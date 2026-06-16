@@ -666,6 +666,103 @@ smoke 结果:
 - 不做 B=4/B=8 正式 sweep，不接入 `Pi05TorchFrontendThor` 默认推理路径。
 - 若后续继续该方向，应先做 graph 并发安全性审计和 Nsight 解释性实验，而不是扩大工程集成。
 
+## 2026-06-16: Batched encoder Down GEMM tactic selection
+
+目标回到单机纯 batch 推理，不再依赖 scheduler、跨设备流水线或同机 overlap。复跑
+`benchmarks/bench_b1_b8.py` 后确认，稳定热状态下 B=1..8 的主要瓶颈在
+`Enc+AE graph` 内部，graph 外 staging/residual 通常只有 1-3 ms。
+
+热状态 baseline:
+
+| B | E2E avg | SigLIP/PostLN | Enc+AE graph | throughput |
+|---:|---:|---:|---:|---:|
+| 1 | 42.3 ms | 5.5 ms | 35.5 ms | 23.6 req/s |
+| 2 | 57.7 ms | 9.2 ms | 47.5 ms | 34.7 req/s |
+| 3 | 76.3 ms | 12.1 ms | 62.8 ms | 39.3 req/s |
+| 4 | 108.3 ms | 16.2 ms | 90.6 ms | 36.9 req/s |
+| 5 | 130.9 ms | 20.3 ms | 109.2 ms | 38.2 req/s |
+| 6 | 153.3 ms | 24.2 ms | 127.6 ms | 39.1 req/s |
+| 7 | 177.7 ms | 28.3 ms | 146.0 ms | 39.4 req/s |
+| 8 | 201.8 ms | 33.9 ms | 165.9 ms | 39.6 req/s |
+
+开关 sweep 结论:
+
+- `FLASHRT_THOR_BATCH_SYNC_AFTER_GRAPH=0` 无收益。最终 D2H `.cpu().numpy()` 本身会同步。
+- `FLASHRT_THOR_BATCH_POSTLN_PROJ_FUSION=1`、`FLASHRT_THOR_BATCH_GRAPH_AUTOTUNE=1`、
+  `FLASHRT_THOR_BATCH_SIGLIP_GRAPH_AUTOTUNE=1` 的短测结果与热状态 baseline 基本同档。
+  早期较慢结果主要来自冷状态或 CUDA Graph capture schedule 波动，不能作为稳定收益。
+- 因此继续优化应集中在 `Enc+AE graph` 内部，而不是 prompt upload、padding zero、
+  D2H 或 Python staging。
+
+新增 microbenchmark:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_pi05_batch_research_kernels.py \
+  --batch-sizes 1-8 \
+  --warmup 10 \
+  --iters 30 \
+  --max-candidates 8 \
+  --skip-chains \
+  --json-out /mnt/home/zengzixuan/workspace/Lingshu/docs/experiments/pi05_batch_kernel_tactics_short_2026-06-16.json
+```
+
+关键发现: encoder FFN down projection 在 B>=4 时，`cutlass_fp8_t2` 比原生产路径
+`cutlass_fp8_wide` 更快，且 microbenchmark 中 bit-exact:
+
+| B | production wide | best t2 | single-GEMM speedup |
+|---:|---:|---:|---:|
+| 4 | 1.440 ms | 1.243 ms | 1.16x |
+| 5 | 1.765 ms | 1.571 ms | 1.12x |
+| 6 | 2.103 ms | 1.845 ms | 1.14x |
+| 7 | 2.445 ms | 2.163 ms | 1.13x |
+| 8 | 2.808 ms | 2.389 ms | 1.18x |
+
+实现:
+
+- `flash_rt/hardware/thor/shared_primitives_batched.py` 新增
+  `FLASHRT_THOR_BATCH_ENCODER_DOWN_TACTIC`。
+- 支持 `auto/wide/t2/sq/t1/plain`。
+- 默认 `auto`: B>=4 且存在 `cutlass_fp8_t2` 时使用 `t2`，否则回退原 `wide`。
+- 该改动只替换 FFN down GEMM tactic，不改变 tensor layout、batch 语义或动作输出格式。
+
+端到端 A/B:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 FLASHRT_THOR_BATCH_ENCODER_DOWN_TACTIC=wide \
+  python benchmarks/bench_b1_b8.py --batch-sizes 4-8 --warmup 8 --iters 20 \
+  --profile --profile-iters 8 --reuse-frontend \
+  --json-out /mnt/home/zengzixuan/workspace/Lingshu/docs/experiments/pi05_b4_b8_down_wide_control_2026-06-16.json
+
+CUDA_VISIBLE_DEVICES=0 FLASHRT_THOR_BATCH_ENCODER_DOWN_TACTIC=auto \
+  python benchmarks/bench_b1_b8.py --batch-sizes 4-8 --warmup 8 --iters 20 \
+  --profile --profile-iters 8 --reuse-frontend \
+  --json-out /mnt/home/zengzixuan/workspace/Lingshu/docs/experiments/pi05_b4_b8_down_auto_2026-06-16.json
+```
+
+| B | wide E2E | auto/t2 E2E | improvement | wide Enc+AE | auto/t2 Enc+AE |
+|---:|---:|---:|---:|---:|---:|
+| 4 | 108.2 ms | 104.7 ms | 3.2% | 90.7 ms | 87.2 ms |
+| 5 | 129.8 ms | 125.0 ms | 3.7% | 107.9 ms | 103.1 ms |
+| 6 | 153.3 ms | 147.8 ms | 3.6% | 127.6 ms | 121.9 ms |
+| 7 | 176.3 ms | 168.4 ms | 4.5% | 145.2 ms | 138.2 ms |
+| 8 | 202.6 ms | 193.0 ms | 4.7% | 166.7 ms | 157.4 ms |
+
+正确性验证:
+
+| B | max_abs | mean_abs | cosine |
+|---:|---:|---:|---:|
+| 4 | 0.00000000 | 0.00000000 | 1.000000000 |
+| 8 | 0.00000000 | 0.00000000 | 1.000000000 |
+
+结论:
+
+- 这是当前单机 batch 路径中第一个明确穿透到端到端延迟的 kernel tactic 优化。
+- 收益幅度不大但稳定，符合瓶颈分解: down GEMM 是 Enc+AE 内部的一部分，因此整体收益约
+  3-5%，不是数量级提升。
+- 后续最有希望的方向不是继续堆 runtime 开关，而是做 batch-shape-aware kernel
+  selection/autotuning，并扩展到 decoder `fp8_gemm_descale_fp16`、GateUp/GeGLU/Down
+  producer chain 或更深的 FFN fusion。
+
 ### Git 提交记录
 
 ```
