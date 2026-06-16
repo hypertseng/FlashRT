@@ -762,7 +762,6 @@ CUDA_VISIBLE_DEVICES=0 FLASHRT_THOR_BATCH_ENCODER_DOWN_TACTIC=auto \
 - 后续最有希望的方向不是继续堆 runtime 开关，而是做 batch-shape-aware kernel
   selection/autotuning，并扩展到 decoder `fp8_gemm_descale_fp16`、GateUp/GeGLU/Down
   producer chain 或更深的 FFN fusion。
-
 ### Git 提交记录
 
 ```
