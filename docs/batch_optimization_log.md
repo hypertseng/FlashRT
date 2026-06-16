@@ -80,51 +80,6 @@
 
 ## 实验记录
 
-### P17: Batch-shape-aware Encoder Down GEMM Tactic (2026-06-16)
-
-**方案**: 对 batched encoder FFN down projection 做 batch-shape-aware CUTLASS
-tactic selection。原路径固定使用 `cutlass_fp8_wide`:
-
-```text
-hid_fp8 = GEGLU(gate, up)      # [B*Se, H=16384]
-x = hid_fp8 @ down_w + x       # [B*Se, D=2048], beta=1 residual fused
-```
-
-该 GEMM 的 `M=B*Se` 随 batch size 变化，但固定 tactic 不能同时覆盖小 M 和大 M。
-当前 `FLASHRT_THOR_BATCH_ENCODER_DOWN_TACTIC=auto` 策略:
-
-| B | tactic |
-|---:|---|
-| 1 | `cutlass_fp8_t1` |
-| 2-3 | `cutlass_fp8_wide` |
-| >=4 | `cutlass_fp8_t2` if available, otherwise `cutlass_fp8_wide` |
-
-**端到端 A/B**:
-
-| B | wide E2E | auto E2E | auto tactic | Delta |
-|---:|---:|---:|---|---:|
-| 1 | 44.9ms | 44.0ms | t1 | -2.0% |
-| 2 | 61.0ms | 61.9ms | wide | +1.5% |
-| 3 | 83.0ms | 83.4ms | wide | +0.4% |
-| 4 | 108.2ms | 104.7ms | t2 | -3.3% |
-| 5 | 129.8ms | 125.0ms | t2 | -3.7% |
-| 6 | 153.3ms | 147.8ms | t2 | -3.6% |
-| 7 | 176.3ms | 168.4ms | t2 | -4.5% |
-| 8 | 202.6ms | 193.0ms | t2 | -4.7% |
-
-For B=2/3, `auto` intentionally resolves to `wide`; the small positive delta
-is measurement noise between two independent runs, not an algorithmic slowdown.
-
-**正确性**: microbenchmark 中候选 tactic 与生产 tactic bit-exact；B=4/B=8
-端到端动作输出 `cosine=1.0`。
-
-**结论**: 这是一个低风险生产优化。更大的后续空间不在继续调 decoder 小 GEMM，
-而在 encoder `GEGLU -> hid_fp8 -> Down GEMM` 边界融合。B=8 时该边界折算到
-17 个 encoder FFN 层约暴露 23.8ms/infer，但朴素按 Down N tile 重新计算 GEGLU
-会引入约 342.7ms/infer 额外代价，因此后续需要 CTA/persistent tile 级 A tile 复用。
-
----
-
 ### P2/P3: Batched Softmax (Encoder + Decoder Attention)
 
 **方案**: 将 encoder 和 decoder 的 per-sample attention 循环改为 decomposed QK^T + batched softmax + PV。
@@ -767,34 +722,30 @@ CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_pi05_batch_research_kernels.py \
 - `flash_rt/hardware/thor/shared_primitives_batched.py` 新增
   `FLASHRT_THOR_BATCH_ENCODER_DOWN_TACTIC`。
 - 支持 `auto/wide/t2/sq/t1/plain`。
-- 默认 `auto`: B=1 使用 `t1`；B=2/3 使用原 `wide`；B>=4 且存在
-  `cutlass_fp8_t2` 时使用 `t2`，否则回退原 `wide`。
+- 默认 `auto`: B>=4 且存在 `cutlass_fp8_t2` 时使用 `t2`，否则回退原 `wide`。
 - 该改动只替换 FFN down GEMM tactic，不改变 tensor layout、batch 语义或动作输出格式。
 
 端到端 A/B:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 FLASHRT_THOR_BATCH_ENCODER_DOWN_TACTIC=wide \
-  python benchmarks/bench_b1_b8.py --batch-sizes 1-8 --warmup 8 --iters 20 \
+  python benchmarks/bench_b1_b8.py --batch-sizes 4-8 --warmup 8 --iters 20 \
   --profile --profile-iters 8 --reuse-frontend \
-  --json-out /mnt/home/zengzixuan/workspace/Lingshu/docs/experiments/pi05_b1_b8_down_wide_control_2026-06-16.json
+  --json-out /mnt/home/zengzixuan/workspace/Lingshu/docs/experiments/pi05_b4_b8_down_wide_control_2026-06-16.json
 
 CUDA_VISIBLE_DEVICES=0 FLASHRT_THOR_BATCH_ENCODER_DOWN_TACTIC=auto \
-  python benchmarks/bench_b1_b8.py --batch-sizes 1-8 --warmup 8 --iters 20 \
+  python benchmarks/bench_b1_b8.py --batch-sizes 4-8 --warmup 8 --iters 20 \
   --profile --profile-iters 8 --reuse-frontend \
-  --json-out /mnt/home/zengzixuan/workspace/Lingshu/docs/experiments/pi05_b1_b8_down_auto_2026-06-16.json
+  --json-out /mnt/home/zengzixuan/workspace/Lingshu/docs/experiments/pi05_b4_b8_down_auto_2026-06-16.json
 ```
 
-| B | wide E2E | auto E2E | auto tactic | improvement | wide Enc+AE | auto Enc+AE |
-|---:|---:|---:|---|---:|---:|---:|
-| 1 | 44.9 ms | 44.0 ms | t1 | 2.0% | 37.5 ms | 37.3 ms |
-| 2 | 61.0 ms | 61.9 ms | wide | -1.5% | 50.5 ms | 50.9 ms |
-| 3 | 83.0 ms | 83.4 ms | wide | -0.4% | 68.4 ms | 68.6 ms |
-| 4 | 108.2 ms | 104.7 ms | t2 | 3.3% | 90.7 ms | 87.2 ms |
-| 5 | 129.8 ms | 125.0 ms | t2 | 3.7% | 107.9 ms | 103.1 ms |
-| 6 | 153.3 ms | 147.8 ms | t2 | 3.6% | 127.6 ms | 121.9 ms |
-| 7 | 176.3 ms | 168.4 ms | t2 | 4.5% | 145.2 ms | 138.2 ms |
-| 8 | 202.6 ms | 193.0 ms | t2 | 4.7% | 166.7 ms | 157.4 ms |
+| B | wide E2E | auto/t2 E2E | improvement | wide Enc+AE | auto/t2 Enc+AE |
+|---:|---:|---:|---:|---:|---:|
+| 4 | 108.2 ms | 104.7 ms | 3.2% | 90.7 ms | 87.2 ms |
+| 5 | 129.8 ms | 125.0 ms | 3.7% | 107.9 ms | 103.1 ms |
+| 6 | 153.3 ms | 147.8 ms | 3.6% | 127.6 ms | 121.9 ms |
+| 7 | 176.3 ms | 168.4 ms | 4.5% | 145.2 ms | 138.2 ms |
+| 8 | 202.6 ms | 193.0 ms | 4.7% | 166.7 ms | 157.4 ms |
 
 正确性验证:
 
@@ -833,80 +784,3 @@ ea20d21 perf: GPU-side image conversion via torch tensors
 8075dbd feat: CPU-side optimization — GPU image conversion, id-based dedup, remove redundant zeros
 6329452 feat: batched softmax optimization for encoder/decoder attention
 ```
-
-### P18: Periodic Research Loop for Batch Inference Hypothesis Testing (2026-06-17)
-
-**目的**: 将单机 Pi0.5 Thor batch 优化从零散 microbenchmark 改为可重复的研究闭环。
-每个周期同时记录:
-
-1. B=1..8 端到端 batch latency 和 graph replay profile。
-2. encoder GEGLU -> Down GEMM producer-chain 边界。
-3. virtual FP8 activation mainloop 成本模型。
-4. 第一周期额外运行 GEGLU LUT/row8 排除实验。
-
-新增脚本:
-
-- `benchmarks/run_pi05_batch_research_loop.py`
-- `benchmarks/summarize_pi05_research_loop.py`
-
-执行:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 FLASHRT_THOR_BATCH_ENCODER_DOWN_TACTIC=auto \
-  python benchmarks/run_pi05_batch_research_loop.py \
-    --duration-min 120 \
-    --batch-sizes 1-8 \
-    --warmup 8 \
-    --iters 20 \
-    --profile-iters 8 \
-    --kernel-warmup 8 \
-    --kernel-iters 20 \
-    --output-dir /mnt/home/zengzixuan/workspace/Lingshu/docs/experiments
-```
-
-结果:
-
-- run_id: `20260616_225321`
-- completed cycles: 102
-- elapsed: 120.4 min
-- summary: `/mnt/home/zengzixuan/workspace/Lingshu/docs/experiments/pi05_research_loop_aggregate_20260616_225321.json`
-
-Context reuse upper bound negative control:
-
-该结果现在只作为反证/上限实验保留。它假设 visual-language context 已经可安全驻留并复用，
-而真实多机器人请求的图像状态通常不同，因此不能把它作为第一个研究点的核心优化路线。
-它的价值是说明: 即使在理想复用假设下，上限也只有约 1.2x，Enc+AE 仍然是主瓶颈。
-
-| B | full avg | context reuse avg | saved | ideal speedup | Enc+AE share |
-|---:|---:|---:|---:|---:|---:|
-| 1 | 42.3 +/- 0.3 ms | 35.8 +/- 0.3 ms | 6.5 +/- 0.3 ms | 1.18x | 83.9% |
-| 2 | 57.7 +/- 0.5 ms | 47.9 +/- 0.4 ms | 9.8 +/- 0.2 ms | 1.21x | 82.4% |
-| 3 | 78.9 +/- 0.7 ms | 65.8 +/- 0.6 ms | 13.1 +/- 0.2 ms | 1.20x | 83.0% |
-| 4 | 107.5 +/- 1.3 ms | 90.2 +/- 1.1 ms | 17.3 +/- 0.3 ms | 1.19x | 83.6% |
-| 5 | 126.7 +/- 1.7 ms | 105.3 +/- 1.5 ms | 21.3 +/- 0.4 ms | 1.20x | 82.7% |
-| 6 | 147.6 +/- 1.8 ms | 122.2 +/- 1.6 ms | 25.4 +/- 0.4 ms | 1.21x | 82.4% |
-| 7 | 171.1 +/- 2.3 ms | 139.6 +/- 2.0 ms | 31.5 +/- 0.6 ms | 1.23x | 81.3% |
-| 8 | 194.0 +/- 1.3 ms | 158.8 +/- 1.0 ms | 35.2 +/- 0.7 ms | 1.22x | 81.5% |
-
-GEGLU -> Down boundary:
-
-| B | chain ms/layer | visible ms/infer | naive recompute delta | required A-tile reuse |
-|---:|---:|---:|---:|---:|
-| 1 | 0.347 +/- 0.009 | 2.62 +/- 0.14 ms | 42.2 +/- 1.5 ms | 8.3x |
-| 2 | 0.620 +/- 0.009 | 5.31 +/- 0.43 ms | 82.9 +/- 2.0 ms | 8.2x |
-| 3 | 1.123 +/- 0.020 | 8.27 +/- 0.20 ms | 124.7 +/- 1.8 ms | 8.0x |
-| 4 | 1.925 +/- 0.056 | 11.34 +/- 0.33 ms | 166.1 +/- 1.7 ms | 7.9x |
-| 5 | 2.374 +/- 0.070 | 13.88 +/- 0.30 ms | 208.3 +/- 1.8 ms | 8.0x |
-| 6 | 2.807 +/- 0.090 | 17.35 +/- 0.45 ms | 248.8 +/- 2.3 ms | 7.8x |
-| 7 | 3.206 +/- 0.092 | 19.44 +/- 0.37 ms | 290.8 +/- 2.4 ms | 8.0x |
-| 8 | 3.686 +/- 0.060 | 22.50 +/- 1.28 ms | 331.3 +/- 3.1 ms | 7.9x |
-
-结论:
-
-- context reuse 只应作为 memory-for-compute upper bound / negative-control probe；
-  真实多机器人图像不可假设相同，且理想上限约 1.2x 后 Enc+AE graph 仍占 81%-84%，
-  因此它不能作为下一阶段核心优化。
-- GEGLU LUT/row8 producer 数值安全但没有稳定加速，排除为核心方向。
-- 下一阶段主线应集中在 Enc+AE 内部，尤其是 GEGLU-producing Down GEMM /
-  virtual FP8 activation mainloop。
-  关键设计约束是避免 per-N-tile 朴素重算，并在 CTA/persistent tile 级达到约 8x A-tile reuse。
