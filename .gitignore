@@ -12,6 +12,19 @@ build*/
 *.so
 *.o
 *.a
+CMakeCache.txt
+CMakeFiles/
+Makefile
+cmake_install.cmake
+
+# Profiling / test output
+profile_output/
+docs/experiments/
+*_compare_results.json
+*.ncu-rep
+*.nsys-rep
+*.sqlite
+*_torch_results.json
 
 # Generated model / engine files
 *.engine

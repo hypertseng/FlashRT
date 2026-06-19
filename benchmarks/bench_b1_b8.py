@@ -194,7 +194,7 @@ def _make_context_reuse_upper_bound_fn(frontend, batch_size: int,
 
         return run_one
 
-    raise RuntimeError(
+raise RuntimeError(
         "B>1 context reuse is not reported here: the batched Enc+AE graph "
         "updates _enc_x_b2 in place, so correctness requires a separate "
         "batched staging snapshot API.")

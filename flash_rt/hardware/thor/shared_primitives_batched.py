@@ -18,6 +18,38 @@ Functions:
 """
 
 import math
+import os
+
+_crt = ctypes.CDLL('libcudart.so')
+
+
+def _select_encoder_down_gemm(fvk, B: int):
+    """Choose the encoder FFN down-projection tactic for batched Thor runs."""
+    tactic = os.environ.get(
+        "FLASHRT_THOR_BATCH_ENCODER_DOWN_TACTIC", "auto").strip().lower()
+    if tactic in ("", "auto"):
+        if B == 1:
+            tactic = "t1"
+        elif B >= 4 and hasattr(fvk, "cutlass_fp8_t2"):
+            tactic = "t2"
+        else:
+            tactic = "wide"
+
+    table = {
+        "wide": fvk.cutlass_fp8_wide,
+        "sq": fvk.cutlass_fp8_sq,
+        "t1": fvk.cutlass_fp8_t1,
+    }
+    optional = {
+        "t2": "cutlass_fp8_t2",
+        "plain": "cutlass_fp8_plain",
+    }
+    if tactic in optional:
+        fn = getattr(fvk, optional[tactic], None)
+        if fn is not None:
+            return fn
+        tactic = "wide"
+    return table.get(tactic, fvk.cutlass_fp8_wide)
 
 
 def encoder_forward_b2(gemm, fvk, bufs, weights, dims, stream=0, *,

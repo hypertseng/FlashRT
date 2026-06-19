@@ -122,6 +122,30 @@ class Pi05TorchFrontendThor:
         infer(observation) -> {"actions": np.ndarray}
     """
 
+    _BATCH_GRAPH_BANK_ATTRS = (
+        "_Kc_b2", "_Vc_b2",
+        "_sig_x_b2", "_sig_x_fp8_b2", "_sig_qkv_b2", "_sig_attn_b2",
+        "_sig_hidden_b2", "_sig_hid_fp8_b2", "_postln_scratch_b2",
+        "_postln_proj_b2",
+        "_img_buf_b2_list", "_img_buf_b2_all", "_patches_buf_b2",
+        "_img_staging_torch",
+        "_img_stack_host_b2", "_img_stack_host_torch_b2",
+        "_img_stack_fp16_host_b2", "_img_stack_fp16_host_torch_b2",
+        "_lang_emb_b2",
+        "_enc_x_b2", "_enc_x_fp8_b2", "_enc_qkv_buf_b2",
+        "_enc_logits_b2", "_enc_attn_b2", "_enc_o_fp8_b2",
+        "_enc_gate_b2", "_enc_hid_fp8_b2", "_enc_fg_b2",
+        "_ae_x_b2", "_ae_xn_b2", "_ae_gate_b2", "_ae_qkv_b2",
+        "_ae_logits_b2", "_ae_attn_b2", "_ae_fg_b2",
+        "_ae_action_f32_b2", "_ae_xn_fp8_b2", "_ae_hid_fp8_b2",
+        "_ae_ctx_fp8_b2",
+        "_g_noise_b2", "_v_b2", "_v_b2_f32",
+        "_sa_all_b2", "_sf_all_b2", "_fs_all_b2",
+        "_siglip_batched_graph", "_siglip_batched_B",
+        "_enc_ae_graph_b2", "_cfg_b2_outer_graph",
+        "_stream_attn_b2",
+    )
+
     # -----------------------------------------------------------------------
     # Construction
     # -----------------------------------------------------------------------
@@ -630,6 +654,59 @@ class Pi05TorchFrontendThor:
         self._Vc_b2 = torch.zeros(B, Le, total_keys_max, HDe,
                                    dtype=fp16, device='cuda')
 
+# ── SigLIP batched buffers (for batched SigLIP CUDA Graph) ──
+        # Contiguous [B*S_sig, D] layout so GEMMs see one big M dimension.
+        S_sig = self.sig_S  # 256 * num_views
+        D_sig = self.sig_D  # 1152
+        H_sig = self.sig_H  # 4304
+        self._sig_x_b2    = torch.zeros(B * S_sig, D_sig, dtype=fp16, device='cuda')
+        self._sig_x_fp8_b2 = torch.zeros(B * S_sig * D_sig, dtype=torch.uint8, device='cuda')
+        self._sig_qkv_b2  = torch.empty(B * S_sig, 3 * D_sig, dtype=fp16, device='cuda')
+        self._sig_attn_b2 = torch.empty(B * S_sig, D_sig, dtype=fp16, device='cuda')
+        self._sig_hidden_b2 = torch.empty(B * S_sig, H_sig, dtype=fp16, device='cuda')
+        self._sig_hid_fp8_b2 = torch.zeros(B * S_sig * H_sig, dtype=torch.uint8, device='cuda')
+        self._postln_scratch_b2 = torch.empty(B * S_sig, D_sig, dtype=fp16, device='cuda')
+        self._postln_proj_b2 = (
+            torch.empty(B * S_sig, self.De, dtype=fp16, device='cuda')
+            if self.batched_postln_proj_fusion else None
+        )
+        # Per-sample image upload buffers
+        self._img_buf_b2_list = [
+            CudaBuffer.device_empty(self._img_buf.nbytes, np.float16)
+            for _ in range(B)
+        ]
+        # Batched image buffer: contiguous (B*nv, 224, 224, 3) fp16
+        self._img_buf_b2_all = CudaBuffer.device_empty(
+            B * self._img_buf.nbytes, np.float16)
+        # Batched patches buffer: (B*nv*256, 588) fp16
+        self._patches_buf_b2 = CudaBuffer.device_empty(
+            B * S_sig * 588, np.float16)
+        # Pre-allocated torch tensor for GPU-side uint8→fp16 image conversion
+        # Sized for B images (batched upload path)
+        self._img_staging_torch = torch.empty(
+            B * self._img_buf.nbytes // 2, dtype=torch.uint8, device='cuda')
+        # Persistent host/device staging for the common uint8 image path.
+        # Avoids per-inference numpy/torch allocation before patch embedding.
+        img_elems = B * self.num_views * 224 * 224 * 3
+        self._img_stack_host_torch_b2 = torch.empty(
+            img_elems, dtype=torch.uint8, pin_memory=True)
+        self._img_stack_host_b2 = self._img_stack_host_torch_b2.numpy().reshape(
+            B, self.num_views, 224, 224, 3)
+        self._img_stack_fp16_host_torch_b2 = torch.empty(
+            img_elems, dtype=fp16, pin_memory=True)
+        self._img_stack_fp16_host_b2 = (
+            self._img_stack_fp16_host_torch_b2.numpy().reshape(
+                B, self.num_views, 224, 224, 3))
+        # Per-sample lang embedding buffers for each sample's prompt.
+        # Multi-prompt batches use the batch max language length, which can
+        # be larger than the prompt used to initialize the serial buffers.
+        lang_slots = max(int(self._lang_emb.shape[0]),
+                         int(Se_max - self.sig_S))
+        self._lang_emb_b2 = torch.zeros(B, lang_slots, self.De,
+                                        dtype=fp16, device='cuda')
+        self._siglip_batched_graph = None
+        self._siglip_batched_B = B
+
         # ── Encoder buffers (B*Se, ...) ──
         self._enc_x_b2     = torch.empty(B * Se_max, De, dtype=fp16, device='cuda')
         self._enc_x_fp8_b2 = torch.zeros(B * Se_max * De, dtype=torch.uint8, device='cuda')
@@ -668,6 +745,318 @@ class Pi05TorchFrontendThor:
             "Allocated B=%d buffers (Se_max=%d, Sa=%d, total_keys_max=%d)",
             B, Se_max, Sa, total_keys_max)
 
+<<<<<<< HEAD
+=======
+    def enable_batch_graph_bank(self, enable: bool = True, *,
+                                clear: bool = False) -> None:
+        """Keep exact B-specific CUDA graph/buffer sets resident in VRAM.
+
+        The bank is keyed by ``(B, Se, S_lang, cfg_beta)``. It does not reuse
+        visual features or any image-conditioned hidden state; it only avoids
+        reallocating and recapturing static CUDA graphs when runtime traffic
+        switches among already-seen batch shapes.
+        """
+        if clear:
+            self.clear_batch_graph_bank()
+        self.batch_graph_bank_enabled = bool(enable)
+
+    def clear_batch_graph_bank(self) -> None:
+        """Drop all resident batch graph-bank entries."""
+        self._batch_graph_bank.clear()
+        self._batch_graph_bank_active_key = None
+
+    def batch_graph_bank_keys(self):
+        """Return the resident graph-bank keys for benchmarks/debugging."""
+        return tuple(sorted(self._batch_graph_bank.keys(), key=repr))
+
+    def _batch_graph_bank_key(self, B: int, Se: int):
+        return (
+            int(B),
+            int(Se),
+            int(getattr(self, "_S_lang", 0) or 0),
+            self._enc_ae_graph_b2_cfg_beta,
+        )
+
+    def _save_active_batch_graph_bank_entry(self) -> None:
+        if not self.batch_graph_bank_enabled:
+            return
+        if getattr(self, "_enc_x_b2", None) is None:
+            return
+        if int(getattr(self, "B", 1)) < 2:
+            return
+        key = self._batch_graph_bank_active_key
+        if key is None:
+            key = self._batch_graph_bank_key(self.B, self.Se)
+        entry = {name: getattr(self, name, None)
+                 for name in self._BATCH_GRAPH_BANK_ATTRS}
+        entry.update({
+            "B": int(self.B),
+            "Se": int(self.Se),
+            "total_keys": int(self.total_keys),
+            "batched": bool(self._batched),
+        })
+        self._batch_graph_bank[key] = entry
+        self._batch_graph_bank_active_key = key
+
+    def _restore_batch_graph_bank_entry(self, B: int, Se: int) -> bool:
+        if not self.batch_graph_bank_enabled:
+            return False
+        key = self._batch_graph_bank_key(B, Se)
+        entry = self._batch_graph_bank.get(key)
+        if entry is None:
+            return False
+        for name in self._BATCH_GRAPH_BANK_ATTRS:
+            setattr(self, name, entry.get(name))
+        self.B = int(entry["B"])
+        self.Se = int(entry["Se"])
+        self.total_keys = int(entry["total_keys"])
+        self._batched = bool(entry["batched"])
+        self._batch_graph_bank_active_key = key
+        return True
+
+    def _mark_batch_graph_bank_entry_ready(self, B: int, Se: int) -> None:
+        if not self.batch_graph_bank_enabled:
+            return
+        if self._siglip_batched_graph is None or self._enc_ae_graph_b2 is None:
+            return
+        self._batch_graph_bank_active_key = self._batch_graph_bank_key(B, Se)
+        self._save_active_batch_graph_bank_entry()
+
+    def enable_prompt_bank(self, enable: bool = True, *,
+                           clear: bool = False) -> None:
+        """Keep exact prompt embeddings resident on device.
+
+        This cache stores token-embedding outputs after the same tokenizer and
+        embedding lookup used by the normal path, plus the existing even-length
+        padding used by batched inference. It does not cache image-conditioned
+        states and does not change model math.
+        """
+        if clear:
+            self.clear_prompt_bank()
+        self.prompt_bank_enabled = bool(enable)
+
+    def clear_prompt_bank(self) -> None:
+        """Drop all resident prompt-bank entries."""
+        self._prompt_bank.clear()
+        self._prompt_bank_hits = 0
+        self._prompt_bank_misses = 0
+
+    def prompt_bank_keys(self):
+        """Return resident prompt-bank keys for benchmarks/debugging."""
+        return tuple(sorted(self._prompt_bank.keys(), key=repr))
+
+    def prompt_bank_stats(self):
+        """Return prompt-bank hit/miss counters and resident entry count."""
+        return {
+            "enabled": bool(self.prompt_bank_enabled),
+            "entries": len(self._prompt_bank),
+            "hits": int(self._prompt_bank_hits),
+            "misses": int(self._prompt_bank_misses),
+        }
+
+    @staticmethod
+    def _prompt_bank_state_key(state):
+        if state is None:
+            return None
+        arr = np.asarray(state)
+        return (arr.shape, str(arr.dtype), arr.tobytes())
+
+    def _prompt_bank_key(self, prompt_text, max_len: int, state=None):
+        return (
+            id(self.embedding_weight),
+            int(max_len),
+            prompt_text,
+            self._prompt_bank_state_key(state),
+        )
+
+    def _get_prompt_bank_entry(self, prompt_text, *,
+                               max_len: int = 48, state=None):
+        """Return even-padded CUDA prompt embeddings for batch inference."""
+        if not self.prompt_bank_enabled or not isinstance(prompt_text, str):
+            embeds, _ = embed_prompt(
+                prompt_text, self.embedding_weight, max_len=max_len,
+                state=state)
+            S_lang = embeds.shape[0]
+            if S_lang % 2 != 0:
+                embeds = torch.cat([embeds, embeds[-1:]], dim=0)
+                S_lang = embeds.shape[0]
+            return embeds, S_lang
+
+        key = self._prompt_bank_key(prompt_text, max_len, state=state)
+        entry = self._prompt_bank.get(key)
+        if entry is not None:
+            self._prompt_bank_hits += 1
+            return entry["embeds"], entry["S_lang"]
+
+        self._prompt_bank_misses += 1
+        embeds, prompt_len = embed_prompt(
+            prompt_text, self.embedding_weight, max_len=max_len, state=state)
+        S_lang = embeds.shape[0]
+        if S_lang % 2 != 0:
+            embeds = torch.cat([embeds, embeds[-1:]], dim=0)
+            S_lang = embeds.shape[0]
+        entry = {
+            "embeds": embeds.contiguous(),
+            "S_lang": int(S_lang),
+            "prompt_len": int(prompt_len),
+        }
+        self._prompt_bank[key] = entry
+        return entry["embeds"], entry["S_lang"]
+
+    def _copy_lang_embeds_batched(self, samples) -> None:
+        """Copy per-sample language embeddings into the B-major buffer.
+
+        Adjacent samples with the exact same prompt and language length share
+        one broadcast copy. This is mathematically identical to per-row copies
+        and only reduces tiny CUDA copy launches for common same-task batches.
+        """
+        b = 0
+        B = len(samples)
+        while b < B:
+            s = samples[b]
+            S_lang = int(s["S_lang"])
+            prompt = s["prompt"]
+            end = b + 1
+            while end < B:
+                nxt = samples[end]
+                if nxt["prompt"] != prompt or int(nxt["S_lang"]) != S_lang:
+                    break
+                end += 1
+            rows = end - b
+            src = s["embeds"][:S_lang]
+            if rows == 1:
+                self._lang_emb_b2[b, :S_lang].copy_(src)
+            else:
+                self._lang_emb_b2[b:end, :S_lang].copy_(
+                    src.unsqueeze(0).expand(rows, S_lang, -1))
+            b = end
+
+    def enable_noise_bank(self, enable: bool = True, *,
+                          clear: bool = False) -> None:
+        """Keep exact seeded diffusion noise tensors resident on device."""
+        if clear:
+            self.clear_noise_bank()
+        self.noise_bank_enabled = bool(enable)
+
+    def clear_noise_bank(self) -> None:
+        """Drop all resident seeded noise tensors."""
+        self._noise_bank.clear()
+        self._noise_bank_hits = 0
+        self._noise_bank_misses = 0
+
+    def noise_bank_stats(self):
+        """Return seeded-noise bank hit/miss counters."""
+        return {
+            "enabled": bool(self.noise_bank_enabled),
+            "entries": len(self._noise_bank),
+            "hits": int(self._noise_bank_hits),
+            "misses": int(self._noise_bank_misses),
+        }
+
+    def _get_seed_noise_batched(self, seed: int, B: int):
+        key = (int(seed), int(B), int(self.Sa), 32)
+        if self.noise_bank_enabled:
+            cached = self._noise_bank.get(key)
+            if cached is not None:
+                self._noise_bank_hits += 1
+                return cached
+            self._noise_bank_misses += 1
+
+        rng_base = np.random.RandomState(seed)
+        noise_np = rng_base.randn(B, self.Sa, 32).astype(np.float16)
+        noise_tensor = torch.from_numpy(noise_np).to('cuda')
+        if self.noise_bank_enabled:
+            self._noise_bank[key] = noise_tensor
+        return noise_tensor
+
+    @staticmethod
+    def _noise_indices_for_samples(samples, B: int):
+        prompt_to_noise_idx = {}
+        noise_idx_counter = 0
+        noise_indices = []
+        for s in samples:
+            prompt = s['prompt']
+            if prompt not in prompt_to_noise_idx:
+                if noise_idx_counter >= B:
+                    noise_idx_counter = 0
+                prompt_to_noise_idx[prompt] = noise_idx_counter
+                noise_idx_counter += 1
+            noise_indices.append(prompt_to_noise_idx[prompt])
+        return noise_indices
+
+    def _fill_seed_noise_batched(self, samples, seed: int) -> None:
+        B = len(samples)
+        noise_tensor = self._get_seed_noise_batched(seed, B)
+        noise_indices = self._noise_indices_for_samples(samples, B)
+        noise_view = self._g_noise_b2[:B * self.Sa].view(B, self.Sa, 32)
+
+        b = 0
+        while b < B:
+            idx = noise_indices[b]
+            end = b + 1
+            while end < B and noise_indices[end] == idx:
+                end += 1
+            rows = end - b
+            if rows == 1:
+                noise_view[b].copy_(noise_tensor[idx])
+            else:
+                noise_view[b:end].copy_(
+                    noise_tensor[idx:idx + 1].expand(rows, self.Sa, 32))
+            b = end
+
+    def _upload_images_gpu_batched(self, samples, target_buf_all,
+                                   target_patches_buf=None) -> bool:
+        """Upload B*N views into the contiguous batched image buffer.
+
+        The common LIBERO input is uint8. Convert that path on GPU using
+        persistent staging buffers so repeated batch inference does not
+        allocate a temporary numpy stack and CUDA fp16 tensor every call.
+        Returns True when the patch matrix was produced directly.
+        """
+        B = len(samples)
+        nv = self.num_views
+
+        all_u8 = True
+        for s in samples:
+            for im in s['images'][:nv]:
+                if not (isinstance(im, np.ndarray) and im.dtype == np.uint8):
+                    all_u8 = False
+                    break
+            if not all_u8:
+                break
+
+        if all_u8:
+            host_stack = self._img_stack_host_b2[:B, :nv]
+            for b, s in enumerate(samples):
+                for v, im in enumerate(s['images'][:nv]):
+                    host_stack[b, v] = im
+
+            numel = host_stack.size
+            src_u8 = self._img_stack_host_torch_b2[:numel]
+            dev_u8 = self._img_staging_torch[:numel]
+            dev_u8.copy_(src_u8, non_blocking=True)
+            if target_patches_buf is not None:
+                fvk.normalize_uint8_to_patches_fp16(
+                    dev_u8.data_ptr(), target_patches_buf.ptr.value, B * nv, 0)
+                return True
+            fvk.normalize_uint8_to_fp16(
+                dev_u8.data_ptr(), target_buf_all.ptr.value, numel, 0)
+            return False
+
+        host_fp16 = self._img_stack_fp16_host_b2[:B, :nv]
+        for b, s in enumerate(samples):
+            for v, im in enumerate(s['images'][:nv]):
+                if isinstance(im, torch.Tensor):
+                    host_fp16[b, v] = im.to(dtype=torch.float16).cpu().numpy()
+                elif im.dtype == np.float16:
+                    host_fp16[b, v] = im
+                else:
+                    host_fp16[b, v] = (
+                        im.astype(np.float32) / 127.5 - 1.0).astype(np.float16)
+        target_buf_all.upload(host_fp16)
+        return False
+
+>>>>>>> 7688d19 (perf: refine thor pi05 batch research path)
     # NOTE: _load_weights_orbax removed — Orbax loading belongs to ThorPipelineJax
     # -----------------------------------------------------------------------
     # RL CFG inference (opt-in via set_rl_mode)
@@ -2338,9 +2727,13 @@ class Pi05TorchFrontendThor:
         Mirrors :meth:`flash_rt.frontends.torch.pi05_rtx.Pi05TorchFrontendRtx.set_batched_mode`
         (line 1140) at the API level.
         """
+        if self.batch_graph_bank_enabled:
+            self._save_active_batch_graph_bank_entry()
+
         if not enable:
             self._batched = False
             self._enc_ae_graph_b2 = None
+            self._batch_graph_bank_active_key = None
             return
 
         if batch_size < 2:
@@ -2348,8 +2741,10 @@ class Pi05TorchFrontendThor:
                 f"set_batched_mode requires batch_size >= 2; "
                 f"got {batch_size}. Use the standard infer() for B=1.")
 
+        restored = self._restore_batch_graph_bank_entry(batch_size, self.Se)
+
         # Lazy alloc on first enable (or on B change).
-        if self._Kc_b2 is None or self.B != batch_size:
+        if not restored and (self._Kc_b2 is None or self.B != batch_size):
             self._alloc_b2_buffers(B=batch_size)
 
         self._batched = True
@@ -2357,11 +2752,19 @@ class Pi05TorchFrontendThor:
         # Force re-capture: next set_prompt or explicit
         # _capture_enc_ae_graph_b2() will rebuild the b2 graph against
         # the new prompt length.
-        self._enc_ae_graph_b2 = None
+        if not restored:
+            self._enc_ae_graph_b2 = None
+            self._batch_graph_bank_active_key = None
         logger.info(
+<<<<<<< HEAD
             "Batched mode ENABLED (B=%d). Call set_prompt() then "
             "_capture_enc_ae_graph_b2() to capture the b2 graph.",
             batch_size)
+=======
+            "Batched mode ENABLED (B=%d) with %d persistent attention backends%s.",
+            batch_size, len(self._stream_attn_b2),
+            " from graph bank" if restored else "")
+>>>>>>> 7688d19 (perf: refine thor pi05 batch research path)
 
     def infer_batch(self, observations):
         """Run B=N batched inference on a list of observations.
@@ -2539,8 +2942,12 @@ class Pi05TorchFrontendThor:
 
         if max_S_lang % 2 != 0:
             max_S_lang += 1
+<<<<<<< HEAD
         # Use fixed self.Se_max for all batches to avoid graph recapture
         Se_max = self.Se_max
+=======
+        Se_max = S_sig + max_S_lang
+>>>>>>> 7688d19 (perf: refine thor pi05 batch research path)
         batch_S_lang = Se_max - S_sig
 
         # Lazy initialization: if set_prompt was never called, we need to
