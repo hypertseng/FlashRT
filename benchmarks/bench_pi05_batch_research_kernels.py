@@ -172,6 +172,21 @@ def _encoder_down_tactic(B: int, requested: str = "auto") -> str:
     return tactic
 
 
+def _encoder_down_tactic(B: int, requested: str = "auto") -> str:
+    tactic = requested.strip().lower()
+    if tactic in ("", "auto"):
+        if B == 1:
+            tactic = "t1"
+        elif B >= 4 and "t2" in CUTLASS_CANDIDATES:
+            tactic = "t2"
+        else:
+            tactic = "wide"
+    if tactic not in CUTLASS_CANDIDATES:
+        choices = ", ".join(sorted(["auto", *CUTLASS_CANDIDATES.keys()]))
+        raise ValueError(f"unsupported encoder down tactic {requested!r}; choices: {choices}")
+    return tactic
+
+
 def _production_down_tactic(B: int) -> str:
     return _encoder_down_tactic(B, "auto")
 

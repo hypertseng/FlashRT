@@ -5,14 +5,7 @@ Default run:
 
 Faster diagnostic run:
     CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_b1_b8.py \
-        --batch-sizes 1-8 --warmup 10 --iters 30 --profile
-
-Note:
-    This script benchmarks Pi05TorchFrontendThor, i.e. the Thor FP8 path by
-    default or the FP16 path with --no-fp8. It does not exercise
-    Pi05TorchFrontendThorFP4. As of 2026-06-20 the FP4 frontend only overrides
-    the single-sample Enc+AE graph; B>=2 still needs a separate batched-FP4
-    implementation before it can be reported as an FP4 service curve.
+        --batch-sizes 1,2,4,8 --warmup 10 --iters 30 --profile
 """
 
 from __future__ import annotations
@@ -158,8 +151,7 @@ def _make_infer_fn(frontend, batch_size: int, batch_data: list[dict],
 
 
 def _make_context_reuse_upper_bound_fn(frontend, batch_size: int,
-                                       seed: int | None,
-                                       batch_data: list[dict] | None = None):
+                                       seed: int | None):
     """Replay only the action-generation graph from a resident VLM context.
 
     This is an experimental upper-bound probe for memory-for-compute research.
@@ -170,12 +162,6 @@ def _make_context_reuse_upper_bound_fn(frontend, batch_size: int,
     from flash_rt.core.utils.actions import LIBERO_ACTION_DIM, unnormalize_actions
 
     if batch_size == 1:
-        if (batch_data is not None
-                and hasattr(frontend, "stage_context")
-                and hasattr(frontend, "infer_from_cached_context")):
-            frontend.stage_context(batch_data[0]["observation"])
-            return lambda: frontend.infer_from_cached_context(seed=seed)
-
         if getattr(frontend, "_enc_ae_graph", None) is None:
             raise RuntimeError("serial Enc+AE graph is not captured yet")
 
@@ -194,10 +180,30 @@ def _make_context_reuse_upper_bound_fn(frontend, batch_size: int,
 
         return run_one
 
-raise RuntimeError(
-        "B>1 context reuse is not reported here: the batched Enc+AE graph "
-        "updates _enc_x_b2 in place, so correctness requires a separate "
-        "batched staging snapshot API.")
+    if getattr(frontend, "_enc_ae_graph_b2", None) is None:
+        raise RuntimeError("batched Enc+AE graph is not captured yet")
+
+    def run_batch():
+        if seed is None:
+            frontend._g_noise_b2.normal_()
+        else:
+            noise_np = np.random.RandomState(seed).randn(
+                batch_size, frontend.Sa, 32).astype(np.float16)
+            noise = torch.from_numpy(noise_np).to("cuda", non_blocking=True)
+            for b in range(batch_size):
+                frontend._g_noise_b2[
+                    b * frontend.Sa:(b + 1) * frontend.Sa].copy_(noise[b])
+        frontend._enc_ae_graph_b2.replay()
+        raw_all = frontend._g_noise_b2[
+            :batch_size * frontend.Sa].float().cpu().numpy()
+        results = []
+        for b in range(batch_size):
+            raw = raw_all[b * frontend.Sa:(b + 1) * frontend.Sa]
+            unnorm = unnormalize_actions(raw, frontend.norm_stats)
+            results.append({"actions": unnorm[:, :LIBERO_ACTION_DIM]})
+        return results
+
+    return run_batch
 
 
 def _print_summary(results: dict[int, dict]) -> None:
@@ -288,15 +294,10 @@ def _print_profile(results: dict[int, dict]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description=(
-            "Benchmark Pi0.5 Thor FP8/FP16 batch inference from B=1..8. "
-            "This is not an FP4 batch benchmark."
-        ))
+        description="Benchmark Pi0.5 Thor batch inference from B=1..8.")
     parser.add_argument("--checkpoint", default=CKPT)
     parser.add_argument("--batch-sizes", type=_parse_batch_sizes, default="1-8",
-                        help=("Comma list or range. Use 1-8 for scheduler "
-                              "curves; sparse lists such as 1,2,4,8 are only "
-                              "for diagnostics."))
+                        help="Comma list or range, e.g. 1,2,4,8 or 1-8.")
     parser.add_argument("--warmup", type=int, default=30)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--profile", action="store_true",
@@ -390,22 +391,17 @@ def main() -> None:
 
             if args.context_reuse_upper_bound:
                 print(f"B={B}: context reuse upper-bound...")
-                try:
-                    reuse_fn = _make_context_reuse_upper_bound_fn(
-                        frontend, B, args.seed, batch_data)
-                except RuntimeError as exc:
-                    print(f"B={B}: context reuse skipped: {exc}")
-                    summary["context_reuse_upper_bound_skipped"] = str(exc)
-                else:
-                    for _ in range(args.warmup):
-                        reuse_fn()
-                    torch.cuda.synchronize()
-                    reuse_times = _time_call(reuse_fn, args.iters)
-                    reuse_summary = _summarize(reuse_times)
-                    reuse_summary["per_sample"] = reuse_summary["avg"] / B
-                    reuse_summary["throughput_per_s"] = (
-                        B * 1000.0 / reuse_summary["avg"])
-                    summary["context_reuse_upper_bound"] = reuse_summary
+                reuse_fn = _make_context_reuse_upper_bound_fn(
+                    frontend, B, args.seed)
+                for _ in range(args.warmup):
+                    reuse_fn()
+                torch.cuda.synchronize()
+                reuse_times = _time_call(reuse_fn, args.iters)
+                reuse_summary = _summarize(reuse_times)
+                reuse_summary["per_sample"] = reuse_summary["avg"] / B
+                reuse_summary["throughput_per_s"] = (
+                    B * 1000.0 / reuse_summary["avg"])
+                summary["context_reuse_upper_bound"] = reuse_summary
         finally:
             if cudart is not None:
                 torch.cuda.synchronize()

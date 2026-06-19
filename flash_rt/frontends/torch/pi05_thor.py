@@ -9,7 +9,6 @@ Usage:
     actions = result["actions"]  # (10, 7) numpy
 """
 
-import ctypes
 import json
 import math
 import logging
@@ -25,7 +24,6 @@ from flash_rt.hardware.thor.shared_primitives import (
     encoder_forward_calibrate,
 )
 from flash_rt.models.pi05.pipeline_thor import (
-    Pi05ThorPipeline,
     decoder_forward,
     decoder_forward_calibrate,
 )
@@ -53,57 +51,11 @@ _CALIBRATION_CACHE_METADATA = {
     "pi05_thor_action_update": "fp32_bias_unscaled_v1",
 }
 
-_cudart = ctypes.CDLL("libcudart.so")
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 from flash_rt.core.thor_frontend_utils import embed_prompt_torch as embed_prompt  # noqa: E402
-
-
-class _TorchTensorBuffer:
-    """CudaBuffer-compatible view over a stable CUDA torch.Tensor."""
-
-    def __init__(self, tensor: torch.Tensor):
-        if not tensor.is_cuda:
-            raise ValueError("runtime-export tensor buffer must be CUDA")
-        self.tensor = tensor.contiguous()
-        self.ptr = ctypes.c_void_p(int(self.tensor.data_ptr()))
-        self.nbytes = self.tensor.numel() * self.tensor.element_size()
-
-    def upload(self, arr: np.ndarray) -> None:
-        arr = np.ascontiguousarray(arr)
-        if arr.nbytes != self.nbytes:
-            raise ValueError(
-                f"upload size mismatch: {arr.nbytes} != {self.nbytes}")
-        _cudart.cudaMemcpy(
-            self.ptr, ctypes.c_void_p(arr.ctypes.data), self.nbytes, 1)
-
-    def download(self, arr: np.ndarray) -> None:
-        if arr.nbytes > self.nbytes:
-            raise ValueError(
-                f"download size mismatch: {arr.nbytes} > {self.nbytes}")
-        _cudart.cudaDeviceSynchronize()
-        _cudart.cudaMemcpy(
-            ctypes.c_void_p(arr.ctypes.data), self.ptr, arr.nbytes, 2)
-
-    def download_new(self, shape, dtype) -> np.ndarray:
-        arr = np.empty(shape, dtype=dtype)
-        self.download(arr)
-        return arr
-
-
-class _TorchGraphExport:
-    """Expose torch CUDAGraph with the field shape used by runtime_export."""
-
-    def __init__(self, graph: torch.cuda.CUDAGraph):
-        self._graph = graph
-        self._graph_exec = ctypes.c_void_p(int(graph.raw_cuda_graph_exec()))
-
-    def replay(self, stream=None):
-        self._graph.replay()
 
 
 # ---------------------------------------------------------------------------
@@ -152,8 +104,7 @@ class Pi05TorchFrontendThor:
 
     def __init__(self, checkpoint_dir: str, num_views: int = 2,
                  use_cuda_graph: bool = True, autotune: int = 3,
-                 use_fp8: bool = True, state_prompt_mode: str = "exact",
-                 state_prompt_fixed_max_len: Optional[int] = None):
+                 use_fp8: bool = True):
         """
         Args:
             autotune: CUDA Graph autotune trials per set_prompt().
@@ -161,24 +112,6 @@ class Pi05TorchFrontendThor:
                 Torch usually finds fast graph on trial 0-1.
         """
         checkpoint_dir = pathlib.Path(checkpoint_dir)
-        _spm = os.environ.get("FLASHRT_PI05_STATE_PROMPT_MODE", state_prompt_mode)
-        if _spm not in ("fixed", "exact"):
-            raise ValueError(
-                f"state_prompt_mode must be 'fixed' or 'exact', got {_spm!r}")
-        self._state_prompt_mode = _spm
-        _fixed_cap = PI05_STATE_PROMPT_MAX_LEN
-        if _spm == "fixed":
-            _fixed_cap = os.environ.get(
-                "FLASHRT_PI05_STATE_PROMPT_FIXED_MAX_LEN",
-                state_prompt_fixed_max_len)
-            if _fixed_cap is None:
-                _fixed_cap = PI05_STATE_PROMPT_MAX_LEN
-            _fixed_cap = int(_fixed_cap)
-            if _fixed_cap <= 0:
-                raise ValueError(
-                    "state_prompt_fixed_max_len must be a positive integer, "
-                    f"got {_fixed_cap}")
-        self._state_prompt_fixed_max_len = _fixed_cap
         self.num_views = num_views
         self.use_cuda_graph = use_cuda_graph
         self.use_fp8 = bool(use_fp8)
@@ -201,12 +134,12 @@ class Pi05TorchFrontendThor:
             os.environ.get("FLASHRT_THOR_BATCH_SYNC_AFTER_GRAPH", "1") != "0"
         )
         self.batch_graph_bank_enabled = (
-            os.environ.get("FLASHRT_THOR_BATCH_GRAPH_BANK", "1") == "1"
+            os.environ.get("FLASHRT_THOR_BATCH_GRAPH_BANK", "0") == "1"
         )
         self._batch_graph_bank = {}
         self._batch_graph_bank_active_key = None
         self.prompt_bank_enabled = (
-            os.environ.get("FLASHRT_THOR_PROMPT_BANK", "1") == "1"
+            os.environ.get("FLASHRT_THOR_PROMPT_BANK", "0") == "1"
         )
         self._prompt_bank = {}
         self._prompt_bank_hits = 0
@@ -220,22 +153,7 @@ class Pi05TorchFrontendThor:
         self.latency_records = []
         self.calibrated = False
         self.graph_captured = False
-        self.pipeline = Pi05ThorPipeline(batch_size=1)
-        self.pipeline.bind_runtime_owner(self)
-        self._model_runtime_full_graph = None
-        self._model_runtime_context_graph = None
-        self._model_runtime_decode_only_graph = None
-        self._model_runtime_rtc_prefix_graphs = {}
-        self._model_runtime_graph_stream = None
-        self._model_runtime_torch_stream = None
-        self._model_runtime_context_stream = None
-        self._model_runtime_decode_only_stream = None
-        self._runtime_rtc_prev_action_chunk = None
-        self._runtime_rtc_prefix_weights = None
-        self._runtime_rtc_guidance_weight = None
         self._real_data_calibrated = False
-        self.current_prompt_len = 0
-        self._fixed_shape_active = False
 
         # ---- RL CFG state (set via set_rl_mode) ----
         # When ``_rl_config`` is non-None, ``set_prompt`` builds an
@@ -259,19 +177,20 @@ class Pi05TorchFrontendThor:
         self._gemm = fvk.GemmRunner()
 
         # ---- Load CUTLASS FMHA (compiled from csrc/attention/) ----
-        # Search order: explicit override, next to the checkpoint, then the
-        # installed ``flash_rt/`` package dir (pip + editable installs land
-        # here via the ``package-data = ["*.so"]`` glob in pyproject.toml),
-        # then the uncopied ``build/`` output of a fresh cmake run.
+        # Search order: next to the checkpoint, then the installed
+        # ``flash_rt/`` package dir (pip + editable installs land here via
+        # the ``package-data = ["*.so"]`` glob in pyproject.toml), then the
+        # uncopied ``build/`` output of a fresh cmake run, then the docker
+        # container convention ``/workspace/``.
         fmha_paths = [
-            os.environ.get("FLASHRT_FMHA_LIBRARY", ""),
             str(checkpoint_dir.parent / "libfmha_fp16_strided.so"),
             str(pathlib.Path(__file__).parent.parent.parent / "libfmha_fp16_strided.so"),
             str(pathlib.Path(__file__).parent.parent.parent.parent / "build" / "libfmha_fp16_strided.so"),
+            "/workspace/libfmha_fp16_strided.so",
         ]
         fmha_loaded = False
         for p in fmha_paths:
-            if p and pathlib.Path(p).exists():
+            if pathlib.Path(p).exists():
                 ret = fvk.load_fmha_strided_library(p)
                 if ret == 0:
                     fmha_loaded = True
@@ -305,17 +224,10 @@ class Pi05TorchFrontendThor:
             checkpoint_dir / "assets" / "physical-intelligence" / "libero" / "norm_stats.json",
             checkpoint_dir.parent / "pi05_libero" / "assets" / "physical-intelligence" / "libero" / "norm_stats.json",
             checkpoint_dir / "norm_stats.json",
+            pathlib.Path("/root/.cache/openpi/openpi-assets/checkpoints/pi05_libero/"
+                         "assets/physical-intelligence/libero/norm_stats.json"),
             *lerobot_candidates(checkpoint_dir),
         ]
-        openpi_assets_dir = os.environ.get("OPENPI_ASSETS_DIR")
-        if openpi_assets_dir:
-            root = pathlib.Path(openpi_assets_dir)
-            candidates.extend([
-                root / "checkpoints" / "pi05_libero" / "assets"
-                / "physical-intelligence" / "libero" / "norm_stats.json",
-                root / "pi05_libero" / "assets" / "physical-intelligence"
-                / "libero" / "norm_stats.json",
-            ])
         self.norm_stats = load_norm_stats(
             candidates, checkpoint_dir=checkpoint_dir)
 
@@ -602,6 +514,10 @@ class Pi05TorchFrontendThor:
         self._ae_ctx_fp8_b2 = None
         self._g_noise_b2 = None
         self._v_b2 = None
+        self._img_stack_host_b2 = None
+        self._img_stack_host_torch_b2 = None
+        self._img_stack_fp16_host_b2 = None
+        self._img_stack_fp16_host_torch_b2 = None
         # B-tiled style buffers — built in set_prompt when ``_batched``.
         self._sa_all_b2 = None
         self._sf_all_b2 = None
@@ -627,7 +543,7 @@ class Pi05TorchFrontendThor:
 
         logger.info("Weights loaded for Pi05TorchFrontendThor")
 
-    def _alloc_b2_buffers(self, B: int = 2) -> None:
+    def _alloc_b2_buffers(self, B: int = 2, Se_dynamic: int = None) -> None:
         """Allocate all B=N inference buffers.
 
         Stage 2 of the Thor batched-CFG port. Called by
@@ -645,7 +561,7 @@ class Pi05TorchFrontendThor:
         Le = self.Le; De = self.De; He = self.He
         NHe = self.NHe; HDe = self.HDe
         Sa = self.Sa; Da = self.Da; Ha = self.Ha; La = self.La
-        Se_max = self._enc_x.shape[0]
+        Se_max = Se_dynamic if Se_dynamic is not None else self._enc_x.shape[0]
         total_keys_max = self._Kc.shape[1]
 
         # ── KV cache (B, La, total_keys_max, HD) ──
@@ -654,7 +570,7 @@ class Pi05TorchFrontendThor:
         self._Vc_b2 = torch.zeros(B, Le, total_keys_max, HDe,
                                    dtype=fp16, device='cuda')
 
-# ── SigLIP batched buffers (for batched SigLIP CUDA Graph) ──
+        # ── SigLIP batched buffers (for batched SigLIP CUDA Graph) ──
         # Contiguous [B*S_sig, D] layout so GEMMs see one big M dimension.
         S_sig = self.sig_S  # 256 * num_views
         D_sig = self.sig_D  # 1152
@@ -711,7 +627,7 @@ class Pi05TorchFrontendThor:
         self._enc_x_b2     = torch.empty(B * Se_max, De, dtype=fp16, device='cuda')
         self._enc_x_fp8_b2 = torch.zeros(B * Se_max * De, dtype=torch.uint8, device='cuda')
         self._enc_qkv_buf_b2 = torch.empty(B * Se_max, 2560, dtype=fp16, device='cuda')
-        self._enc_logits_b2  = torch.empty(Se_max * NHe, total_keys_max,
+        self._enc_logits_b2  = torch.empty(B * Se_max * NHe, total_keys_max,
                                             dtype=fp16, device='cuda')  # scratch reused per sample
         self._enc_attn_b2    = torch.empty(B * Se_max, NHe * HDe, dtype=fp16, device='cuda')
         self._enc_o_fp8_b2   = torch.zeros(B * Se_max * NHe * HDe, dtype=torch.uint8, device='cuda')
@@ -724,8 +640,8 @@ class Pi05TorchFrontendThor:
         self._ae_xn_b2  = torch.empty(B * Sa, Da, dtype=fp16, device='cuda')
         self._ae_gate_b2 = torch.empty(B * Sa, Da, dtype=fp16, device='cuda')
         self._ae_qkv_b2 = torch.empty(B * Sa, 2560, dtype=fp16, device='cuda')
-        self._ae_logits_b2 = torch.empty(Sa * 8, total_keys_max,
-                                          dtype=fp16, device='cuda')  # scratch reused per sample
+        self._ae_logits_b2 = torch.empty(B * Sa * 8, total_keys_max,
+                                          dtype=fp16, device='cuda')  # scratch for each sample
         self._ae_attn_b2 = torch.empty(B * Sa * 8, 256, dtype=fp16, device='cuda')
         self._ae_fg_b2   = torch.empty(B * Sa, 2 * Ha, dtype=fp16, device='cuda')
         self._ae_action_f32_b2 = torch.empty(B * Sa, 32, dtype=torch.float32, device='cuda')
@@ -745,8 +661,6 @@ class Pi05TorchFrontendThor:
             "Allocated B=%d buffers (Se_max=%d, Sa=%d, total_keys_max=%d)",
             B, Se_max, Sa, total_keys_max)
 
-<<<<<<< HEAD
-=======
     def enable_batch_graph_bank(self, enable: bool = True, *,
                                 clear: bool = False) -> None:
         """Keep exact B-specific CUDA graph/buffer sets resident in VRAM.
@@ -1056,7 +970,6 @@ class Pi05TorchFrontendThor:
         target_buf_all.upload(host_fp16)
         return False
 
->>>>>>> 7688d19 (perf: refine thor pi05 batch research path)
     # NOTE: _load_weights_orbax removed — Orbax loading belongs to ThorPipelineJax
     # -----------------------------------------------------------------------
     # RL CFG inference (opt-in via set_rl_mode)
@@ -1309,7 +1222,7 @@ class Pi05TorchFrontendThor:
             outer_graph_replay=lambda: self._cfg_b2_outer_graph.replay(),
         )
 
-    def _infer_cfg(self, observation, debug=False):
+    def _infer_cfg(self, observation, debug=False, seed=None):
         """CFG inference dispatcher.
 
         Routes to either the serial (Stage 0) per-chunk path —
@@ -1364,7 +1277,12 @@ class Pi05TorchFrontendThor:
             # so the result matches B=1 cond-only deterministically.
             if self._batched and self._enc_ae_graph_b2 is not None:
                 self._enc_ae_graph_b2 = None
-                self._capture_enc_ae_graph_b2()
+                if (self.batched_graph_autotune and self.autotune > 0
+                        and self._cfg_b2_outer_graph is None):
+                    self._autotune_enc_ae_graph_b2(
+                        n_trials=self.autotune, n_bench=10)
+                else:
+                    self._capture_enc_ae_graph_b2()
                 # The outer fused-CFG graph also references the freed
                 # scale buffers; recapture against the new scales,
                 # honouring autotune.
@@ -1393,7 +1311,10 @@ class Pi05TorchFrontendThor:
             # numpy CPU RNG so the bit pattern matches the JAX frontend
             # under the same ``np.random.seed`` (cross-backend cos
             # contract — see ``_seed_b2_noise_from_R`` for the rationale).
-            R_np = np.random.randn(self.Sa, 32).astype(np.float16)
+            if seed is not None:
+                R_np = np.random.RandomState(seed).randn(self.Sa, 32).astype(np.float16)
+            else:
+                R_np = np.random.randn(self.Sa, 32).astype(np.float16)
             R = torch.from_numpy(R_np).to('cuda', non_blocking=True)
             self._g_noise.view(-1, 32).copy_(R)
             self._cfg_pipeline.run_pipeline()
@@ -1422,9 +1343,6 @@ class Pi05TorchFrontendThor:
         ``_set_prompt_rl`` calls back into ``set_prompt`` with token IDs
         to drive the standard capture path.
         """
-        self._cached_context_ready = False
-        self._cached_enc_x = None
-        self._cached_batched_context_ready = False
         if (self._rl_config is not None
                 and not getattr(self, "_in_rl_set_prompt", False)
                 and isinstance(prompt_text, str)):
@@ -1441,12 +1359,6 @@ class Pi05TorchFrontendThor:
         S_sig = self.sig_S
         nv = self.num_views
 
-        fixed_shape = (
-            self._state_prompt_mode == "fixed"
-            and state is not None
-            and self._rl_config is None
-        )
-
         # ---- Tokenize ----
         if isinstance(prompt_text, (np.ndarray, list)):
             token_ids = np.asarray(prompt_text, dtype=np.int64)
@@ -1455,48 +1367,30 @@ class Pi05TorchFrontendThor:
                 torch.from_numpy(token_ids).long().cuda(), self.embedding_weight)
             embeds = embeds * float(embeds.shape[-1] ** 0.5)
         else:
-            max_len = (self._state_prompt_fixed_max_len
-                       if fixed_shape else PI05_STATE_PROMPT_MAX_LEN)
-            max_len = max_len if state is not None else 48
+            max_len = PI05_STATE_PROMPT_MAX_LEN if state is not None else 48
             embeds, prompt_len = embed_prompt(
                 prompt_text, self.embedding_weight, max_len=max_len,
                 state=state)
 
-# Use fixed Se_max for all prompts to avoid graph recapture on prompt change.
-        # Shorter prompts are padded by repeating the last embedding token.
-        Se = self.Se_max  # Fixed max sequence length (Nv*256 + 256)
-        actual_lang = Se - S_sig  # Max prompt tokens we can store
-        # Pad embeds to fill Se_max space (repeat last token)
-        if prompt_len < actual_lang:
-            pad_len = actual_lang - prompt_len
-            embeds = torch.cat([embeds, embeds[-1:].expand(pad_len, -1)], dim=0)
-            prompt_len = actual_lang
+        # Se must be EVEN for cuBLASLt FP8
+        Se = S_sig + prompt_len
+        if Se % 2 != 0:
+            Se += 1
+        actual_lang = Se - S_sig
+        if actual_lang > prompt_len:
+            embeds = torch.cat([embeds, embeds[-1:]], dim=0)
 
         if (self.graph_captured and self._lang_emb is not None
                 and self._S_lang == actual_lang and self.Se == Se):
             self._lang_emb.copy_(embeds)
-            dec_start = valid_prefix if fixed_shape else Se
-            self._dec_rope.copy_(
-                torch.cat([self._kc_t[dec_start:dec_start + self.Sa, :, None],
-                           self._ks_t[dec_start:dec_start + self.Sa, :, None]], dim=2)
-                .reshape(self.Sa, 256))
-            self._fixed_shape_active = fixed_shape
-            self.current_prompt_len = int(prompt_len)
-            if self._attn is not None:
-                self._attn.set_fixed_shape(fixed_shape)
-                if fixed_shape:
-                    self._attn.set_fixed_valid_len(valid_prefix)
             logger.info(
                 "Updated Pi0.5 Thor prompt in place: '%s' "
-                "(%d tokens, Se=%d, state=%s, mode=%s)",
-                prompt_text, prompt_len, Se, state is not None,
-                "fixed" if fixed_shape else "exact")
+                "(%d tokens, Se=%d, state=%s)",
+                prompt_text, prompt_len, Se, state is not None)
             return
 
         self.Se = Se
         self.total_keys = Se + self.Sa
-        self._fixed_shape_active = fixed_shape
-        self.current_prompt_len = int(prompt_len)
 
         # Stage 1.4 — build AttentionBackend. total_keys must be set first
         # because the encoder/decoder KV cache layer_stride is computed from
@@ -1537,18 +1431,21 @@ class Pi05TorchFrontendThor:
                 "scale":        attn_scale,
             },
         )
-        self._attn.set_fixed_shape(fixed_shape)
-        if fixed_shape:
-            self._attn.set_fixed_valid_len(valid_prefix)
 
         self._lang_emb = embeds
         self._S_lang = actual_lang
+
+        # Propagate lang_emb to batched buffer so batched PostLN sees
+        # the current prompt embeddings (not stale zeros).
+        if self._batched and hasattr(self, '_lang_emb_b2') and self._lang_emb_b2 is not None:
+            for b in range(self.B):
+                self._lang_emb_b2[b, :actual_lang].copy_(embeds[:actual_lang])
 
         # ---- RoPE tables ----
         self._enc_rope[:Se].copy_(
             torch.cat([self._kc_t[:Se, :, None],
                        self._ks_t[:Se, :, None]], dim=2).reshape(Se, 256))
-        dec_start = valid_prefix if fixed_shape else Se
+        dec_start = Se
         self._dec_rope.copy_(
             torch.cat([self._kc_t[dec_start:dec_start + self.Sa, :, None],
                        self._ks_t[dec_start:dec_start + self.Sa, :, None]], dim=2)
@@ -1632,16 +1529,29 @@ class Pi05TorchFrontendThor:
 
         self.graph_captured = True
         self.calibrated = True
-        logger.info("set_prompt done: '%s' (%d tokens, Se=%d, mode=%s)",
-                    prompt_text, prompt_len, Se,
-                    "fixed" if fixed_shape else "exact")
+        self._current_prompt = prompt_text
+        logger.info("set_prompt done: '%s' (%d tokens, Se=%d)", prompt_text, prompt_len, Se)
 
     # -----------------------------------------------------------------------
     # Calibration
     # -----------------------------------------------------------------------
 
-    def _calibrate(self, Se):
-        """Calibrate encoder + decoder FP8 activation scales."""
+    def _calibrate(self, Se, force_recalibrate=False, recompute_enc=False,
+                   compute_ae=True):
+        """Calibrate encoder + decoder FP8 activation scales.
+
+        Args:
+            Se: encoder sequence length for buffer sizing.
+            force_recalibrate: if True, skip cache and compute from current data.
+            recompute_enc: if True, ALWAYS recompute encoder scales from current
+                data (with flash attention), even if cache hits. This is needed
+                for batch inference where cached scales may have been computed
+                with DIFFERENT images than the current batch.
+            compute_ae: if True, also compute decoder (AE) FP8 scales. If False,
+                skip AE calibration (decoder scales must be provided by caller).
+                Skipping AE calibration saves ~20ms per call — critical for
+                per-sample batch inference where we only need fresh enc scales.
+        """
         Le = self.Le; La = self.La
         ae_scale_count = self.steps * La * 4
         total_keys = self.total_keys
@@ -1655,12 +1565,12 @@ class Pi05TorchFrontendThor:
             self._enc_calib_scales = torch.tensor(
                 cached["enc_scales"], dtype=torch.float32, device='cuda')
             enc_ws = self._enc_w_dev.cpu().tolist()
-            # f32 multiply to match production C float arithmetic (not f64!)
             self._enc_alpha_host = [
                 float(np.float32(self._enc_calib_scales[i].item()) * np.float32(enc_ws[i]))
                 for i in range(Le * 4)]
-            self._ae_calib_scales = torch.tensor(
-                cached["ae_scales"], dtype=torch.float32, device='cuda')
+            if compute_ae:
+                self._ae_calib_scales = torch.tensor(
+                    cached["ae_scales"], dtype=torch.float32, device='cuda')
             logger.info("Calibration loaded from cache (enc=%d, ae=%d scales)",
                         Le * 4, ae_scale_count)
             return
@@ -1699,7 +1609,7 @@ class Pi05TorchFrontendThor:
             'L': Le, 'total_keys': total_keys,
         }
 
-        # Encoder calibration — scratch buffers allocated by caller
+        # Encoder calibration — scratch buffers allocated here
         _norm_scratch = torch.empty(Se * De, dtype=fp16, device='cuda')
         _x_scratch = torch.empty(Se * De, dtype=fp16, device='cuda')
         _calib_buf = torch.zeros(Le * 4, dtype=torch.float32, device='cuda')
@@ -1713,15 +1623,18 @@ class Pi05TorchFrontendThor:
         enc_bufs['fp8_scratch'] = _fp8_scratch.data_ptr()
         enc_bufs['ones'] = _ones.data_ptr()
 
+        # Always recompute encoder scales in this path
         self._Kc.zero_(); self._Vc.zero_()
         enc_max = torch.zeros(Le * 4, dtype=torch.float32, device='cuda')
         encoder_forward_calibrate(
             self._gemm, fvk, enc_bufs, enc_weights, enc_dims,
             enc_max.data_ptr(), stream=0, attn=self._attn)
 
-        self._enc_calib_scales = enc_max
+        # In-place copy: REPLACES values but keeps SAME tensor address.
+        # This is critical: any CUDA graphs reading _enc_calib_scales.data_ptr()
+        # will continue reading the same (now-updated) tensor.
+        self._enc_calib_scales.copy_(enc_max)
         enc_ws = self._enc_w_dev.cpu().tolist()
-        # f32 multiply to match production C float arithmetic
         self._enc_alpha_host = [
             float(np.float32(self._enc_calib_scales[i].item()) * np.float32(enc_ws[i]))
             for i in range(Le * 4)]
@@ -1751,7 +1664,6 @@ class Pi05TorchFrontendThor:
             'qw':        self._dec_qkv_flat.data_ptr(),
             'Kc':        self._Kc.reshape(-1).data_ptr(),
             'Vc':        self._Vc.reshape(-1).data_ptr(),
-            'dec_devpos': self._attn.dec_devpos.data_ptr(),
             'ow':        self._dec_o_flat.data_ptr(),
             'sf':        self._sf_all.data_ptr(),
             'gw':        self._dec_gu_flat.data_ptr(),
@@ -1768,7 +1680,6 @@ class Pi05TorchFrontendThor:
             'S': Sa, 'D': Da, 'H': Ha, 'NH': 8, 'HD': 256,
             'steps': 10, 'layers': self.La, 'enc_seq': Se,
             'total_keys': total_keys,
-            'fixed_shape': self._fixed_shape_active,
         }
 
         # Decoder scratch buffers
@@ -1782,16 +1693,16 @@ class Pi05TorchFrontendThor:
         ae_bufs['hidden_scratch'] = _ae_hidden_scratch.data_ptr()
         ae_bufs['fp8_scratch'] = _ae_fp8_scratch.data_ptr()
 
-        self._g_noise.normal_()
-        ae_max = torch.zeros(ae_scale_count, dtype=torch.float32, device='cuda')
-        decoder_forward_calibrate(
-            self._ctx, fvk, ae_bufs, ae_weights, ae_dims,
-            ae_max.data_ptr(), stream=0, attn=self._attn)
-
-        self._ae_calib_scales = ae_max
-        logger.info("Decoder calibrated: %d scales", ae_scale_count)
-
-        # Save to cache
+        # AE calibration: only if compute_ae=True.
+        # When compute_ae=False, caller is responsible for providing _ae_calib_scales.
+        if compute_ae:
+            self._g_noise.normal_()
+            ae_max = torch.zeros(ae_scale_count, dtype=torch.float32, device='cuda')
+            decoder_forward_calibrate(
+                self._ctx, fvk, ae_bufs, ae_weights, ae_dims,
+                ae_max.data_ptr(), stream=0, attn=self._attn)
+            self._ae_calib_scales = ae_max
+            logger.info("Decoder calibrated: %d scales", ae_scale_count)
         try:
             save_calibration(
                 checkpoint_path=self._checkpoint_path,
@@ -1818,6 +1729,24 @@ class Pi05TorchFrontendThor:
                            self._sig_x.data_ptr(), S_sig, D_sig, 588, stream_int)
         fvk.patch_embed_bias_pos(self._sig_x.data_ptr(), self._pe_b.ptr.value,
                                  self._pos_emb.ptr.value, S_sig, D_sig, 256, stream_int)
+
+    def _patch_embed_ops_batched(self, B, stream_int, *, patches_ready=False):
+        """Batched patch embed: im2col -> GEMM -> bias+pos for B samples.
+
+        Input: self._img_buf_b2_all (contiguous B*nv images)
+        Output: self._sig_x_b2 (B*S_sig, D_sig)
+        """
+        S_sig = self.sig_S
+        D_sig = self.sig_D
+        nv_b = B * self.num_views
+        m = B * S_sig
+        if not patches_ready:
+            fvk.patch_im2col(self._img_buf_b2_all.ptr.value,
+                             self._patches_buf_b2.ptr.value, nv_b, stream_int)
+        self._gemm.fp16_nn(self._patches_buf_b2.ptr.value, self._pe_w.ptr.value,
+                           self._sig_x_b2.data_ptr(), m, D_sig, 588, stream_int)
+        fvk.patch_embed_bias_pos(self._sig_x_b2.data_ptr(), self._pe_b.ptr.value,
+                                 self._pos_emb.ptr.value, m, D_sig, 256, stream_int)
 
     # -----------------------------------------------------------------------
     # PostLN + projection
@@ -1879,6 +1808,105 @@ class Pi05TorchFrontendThor:
             self._siglip_graph.capture_end()
         torch.cuda.synchronize()
         logger.info("SigLIP CUDA graph captured (S=%d)", self.sig_S)
+
+    def _capture_siglip_batched_graph(self, B):
+        """Capture batched SigLIP + PostLN graph for B samples.
+
+        The graph processes B*S_sig tokens in one pass.  Patch embedding
+        is run before graph replay; this graph consumes the already-filled
+        batched SigLIP token buffer.
+        """
+        from flash_rt.hardware.thor.shared_primitives_batched import (
+            siglip_forward_batched, postln_project_batched)
+
+        S_sig = self.sig_S
+        D_sig = self.sig_D
+        D_enc = self.De
+        S_lang = self._S_lang
+
+        # Buffers (already allocated in _alloc_b2_buffers)
+        sig_x = self._sig_x_b2          # [B*S_sig, D_sig]
+        sig_x_fp8 = self._sig_x_fp8_b2  # [B*S_sig * D_sig]
+        sig_qkv = self._sig_qkv_b2      # [B*S_sig, 3*D_sig]
+        sig_attn = self._sig_attn_b2    # [B*S_sig, D_sig]
+        sig_hidden = self._sig_hidden_b2 # [B*S_sig, H_sig]
+        sig_hid_fp8 = self._sig_hid_fp8_b2
+        postln_scratch = self._postln_scratch_b2
+
+        bufs = {
+            'x':       sig_x.data_ptr(),
+            'x_fp8':   sig_x_fp8.data_ptr(),
+            'qkv':     sig_qkv.data_ptr(),
+            'attn_out': sig_attn.data_ptr(),
+            'hidden':  sig_hidden.data_ptr(),
+            'hid_fp8': sig_hid_fp8.data_ptr(),
+            'x_norm':  sig_attn.data_ptr(),
+            'fg':      0,
+        }
+
+        dims = {
+            'S': S_sig, 'D': D_sig, 'H': self.sig_H,
+            'NH': self.sig_NH, 'HD': self.sig_HD, 'L': self.sig_L,
+            'num_views': self.num_views, 'seq_per_view': 256,
+            'B': B,
+        }
+
+        postln_bufs = {
+            'x_sig':    sig_x.data_ptr(),
+            'enc_x_b2': self._enc_x_b2.data_ptr(),
+            'scratch':  postln_scratch.data_ptr(),
+        }
+        if self._postln_proj_b2 is not None:
+            postln_bufs['proj'] = self._postln_proj_b2.data_ptr()
+        # Per-sample language embedding pointers
+        lang_emb_ptrs = [
+            self._lang_emb_b2[b].data_ptr() for b in range(B)
+        ]
+        postln_weights = {
+            'ln_w':         self._postln_w.data_ptr(),
+            'ln_b':         self._postln_b.data_ptr(),
+            'proj_w':       self._proj_w.data_ptr(),
+            'proj_b':       self._proj_b.data_ptr(),
+            'lang_emb_list': lang_emb_ptrs,
+        }
+        postln_dims = {
+            'S_sig': S_sig, 'D_sig': D_sig,
+            'D_enc': D_enc, 'S_lang': S_lang, 'B': B,
+        }
+
+        # SigLIP updates sig_x in place through residual projections.
+        # Lazy capture happens after patch embedding has filled sig_x_b2,
+        # so restore that input before capture and before the first replay.
+        sig_x_snapshot = sig_x.detach().clone()
+
+        # Warmup
+        for _ in range(3):
+            siglip_forward_batched(self._gemm, fvk, bufs, self._sig_weights,
+                                   dims, stream=0, attn=self._attn,
+                                   use_fp8=self.use_fp8)
+            postln_project_batched(self._gemm, fvk, postln_bufs,
+                                   postln_weights, postln_dims, stream=0)
+        torch.cuda.synchronize()
+        sig_x.copy_(sig_x_snapshot)
+        torch.cuda.synchronize()
+
+        # Capture
+        stream = torch.cuda.Stream()
+        self._siglip_batched_graph = torch.cuda.CUDAGraph()
+        s_int = stream.cuda_stream
+        with torch.cuda.stream(stream):
+            self._siglip_batched_graph.capture_begin()
+            siglip_forward_batched(self._gemm, fvk, bufs, self._sig_weights,
+                                   dims, stream=s_int, attn=self._attn,
+                                   use_fp8=self.use_fp8)
+            postln_project_batched(self._gemm, fvk, postln_bufs,
+                                   postln_weights, postln_dims, stream=s_int)
+            self._siglip_batched_graph.capture_end()
+        torch.cuda.synchronize()
+        sig_x.copy_(sig_x_snapshot)
+        self._siglip_batched_B = B
+        logger.info("Batched SigLIP CUDA graph captured (B=%d, S=%d)",
+                    B, B * S_sig)
 
     def _capture_enc_ae_graph(self):
         """Capture encoder + decoder (static FP8) as CUDA graph."""
@@ -1946,7 +1974,6 @@ class Pi05TorchFrontendThor:
             'qw':         self._dec_qkv_flat.data_ptr(),
             'Kc':         self._Kc.reshape(-1).data_ptr(),
             'Vc':         self._Vc.reshape(-1).data_ptr(),
-            'dec_devpos': self._attn.dec_devpos.data_ptr(),
             'ow':         self._dec_o_flat.data_ptr(),
             'sf':         self._sf_all.data_ptr(),
             'gw':         self._dec_gu_flat.data_ptr(),
@@ -1964,7 +1991,6 @@ class Pi05TorchFrontendThor:
             'S': Sa, 'D': Da, 'H': Ha, 'NH': 8, 'HD': 256,
             'steps': 10, 'layers': La, 'enc_seq': Se,
             'total_keys': total_keys,
-            'fixed_shape': self._fixed_shape_active,
         }
 
         # Warmup
@@ -1993,346 +2019,7 @@ class Pi05TorchFrontendThor:
                             use_fp8=self.use_fp8)
             self._enc_ae_graph.capture_end()
         torch.cuda.synchronize()
-        self._model_runtime_full_graph = None
-        self._model_runtime_context_graph = None
-        self._model_runtime_decode_only_graph = None
-        self._model_runtime_rtc_prefix_graphs = {}
-        self.pipeline._decoder_only_graph = None
         logger.info("Enc+AE CUDA graph captured (Se=%d)", Se)
-
-    def _runtime_encoder_spec(self):
-        Se = self.Se
-        total_keys = self.total_keys
-        Le = self.Le; De = self.De; He = self.He
-        NHe = self.NHe; HDe = self.HDe
-        enc_bufs = {
-            'x':       self._enc_x.data_ptr(),
-            'x_fp8':   self._enc_x_fp8.data_ptr(),
-            'qkv':     self._enc_qkv_buf.data_ptr(),
-            'logits':  self._enc_logits.data_ptr(),
-            'attn_out': self._enc_attn.data_ptr(),
-            'o_fp8':   self._enc_o_fp8.data_ptr(),
-            'gate':    self._enc_gate.data_ptr(),
-            'hidden':  self._enc_hidden.data_ptr(),
-            'hid_fp8': self._enc_hid_fp8.data_ptr(),
-            'fg':      self._enc_fg.data_ptr(),
-            'ctx':     self._ctx,
-            'x_norm':  self._enc_attn.data_ptr(),
-            'ones':    (self._enc_ones_fp16.data_ptr()
-                        if self._enc_ones_fp16 is not None else 0),
-        }
-        enc_weights = {
-            'qkv_w':     [w.data_ptr() for w in self._enc_qkv_w],
-            'o_w':       [w.data_ptr() for w in self._enc_o_w],
-            'gate_w':    [w.data_ptr() for w in self._enc_gu_w],
-            'down_w':    [w.data_ptr() for w in self._enc_d_w],
-            'rope':      self._enc_rope.data_ptr(),
-            'Kc':        self._Kc.reshape(-1).data_ptr(),
-            'Vc':        self._Vc.reshape(-1).data_ptr(),
-            'act_scales': self._enc_calib_scales.data_ptr(),
-            'alpha_host': self._enc_alpha_host,
-        }
-        enc_dims = {
-            'Se': Se, 'D': De, 'H': He, 'NH': NHe, 'HD': HDe,
-            'L': Le, 'total_keys': total_keys,
-        }
-        return enc_bufs, enc_weights, enc_dims
-
-    def _runtime_decoder_spec(self):
-        Se = self.Se
-        total_keys = self.total_keys
-        La = self.La
-        Sa = self.Sa; Da = self.Da; Ha = self.Ha
-        ae_bufs = {
-            'noise':   self._g_noise.data_ptr(),
-            'x':       self._ae_x.data_ptr(),
-            'xn':      self._ae_xn.data_ptr(),
-            'gate':    self._ae_gate.data_ptr(),
-            'qkv':     self._ae_qkv.data_ptr(),
-            'logits':  self._ae_logits.data_ptr(),
-            'attn_out': self._ae_attn.data_ptr(),
-            'hid':     self._ae_hid.data_ptr(),
-            'fg':      self._ae_fg.data_ptr(),
-            'action_f32': self._ae_action_f32.data_ptr(),
-            'xn_fp8':  self._ae_xn_fp8.data_ptr(),
-            'hid_fp8': self._ae_hid_fp8.data_ptr(),
-            'ctx_fp8': self._ae_ctx_fp8.data_ptr(),
-        }
-        if self._runtime_rtc_prev_action_chunk is not None:
-            ae_bufs['rtc_prev_action_chunk'] = (
-                self._runtime_rtc_prev_action_chunk.ptr.value)
-        ae_weights = {
-            'ain_w':      self._ain_w.data_ptr(),
-            'ain_b':      self._ain_b.data_ptr(),
-            'sa':         self._sa_all.data_ptr(),
-            'qw':         self._dec_qkv_flat.data_ptr(),
-            'Kc':         self._Kc.reshape(-1).data_ptr(),
-            'Vc':         self._Vc.reshape(-1).data_ptr(),
-            'dec_devpos': self._attn.dec_devpos.data_ptr(),
-            'ow':         self._dec_o_flat.data_ptr(),
-            'sf':         self._sf_all.data_ptr(),
-            'gw':         self._dec_gu_flat.data_ptr(),
-            'dw':         self._dec_d_flat.data_ptr(),
-            'aow':        self._aow.data_ptr(),
-            'aob':        self._aob.data_ptr(),
-            'aob_dt':     self._aob_dt.data_ptr(),
-            'dt':         self._ae_dt,
-            'fs':         self._fs_all.data_ptr(),
-            'rope':       self._dec_rope.data_ptr(),
-            'w_scales':   self._ae_w_dev.data_ptr(),
-            'act_scales': self._ae_calib_scales.data_ptr(),
-        }
-        ae_dims = {
-            'S': Sa, 'D': Da, 'H': Ha, 'NH': 8, 'HD': 256,
-            'steps': 10, 'layers': La, 'enc_seq': Se,
-            'total_keys': total_keys,
-            'fixed_shape': self._fixed_shape_active,
-        }
-        return ae_bufs, ae_weights, ae_dims
-
-    def _capture_runtime_graph(self, body, *, log_name: str):
-        for _ in range(3):
-            body(0)
-        torch.cuda.synchronize()
-
-        stream = torch.cuda.Stream()
-        graph = torch.cuda.CUDAGraph()
-        stream_int = stream.cuda_stream
-        with torch.cuda.stream(stream):
-            graph.capture_begin()
-            body(stream_int)
-            graph.capture_end()
-        torch.cuda.synchronize()
-        logger.info("Pi0.5 Thor model-runtime %s graph captured", log_name)
-        return stream, _TorchGraphExport(graph)
-
-    def _run_model_runtime_context(self, stream_int: int, enc_bufs,
-                                   enc_weights, enc_dims) -> None:
-        self._patch_embed_ops(stream_int)
-        siglip_forward(self._gemm, fvk, self._sig_bufs,
-                       self._sig_weights, self._sig_dims,
-                       stream=stream_int, attn=self._attn,
-                       use_fp8=self.use_fp8)
-        self._postln_project_ops(stream_int)
-        self._Kc.zero_()
-        self._Vc.zero_()
-        encoder_forward(self._gemm, fvk, enc_bufs, enc_weights,
-                        enc_dims, stream=stream_int, attn=self._attn,
-                        use_fp8=self.use_fp8)
-
-    def _run_model_runtime_decode(self, stream_int: int, ae_bufs,
-                                  ae_weights, ae_dims,
-                                  rtc_prefix_len: int = 0) -> None:
-        decoder_forward(self._ctx, fvk, ae_bufs, ae_weights,
-                        ae_dims, stream=stream_int, attn=self._attn,
-                        use_fp8=self.use_fp8,
-                        rtc_prefix_len=rtc_prefix_len)
-
-    def _capture_model_runtime_context_action_graphs(
-            self, pipeline, stream_handle, stream_int) -> None:
-        del stream_handle, stream_int
-        if getattr(self, "_model_runtime_context_graph", None) is None:
-            enc_bufs, enc_weights, enc_dims = self._runtime_encoder_spec()
-            stream, graph = self._capture_runtime_graph(
-                lambda s: self._run_model_runtime_context(
-                    s, enc_bufs, enc_weights, enc_dims),
-                log_name="context")
-            self._model_runtime_context_stream = stream
-            self._model_runtime_context_graph = graph
-            from flash_rt.subgraphs.capture import register_captured_graph
-            register_captured_graph(
-                pipeline, "context", graph, exec_name="pi05_thor_context",
-                stream="main", variants=(0,))
-
-        if getattr(self, "_model_runtime_decode_only_graph", None) is None:
-            ae_bufs, ae_weights, ae_dims = self._runtime_decoder_spec()
-            stream, graph = self._capture_runtime_graph(
-                lambda s: self._run_model_runtime_decode(
-                    s, ae_bufs, ae_weights, ae_dims),
-                log_name="decode_only")
-            self._model_runtime_decode_only_stream = stream
-            self._model_runtime_decode_only_graph = graph
-        pipeline._decoder_only_graph = self._model_runtime_decode_only_graph
-
-    def _capture_model_runtime_rtc_prefix_graph(
-            self, pipeline, stream_handle, stream_int, prefix_len: int) -> None:
-        del stream_handle, stream_int
-        prefix = int(prefix_len)
-        if prefix < 0:
-            raise ValueError("prefix_len must be >= 0")
-        if prefix > int(self.Sa):
-            raise ValueError(
-                f"prefix_len {prefix} exceeds chunk_size {self.Sa}")
-        cached = getattr(self, "_model_runtime_rtc_prefix_graphs", None)
-        if cached is None:
-            cached = {}
-            self._model_runtime_rtc_prefix_graphs = cached
-        if prefix in cached:
-            return
-        ae_bufs, ae_weights, ae_dims = self._runtime_decoder_spec()
-        stream, graph = self._capture_runtime_graph(
-            lambda s: self._run_model_runtime_decode(
-                s, ae_bufs, ae_weights, ae_dims, rtc_prefix_len=prefix),
-            log_name=f"decode_rtc_prefix_{prefix}")
-        cached[prefix] = (stream, graph)
-        from flash_rt.subgraphs.capture import register_captured_graph
-        register_captured_graph(
-            pipeline, "decode_rtc_prefix", graph,
-            exec_name=f"pi05_thor_decode_rtc_prefix_{prefix}",
-            stream="main", variants=(0,))
-
-    def _capture_model_runtime_full_graph(self) -> None:
-        """Capture one full Pi0.5 Thor graph for model-runtime export."""
-        Se = self.Se
-        total_keys = self.total_keys
-        Le = self.Le; La = self.La; De = self.De; He = self.He
-        NHe = self.NHe; HDe = self.HDe
-        Sa = self.Sa; Da = self.Da; Ha = self.Ha
-
-        enc_bufs = {
-            'x':       self._enc_x.data_ptr(),
-            'x_fp8':   self._enc_x_fp8.data_ptr(),
-            'qkv':     self._enc_qkv_buf.data_ptr(),
-            'logits':  self._enc_logits.data_ptr(),
-            'attn_out': self._enc_attn.data_ptr(),
-            'o_fp8':   self._enc_o_fp8.data_ptr(),
-            'gate':    self._enc_gate.data_ptr(),
-            'hidden':  self._enc_hidden.data_ptr(),
-            'hid_fp8': self._enc_hid_fp8.data_ptr(),
-            'fg':      self._enc_fg.data_ptr(),
-            'ctx':     self._ctx,
-            'x_norm':  self._enc_attn.data_ptr(),
-            'ones':    (self._enc_ones_fp16.data_ptr()
-                        if self._enc_ones_fp16 is not None else 0),
-        }
-        enc_weights = {
-            'qkv_w':     [w.data_ptr() for w in self._enc_qkv_w],
-            'o_w':       [w.data_ptr() for w in self._enc_o_w],
-            'gate_w':    [w.data_ptr() for w in self._enc_gu_w],
-            'down_w':    [w.data_ptr() for w in self._enc_d_w],
-            'rope':      self._enc_rope.data_ptr(),
-            'Kc':        self._Kc.reshape(-1).data_ptr(),
-            'Vc':        self._Vc.reshape(-1).data_ptr(),
-            'act_scales':  self._enc_calib_scales.data_ptr(),
-            'alpha_host':  self._enc_alpha_host,
-        }
-        enc_dims = {
-            'Se': Se, 'D': De, 'H': He, 'NH': NHe, 'HD': HDe,
-            'L': Le, 'total_keys': total_keys,
-        }
-
-        ae_bufs = {
-            'noise':   self._g_noise.data_ptr(),
-            'x':       self._ae_x.data_ptr(),
-            'xn':      self._ae_xn.data_ptr(),
-            'gate':    self._ae_gate.data_ptr(),
-            'qkv':     self._ae_qkv.data_ptr(),
-            'logits':  self._ae_logits.data_ptr(),
-            'attn_out': self._ae_attn.data_ptr(),
-            'hid':     self._ae_hid.data_ptr(),
-            'fg':      self._ae_fg.data_ptr(),
-            'action_f32': self._ae_action_f32.data_ptr(),
-            'xn_fp8':  self._ae_xn_fp8.data_ptr(),
-            'hid_fp8': self._ae_hid_fp8.data_ptr(),
-            'ctx_fp8': self._ae_ctx_fp8.data_ptr(),
-        }
-        ae_weights = {
-            'ain_w':      self._ain_w.data_ptr(),
-            'ain_b':      self._ain_b.data_ptr(),
-            'sa':         self._sa_all.data_ptr(),
-            'qw':         self._dec_qkv_flat.data_ptr(),
-            'Kc':         self._Kc.reshape(-1).data_ptr(),
-            'Vc':         self._Vc.reshape(-1).data_ptr(),
-            'dec_devpos': self._attn.dec_devpos.data_ptr(),
-            'ow':         self._dec_o_flat.data_ptr(),
-            'sf':         self._sf_all.data_ptr(),
-            'gw':         self._dec_gu_flat.data_ptr(),
-            'dw':         self._dec_d_flat.data_ptr(),
-            'aow':        self._aow.data_ptr(),
-            'aob':        self._aob.data_ptr(),
-            'aob_dt':     self._aob_dt.data_ptr(),
-            'dt':         self._ae_dt,
-            'fs':         self._fs_all.data_ptr(),
-            'rope':       self._dec_rope.data_ptr(),
-            'w_scales':   self._ae_w_dev.data_ptr(),
-            'act_scales': self._ae_calib_scales.data_ptr(),
-        }
-        ae_dims = {
-            'S': Sa, 'D': Da, 'H': Ha, 'NH': 8, 'HD': 256,
-            'steps': 10, 'layers': La, 'enc_seq': Se,
-            'total_keys': total_keys,
-            'fixed_shape': self._fixed_shape_active,
-        }
-
-        def _run(stream_int):
-            self._patch_embed_ops(stream_int)
-            siglip_forward(self._gemm, fvk, self._sig_bufs,
-                           self._sig_weights, self._sig_dims,
-                           stream=stream_int, attn=self._attn,
-                           use_fp8=self.use_fp8)
-            self._postln_project_ops(stream_int)
-            self._Kc.zero_()
-            self._Vc.zero_()
-            encoder_forward(self._gemm, fvk, enc_bufs, enc_weights,
-                            enc_dims, stream=stream_int, attn=self._attn,
-                            use_fp8=self.use_fp8)
-            decoder_forward(self._ctx, fvk, ae_bufs, ae_weights,
-                            ae_dims, stream=stream_int, attn=self._attn,
-                            use_fp8=self.use_fp8)
-
-        for _ in range(3):
-            _run(0)
-        torch.cuda.synchronize()
-
-        stream = torch.cuda.Stream()
-        graph = torch.cuda.CUDAGraph()
-        stream_int = stream.cuda_stream
-        with torch.cuda.stream(stream):
-            graph.capture_begin()
-            _run(stream_int)
-            graph.capture_end()
-        torch.cuda.synchronize()
-
-        self._model_runtime_torch_stream = stream
-        self._model_runtime_graph_stream = ctypes.c_void_p(stream_int)
-        self._model_runtime_full_graph = _TorchGraphExport(graph)
-        logger.info("Pi0.5 Thor model-runtime full graph captured (Se=%d)", Se)
-
-    def _ensure_model_runtime_export(self) -> None:
-        if not self.graph_captured:
-            raise RuntimeError(
-                "Pi0.5 Thor export requires set_prompt()/predict() first")
-        if self._model_runtime_full_graph is None:
-            self._capture_model_runtime_full_graph()
-        if self._runtime_rtc_prev_action_chunk is None:
-            self._runtime_rtc_prev_action_chunk = CudaBuffer.device_empty(
-                self.Sa * 32, np.float16)
-            self._runtime_rtc_prefix_weights = CudaBuffer.device_empty(
-                self.Sa, np.float32)
-            self._runtime_rtc_guidance_weight = CudaBuffer.device_empty(
-                1, np.float32)
-
-        bufs = {
-            "observation_images_normalized": self._img_buf,
-            "diffusion_noise": _TorchTensorBuffer(self._g_noise),
-            "encoder_x": _TorchTensorBuffer(self._enc_x),
-            "rtc_prev_action_chunk": self._runtime_rtc_prev_action_chunk,
-            "rtc_prefix_weights": self._runtime_rtc_prefix_weights,
-            "rtc_guidance_weight": self._runtime_rtc_guidance_weight,
-        }
-        self.pipeline.bind_runtime_export(
-            graph=self._model_runtime_full_graph,
-            graph_stream=self._model_runtime_graph_stream,
-            bufs=bufs,
-            decoder_only_graph=None,
-            num_views=self.num_views,
-            max_prompt_len=getattr(self, "_S_lang", self.current_prompt_len),
-            chunk_size=self.Sa,
-            norm_stats=self.norm_stats,
-            use_fp8=self.use_fp8,
-            tensor_dtype="f16",
-            hardware="thor_sm110",
-        )
 
     def _capture_enc_ae_graph_b2(self):
         """Capture B=N encoder + decoder as a CUDA graph (Stage 2).
@@ -2417,6 +2104,10 @@ class Pi05TorchFrontendThor:
             'v_b2':    self._v_b2.data_ptr(),
             'v_b2_f32': self._v_b2_f32.data_ptr(),
         }
+        # Per-sample total_keys and enc_seq (uniform for graph capture)
+        _total_keys_b2 = [total_keys] * B
+        _enc_seq_b2 = [Se] * B
+
         ae_weights_b2 = {
             'ain_w':      self._ain_w.data_ptr(),
             'ain_b':      self._ain_b.data_ptr(),
@@ -2424,6 +2115,8 @@ class Pi05TorchFrontendThor:
             'qw':         self._dec_qkv_flat.data_ptr(),
             'Kc_b2':      kc_b2,
             'Vc_b2':      vc_b2,
+            'total_keys_b2': _total_keys_b2,
+            'enc_seq_b2':    _enc_seq_b2,
             'ow':         self._dec_o_flat.data_ptr(),
             'sf':         self._sf_all_b2.data_ptr(),
             'gw':         self._dec_gu_flat.data_ptr(),
@@ -2450,17 +2143,27 @@ class Pi05TorchFrontendThor:
         cfg_beta = self._enc_ae_graph_b2_cfg_beta
 
         def _b2_run(stream):
-            for b in range(B):
-                self._Kc_b2[b].zero_(); self._Vc_b2[b].zero_()
+            if not self.batched_skip_kv_zero:
+                self._Kc_b2.zero_(); self._Vc_b2.zero_()
             encoder_forward_b2(self._gemm, fvk, enc_bufs_b2, enc_weights_b2,
                                 enc_dims_b2, stream=stream, B=B)
             decoder_forward_b2(self._ctx, fvk, ae_bufs_b2, ae_weights_b2,
                                 ae_dims_b2, stream=stream, B=B,
                                 cfg_beta=cfg_beta)
 
+        # Graph warmup/capture runs the encoder and decoder in place.
+        # infer_multi_prompt_batch stages fresh encoder inputs and noise
+        # before first lazy capture, so restore them to keep the first
+        # replay bit-identical to later replays with the same seed.
+        enc_x_snapshot = self._enc_x_b2.detach().clone()
+        noise_snapshot = self._g_noise_b2.detach().clone()
+
         # Warmup
         for _ in range(3):
             _b2_run(0)
+        torch.cuda.synchronize()
+        self._enc_x_b2.copy_(enc_x_snapshot)
+        self._g_noise_b2.copy_(noise_snapshot)
         torch.cuda.synchronize()
 
         # Capture
@@ -2472,9 +2175,12 @@ class Pi05TorchFrontendThor:
             _b2_run(s_int)
             self._enc_ae_graph_b2.capture_end()
         torch.cuda.synchronize()
+        self._enc_x_b2.copy_(enc_x_snapshot)
+        self._g_noise_b2.copy_(noise_snapshot)
         logger.info(
-            "Enc+AE CUDA graph captured at B=%d (Se=%d, total_keys=%d)",
-            B, Se, total_keys)
+            "Enc+AE CUDA graph captured at B=%d (Se=%d, total_keys=%d, "
+            "skip_kv_zero=%s)",
+            B, Se, total_keys, self.batched_skip_kv_zero)
 
     def _capture_cfg_b2_outer_graph(self, cfg_beta: float) -> None:
         """Capture the entire fused-CFG B=2 pipeline as one outer graph.
@@ -2626,8 +2332,8 @@ class Pi05TorchFrontendThor:
                 self._enc_x.data_ptr(),
                 enc_x_slot_bytes, stream_int)
             # Encoder + Decoder at B=2 with per-step CFG.
-            for b in range(B):
-                self._Kc_b2[b].zero_(); self._Vc_b2[b].zero_()
+            if not self.batched_skip_kv_zero:
+                self._Kc_b2.zero_(); self._Vc_b2.zero_()
             encoder_forward_b2(
                 self._gemm, fvk, enc_bufs_b2, enc_weights_b2,
                 enc_dims_b2, stream=stream_int, B=B)
@@ -2702,6 +2408,86 @@ class Pi05TorchFrontendThor:
         logger.info("  [B2 autotune] kept best: p50=%.2f ms (of %d trials)",
                     best_p50, n_trials)
 
+    def _autotune_siglip_batched_graph(self, B: int, n_trials: int = 3,
+                                       n_bench: int = 10) -> None:
+        """Capture the B=N SigLIP/PostLN graph N times, keep fastest."""
+        sig_x_snapshot = self._sig_x_b2.detach().clone()
+        candidates = []
+        for trial in range(n_trials):
+            self._siglip_batched_graph = None
+            self._capture_siglip_batched_graph(B)
+            graph = self._siglip_batched_graph
+
+            latencies = []
+            for _ in range(n_bench):
+                self._sig_x_b2.copy_(sig_x_snapshot)
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                graph.replay()
+                torch.cuda.synchronize()
+                latencies.append((time.perf_counter() - t0) * 1000)
+            self._sig_x_b2.copy_(sig_x_snapshot)
+            torch.cuda.synchronize()
+
+            latencies.sort()
+            p50 = latencies[len(latencies) // 2]
+            candidates.append((p50, graph))
+            logger.info("  [B%d siglip autotune] trial %d/%d: p50=%.2f ms",
+                        B, trial + 1, n_trials, p50)
+
+        best_p50, best_graph = min(candidates, key=lambda x: x[0])
+        self._siglip_batched_graph = best_graph
+        self._siglip_batched_B = B
+        for p50, g in candidates:
+            if g is not best_graph:
+                del g
+        self._sig_x_b2.copy_(sig_x_snapshot)
+        torch.cuda.synchronize()
+        logger.info(
+            "  [B%d siglip autotune] kept best: p50=%.2f ms (of %d trials)",
+            B, best_p50, n_trials)
+
+    def _autotune_enc_ae_graph_b2(self, n_trials: int = 3,
+                                  n_bench: int = 10) -> None:
+        """Capture the generic B=N enc+ae graph N times, keep fastest."""
+        enc_x_snapshot = self._enc_x_b2.detach().clone()
+        noise_snapshot = self._g_noise_b2.detach().clone()
+        candidates = []
+        for trial in range(n_trials):
+            self._enc_ae_graph_b2 = None
+            self._capture_enc_ae_graph_b2()
+            graph = self._enc_ae_graph_b2
+
+            latencies = []
+            for _ in range(n_bench):
+                self._enc_x_b2.copy_(enc_x_snapshot)
+                self._g_noise_b2.copy_(noise_snapshot)
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                graph.replay()
+                torch.cuda.synchronize()
+                latencies.append((time.perf_counter() - t0) * 1000)
+            self._enc_x_b2.copy_(enc_x_snapshot)
+            self._g_noise_b2.copy_(noise_snapshot)
+            torch.cuda.synchronize()
+            latencies.sort()
+            p50 = latencies[len(latencies) // 2]
+            candidates.append((p50, graph))
+            logger.info("  [B%d enc+ae autotune] trial %d/%d: p50=%.2f ms",
+                        self.B, trial + 1, n_trials, p50)
+
+        best_p50, best_graph = min(candidates, key=lambda x: x[0])
+        self._enc_ae_graph_b2 = best_graph
+        for p50, g in candidates:
+            if g is not best_graph:
+                del g
+        self._enc_x_b2.copy_(enc_x_snapshot)
+        self._g_noise_b2.copy_(noise_snapshot)
+        torch.cuda.synchronize()
+        logger.info(
+            "  [B%d enc+ae autotune] kept best: p50=%.2f ms (of %d trials)",
+            self.B, best_p50, n_trials)
+
     def set_batched_mode(self, *, enable: bool = True,
                           batch_size: int = 2) -> None:
         """Switch the frontend to / from B=N batched inference (Stage 2).
@@ -2747,6 +2533,27 @@ class Pi05TorchFrontendThor:
         if not restored and (self._Kc_b2 is None or self.B != batch_size):
             self._alloc_b2_buffers(B=batch_size)
 
+        # Pre-allocate attention backends for each stream.
+        # This avoids the overhead of creating ThorFlashAttnBackend copies
+        # on every infer_multi_prompt_batch call, which was causing significant
+        # performance overhead due to __dict__.copy() and stream_attn configuration.
+        #
+        # INNOVATION: Persistent per-sample attention backends with pre-configured
+        # KV cache slots. Each backend is initialized once and reused across all
+        # inference calls, eliminating the per-call setup overhead.
+        self._stream_attn_b2 = []
+        for b in range(batch_size):
+            stream_attn = ThorFlashAttnBackend.__new__(ThorFlashAttnBackend)
+            stream_attn.__dict__.update(self._attn.__dict__)
+            stream_attn._spec = self._attn._spec
+            stream_attn.refresh_per_layer_kv = self._attn.refresh_per_layer_kv
+            self._stream_attn_b2.append(stream_attn)
+
+        # Record the per-call batch Se_max so _alloc_b2_buffers can be
+        # called with the correct sequence length by infer_multi_prompt_batch.
+        # This is consumed by the subsequent _alloc_b2_buffers(B=B,Se_dynamic=Se_max)
+        # call in that method.
+
         self._batched = True
         self.B = int(batch_size)
         # Force re-capture: next set_prompt or explicit
@@ -2756,15 +2563,9 @@ class Pi05TorchFrontendThor:
             self._enc_ae_graph_b2 = None
             self._batch_graph_bank_active_key = None
         logger.info(
-<<<<<<< HEAD
-            "Batched mode ENABLED (B=%d). Call set_prompt() then "
-            "_capture_enc_ae_graph_b2() to capture the b2 graph.",
-            batch_size)
-=======
             "Batched mode ENABLED (B=%d) with %d persistent attention backends%s.",
             batch_size, len(self._stream_attn_b2),
             " from graph bank" if restored else "")
->>>>>>> 7688d19 (perf: refine thor pi05 batch research path)
 
     def infer_batch(self, observations):
         """Run B=N batched inference on a list of observations.
@@ -2788,7 +2589,11 @@ class Pi05TorchFrontendThor:
             raise RuntimeError(
                 "set_batched_mode(enable=True) must be called first")
         if self._enc_ae_graph_b2 is None:
-            self._capture_enc_ae_graph_b2()
+            if self.batched_graph_autotune and self.autotune > 0:
+                self._autotune_enc_ae_graph_b2(
+                    n_trials=self.autotune, n_bench=10)
+            else:
+                self._capture_enc_ae_graph_b2()
 
         if isinstance(observations, dict):
             observations = [observations] * self.B
@@ -2840,7 +2645,8 @@ class Pi05TorchFrontendThor:
 
         # ── Run B=N enc+ae graph ──
         self._enc_ae_graph_b2.replay()
-        torch.cuda.synchronize()
+        if self.batched_sync_after_graph:
+            torch.cuda.synchronize()
 
         latency_ms = (time.perf_counter() - t0) * 1000
         self.latency_records.append(latency_ms)
@@ -2855,11 +2661,6 @@ class Pi05TorchFrontendThor:
                 {"actions": unnorm[:, :LIBERO_ACTION_DIM]})
         return results
 
-<<<<<<< HEAD
-    # -----------------------------------------------------------------------
-    # Autotune: try multiple graph captures, keep the fastest
-    # -----------------------------------------------------------------------
-=======
     def _run_serial_batch(self, obs_list, prompts):
         """Internal: Run serial inference for each item in the list.
 
@@ -2942,12 +2743,7 @@ class Pi05TorchFrontendThor:
 
         if max_S_lang % 2 != 0:
             max_S_lang += 1
-<<<<<<< HEAD
-        # Use fixed self.Se_max for all batches to avoid graph recapture
-        Se_max = self.Se_max
-=======
         Se_max = S_sig + max_S_lang
->>>>>>> 7688d19 (perf: refine thor pi05 batch research path)
         batch_S_lang = Se_max - S_sig
 
         # Lazy initialization: if set_prompt was never called, we need to
@@ -3252,7 +3048,6 @@ class Pi05TorchFrontendThor:
         self._attn.refresh_per_layer_kv(('encoder',))
 
         return results
->>>>>>> 7cbdcdd (feat: add cached context inference support for context reuse benchmarks)
 
     def _autotune_enc_ae(self, n_trials=5, n_bench=10):
         """Autotune Enc+AE graph: recapture until fast schedule is found.
@@ -3316,8 +3111,7 @@ class Pi05TorchFrontendThor:
     # Inference
     # -----------------------------------------------------------------------
 
-<<<<<<< HEAD
-    def infer(self, observation, debug=False):
+    def infer(self, observation, debug=False, seed=None):
         """Run inference: images -> CUDA graph replay -> actions.
 
         Args:
@@ -3327,13 +3121,11 @@ class Pi05TorchFrontendThor:
             {"actions": np.ndarray}  shape (Sa, LIBERO_ACTION_DIM)
         """
         if self._rl_config is not None:
-            return self._infer_cfg(observation, debug)
+            return self._infer_cfg(observation, debug, seed)
         t0 = time.perf_counter()
-=======
-    def _observation_images_np(self, observation):
-        """Convert an observation into the fp16 image stack consumed by SigLIP."""
->>>>>>> 7cbdcdd (feat: add cached context inference support for context reuse benchmarks)
         nv = self.num_views
+
+        # ---- Collect and upload images ----
         if 'images' in observation:
             img_list = observation['images']
         else:
@@ -3352,106 +3144,7 @@ class Pi05TorchFrontendThor:
                 return im
             return (im.astype(np.float32) / 127.5 - 1.0).astype(np.float16)
 
-        return np.stack([_to_np16(im) for im in img_list[:nv]])
-
-    def stage_context(self, observation):
-        """Stage visual-language context for repeated action sampling.
-
-        This updates ``_enc_x`` by running the SigLIP/PostLN graph only.
-        Callers may then invoke :meth:`infer_from_cached_context` one or more
-        times while the observation and prompt are unchanged.  The normal
-        :meth:`infer` path is unaffected and remains the correct API when every
-        action request has a fresh observation.
-        """
-        if self._rl_config is not None:
-            raise RuntimeError(
-                "stage_context() is only implemented for the non-CFG Thor path")
-        if getattr(self, "_siglip_graph", None) is None:
-            raise RuntimeError("set_prompt() must be called before stage_context()")
-
-        images_np = self._observation_images_np(observation)
-        self._img_buf.upload(images_np)
-        self._siglip_graph.replay()
-
-        if self.use_fp8 and not self._real_data_calibrated:
-            torch.cuda.synchronize()
-            self._recalibrate_with_real_data()
-            self._real_data_calibrated = True
-            # Graph recapture uses a dummy image; replay the requested
-            # observation again so the cached context is the caller's context.
-            self._img_buf.upload(images_np)
-            self._siglip_graph.replay()
-
-        self._cached_enc_x = self._enc_x[:self.Se].detach().clone()
-        self._cached_context_ready = True
-        return {"cached_context_ready": True}
-
-    def infer_from_cached_context(self, debug=False, seed=None):
-        """Run action generation from the currently staged context.
-
-        Preconditions:
-          * ``set_prompt()`` has been called.
-          * ``stage_context(observation)`` was called for the current
-            observation/prompt.  Full ``infer()`` calls do not stage reusable
-            context because the Enc+AE graph updates ``_enc_x`` in place.
-        """
-        if self._rl_config is not None:
-            raise RuntimeError(
-                "infer_from_cached_context() is only implemented for the "
-                "non-CFG Thor path")
-        if not getattr(self, "_cached_context_ready", False):
-            raise RuntimeError(
-                "No reusable visual-language context is staged; call "
-                "stage_context(observation) first.")
-        cached_enc_x = getattr(self, "_cached_enc_x", None)
-        if cached_enc_x is None:
-            raise RuntimeError(
-                "Cached context snapshot is missing; call "
-                "stage_context(observation) first.")
-        if self._enc_ae_graph is None:
-            self._capture_enc_ae_graph()
-
-        t0 = time.perf_counter()
-        self._enc_x[:self.Se].copy_(cached_enc_x)
-        if seed is not None:
-            R_np = np.random.RandomState(seed).randn(self.Sa, 32).astype(np.float16)
-        else:
-            R_np = np.random.randn(self.Sa, 32).astype(np.float16)
-        R = torch.from_numpy(R_np).to('cuda', non_blocking=True)
-        self._g_noise.view(-1, 32).copy_(R)
-        self._enc_ae_graph.replay()
-        torch.cuda.synchronize()
-
-        latency_ms = (time.perf_counter() - t0) * 1000
-        self.latency_records.append(latency_ms)
-
-        raw_actions = self._g_noise.float().cpu().numpy()
-        unnorm = unnormalize_actions(raw_actions, self.norm_stats)
-        robot_actions = unnorm[:, :LIBERO_ACTION_DIM]
-
-        if debug:
-            logger.info("Cached raw actions[0,:5]: %s", raw_actions[0, :5])
-            logger.info("Cached robot actions[0]: %s", robot_actions[0])
-            logger.info("Cached latency: %.1f ms", latency_ms)
-
-        return {"actions": robot_actions}
-
-    def infer(self, observation, debug=False, seed=None):
-        """Run inference: images -> CUDA graph replay -> actions.
-
-        Args:
-            observation: dict with 'image' and 'wrist_image' (or 'images' list).
-                         Each image is (224,224,3) uint8 or float16 numpy.
-        Returns:
-            {"actions": np.ndarray}  shape (Sa, LIBERO_ACTION_DIM)
-        """
-        if self._rl_config is not None:
-            return self._infer_cfg(observation, debug, seed)
-        self._cached_context_ready = False
-        t0 = time.perf_counter()
-
-        # ---- Collect and upload images ----
-        images_np = self._observation_images_np(observation)
+        images_np = np.stack([_to_np16(im) for im in img_list[:nv]])
         self._img_buf.upload(images_np)
 
         # ---- Graph 1: SigLIP + PostLN ----
@@ -3465,17 +3158,16 @@ class Pi05TorchFrontendThor:
             torch.cuda.synchronize()
             self._recalibrate_with_real_data()
             self._real_data_calibrated = True
-            # Graph recapture uses a dummy image; replay the current
-            # observation so this inference still consumes the caller's frame.
-            self._img_buf.upload(images_np)
-            self._siglip_graph.replay()
 
         # ---- Graph 2: Encoder + Decoder ----
         # numpy CPU RNG so the bit pattern matches the JAX frontend's
         # standard infer path (cross-backend determinism + lets the RL
         # CFG path's β=1.0 output collapse cleanly to this cond-only
         # baseline — both use the same numpy seed → same R).
-        R_np = np.random.randn(self.Sa, 32).astype(np.float16)
+        if seed is not None:
+            R_np = np.random.RandomState(seed).randn(self.Sa, 32).astype(np.float16)
+        else:
+            R_np = np.random.randn(self.Sa, 32).astype(np.float16)
         R = torch.from_numpy(R_np).to('cuda', non_blocking=True)
         self._g_noise.view(-1, 32).copy_(R)
         self._enc_ae_graph.replay()
@@ -3495,6 +3187,222 @@ class Pi05TorchFrontendThor:
             logger.info("Latency: %.1f ms", latency_ms)
 
         return {"actions": robot_actions}
+
+    # -----------------------------------------------------------------------
+    # Pipelined Encoder-Decoder Inference
+    # -----------------------------------------------------------------------
+
+    def enable_pipeline_mode(self):
+        """Enable double-buffered KV cache for encoder-decoder pipelining.
+
+        Creates alternate KV cache buffers and CUDA streams so that
+        encoder(frame N+1) can overlap with decoder(frame N).
+        Call once after set_prompt().
+        """
+        if not hasattr(self, '_Kc') or self._Kc is None:
+            raise RuntimeError("set_prompt() must be called before enable_pipeline_mode()")
+
+        # Create alternate KV cache buffers (same shape as originals)
+        self._Kc_alt = torch.zeros_like(self._Kc)
+        self._Vc_alt = torch.zeros_like(self._Vc)
+
+        # CUDA streams for pipelining
+        self._enc_stream = torch.cuda.Stream()
+        self._dec_stream = torch.cuda.Stream()
+
+        # State: which KV buffer is "current" (encoder writes here)
+        # and which is "previous" (decoder reads from here)
+        self._kv_is_alt = False  # False: enc→_Kc, dec→_Kc_alt; True: opposite
+        self._has_prev_frame = False
+        self._prev_noise = None  # noise tensor for the previous frame's decoder
+        self._prev_actions = None
+
+        logger.info("Pipeline mode enabled (double-buffered KV cache)")
+
+    def _swap_kv_buffers(self):
+        """Swap current/alternate KV cache buffers and update attention backend."""
+        self._kv_is_alt = not self._kv_is_alt
+        if self._kv_is_alt:
+            enc_Kc, enc_Vc = self._Kc_alt, self._Vc_alt
+            dec_Kc, dec_Vc = self._Kc, self._Vc
+        else:
+            enc_Kc, enc_Vc = self._Kc, self._Vc
+            dec_Kc, dec_Vc = self._Kc_alt, self._Vc_alt
+
+        # Update attention backend slots for encoder
+        self._attn._slots['encoder']['Kc'] = enc_Kc.reshape(-1).data_ptr()
+        self._attn._slots['encoder']['Vc'] = enc_Vc.reshape(-1).data_ptr()
+        # Update attention backend slots for decoder
+        self._attn._slots['decoder']['Kc'] = dec_Kc.reshape(-1).data_ptr()
+        self._attn._slots['decoder']['Vc'] = dec_Vc.reshape(-1).data_ptr()
+        self._attn.refresh_per_layer_kv(["encoder", "decoder"])
+
+        return enc_Kc, enc_Vc, dec_Kc, dec_Vc
+
+    def infer_pipelined(self, observation, seed=None):
+        """Pipelined inference: encoder(frame N+1) overlaps decoder(frame N).
+
+        On the first call, runs full SigLIP + Encoder + Decoder (no overlap).
+        On subsequent calls, overlaps the encoder of the current frame with
+        the decoder of the previous frame, saving ~3-6ms per frame.
+
+        Args:
+            observation: dict with 'image' and 'wrist_image'.
+            seed: optional numpy seed for deterministic noise.
+
+        Returns:
+            {"actions": np.ndarray} shape (Sa, LIBERO_ACTION_DIM)
+            On the first call, returns actions for frame 0.
+            On subsequent calls, returns actions for the PREVIOUS frame
+            (the one whose decoder just completed).
+        """
+        t0 = time.perf_counter()
+        nv = self.num_views
+
+        # ---- Collect and upload images ----
+        if 'images' in observation:
+            img_list = observation['images']
+        else:
+            img_list = [observation['image']]
+            if nv >= 2:
+                img_list.append(observation.get('wrist_image', observation['image']))
+            if nv >= 3:
+                img_list.append(observation.get('wrist_image_right', img_list[-1]))
+
+        def _to_np16(im):
+            if isinstance(im, torch.Tensor):
+                return im.to(dtype=torch.float16).cpu().numpy()
+            if im.dtype == np.float16:
+                return im
+            return (im.astype(np.float32) / 127.5 - 1.0).astype(np.float16)
+
+        images_np = np.stack([_to_np16(im) for im in img_list[:nv]])
+
+        # Generate noise for current frame
+        if seed is not None:
+            R_np = np.random.RandomState(seed).randn(self.Sa, 32).astype(np.float16)
+        else:
+            R_np = np.random.randn(self.Sa, 32).astype(np.float16)
+        cur_noise = torch.from_numpy(R_np).to('cuda', non_blocking=True)
+
+        if not self._has_prev_frame:
+            # ---- First frame: full sequential path (no overlap) ----
+            self._img_buf.upload(images_np)
+            self._siglip_graph.replay()
+
+            # Swap KV buffers: encoder writes to current, decoder reads from same
+            enc_Kc, enc_Vc, dec_Kc, dec_Vc = self._swap_kv_buffers()
+            enc_Kc.zero_(); enc_Vc.zero_()
+
+            # Encoder + Decoder on default stream
+            self._g_noise.view(-1, 32).copy_(cur_noise)
+            self._enc_ae_graph.replay()
+            torch.cuda.synchronize()
+
+            # Save state for next call
+            self._has_prev_frame = True
+            self._prev_noise = cur_noise
+
+            latency_ms = (time.perf_counter() - t0) * 1000
+            self.latency_records.append(latency_ms)
+
+            raw_actions = self._g_noise.float().cpu().numpy()
+            unnorm = unnormalize_actions(raw_actions, self.norm_stats)
+            return {"actions": unnorm[:, :LIBERO_ACTION_DIM]}
+
+        # ---- Subsequent frames: pipelined execution ----
+
+        # 1. Swap KV buffers: encoder writes to new buffer, decoder reads from old
+        enc_Kc, enc_Vc, dec_Kc, dec_Vc = self._swap_kv_buffers()
+
+        # 2. Upload image + SigLIP on enc_stream
+        with torch.cuda.stream(self._enc_stream):
+            self._img_buf.upload(images_np)
+            self._siglip_graph.replay()
+            # Zero the encoder's KV cache (must happen after swap)
+            enc_Kc.zero_(); enc_Vc.zero_()
+            # Encoder (writes to enc_Kc/enc_Vc)
+            from flash_rt.hardware.thor.shared_primitives import encoder_forward
+            enc_bufs = {
+                'x': self._enc_x.data_ptr(), 'x_fp8': self._enc_x_fp8.data_ptr(),
+                'qkv': self._enc_qkv_buf.data_ptr(), 'logits': self._enc_logits.data_ptr(),
+                'attn_out': self._enc_attn.data_ptr(), 'o_fp8': self._enc_o_fp8.data_ptr(),
+                'gate': self._enc_gate.data_ptr(), 'hidden': self._enc_hidden.data_ptr(),
+                'hid_fp8': self._enc_hid_fp8.data_ptr(), 'fg': self._enc_fg.data_ptr(),
+                'ctx': self._ctx,
+                'x_norm': self._enc_attn.data_ptr(),
+                'ones': self._enc_ones_fp16.data_ptr() if self._enc_ones_fp16 is not None else 0,
+            }
+            enc_weights = {
+                'qkv_w': [w.data_ptr() for w in self._enc_qkv_w],
+                'o_w': [w.data_ptr() for w in self._enc_o_w],
+                'gate_w': [w.data_ptr() for w in self._enc_gu_w],
+                'down_w': [w.data_ptr() for w in self._enc_d_w],
+                'rope': self._enc_rope.data_ptr(),
+                'Kc': enc_Kc.reshape(-1).data_ptr(),
+                'Vc': enc_Vc.reshape(-1).data_ptr(),
+                'act_scales': self._enc_calib_scales.data_ptr(),
+                'alpha_host': self._enc_alpha_host,
+            }
+            enc_dims = {
+                'Se': self.Se, 'D': self.De, 'H': self.He, 'NH': self.NHe,
+                'HD': self.HDe, 'L': self.Le, 'total_keys': self.total_keys,
+            }
+            if self.use_fp8:
+                enc_weights['act_scales'] = self._enc_calib_scales.data_ptr()
+                enc_weights['alpha_host'] = self._enc_alpha_host
+            s_enc = self._enc_stream.cuda_stream
+            encoder_forward(self._gemm, fvk, enc_bufs, enc_weights,
+                           enc_dims, stream=s_enc, attn=self._attn,
+                           use_fp8=self.use_fp8)
+
+        # 3. Decoder for PREVIOUS frame on dec_stream (reads from dec_Kc/dec_Vc)
+        with torch.cuda.stream(self._dec_stream):
+            self._g_noise.view(-1, 32).copy_(self._prev_noise)
+            from flash_rt.models.pi05.pipeline_thor import decoder_forward
+            ae_bufs = {
+                'noise': self._g_noise.data_ptr(), 'x': self._ae_x.data_ptr(),
+                'xn': self._ae_xn.data_ptr(), 'gate': self._ae_gate.data_ptr(),
+                'qkv': self._ae_qkv.data_ptr(), 'logits': self._ae_logits.data_ptr(),
+                'attn_out': self._ae_attn.data_ptr(), 'hid': self._ae_hid.data_ptr(),
+                'fg': self._ae_fg.data_ptr(), 'xn_fp8': self._ae_xn_fp8.data_ptr(),
+                'hid_fp8': self._ae_hid_fp8.data_ptr(), 'ctx_fp8': self._ae_ctx_fp8.data_ptr(),
+            }
+            ae_weights = {
+                'ain_w': self._ain_w.data_ptr(), 'ain_b': self._ain_b.data_ptr(),
+                'sa': self._sa_all.data_ptr(), 'qw': self._dec_qkv_flat.data_ptr(),
+                'Kc': dec_Kc.reshape(-1).data_ptr(),
+                'Vc': dec_Vc.reshape(-1).data_ptr(),
+                'ow': self._dec_o_flat.data_ptr(), 'sf': self._sf_all.data_ptr(),
+                'gw': self._dec_gu_flat.data_ptr(), 'dw': self._dec_d_flat.data_ptr(),
+                'aow': self._aow.data_ptr(), 'aob': self._aob.data_ptr(),
+                'fs': self._fs_all.data_ptr(), 'rope': self._dec_rope.data_ptr(),
+                'w_scales': self._ae_w_dev.data_ptr(),
+                'act_scales': self._ae_calib_scales.data_ptr(),
+            }
+            ae_dims = {
+                'S': self.Sa, 'D': self.Da, 'H': self.Ha, 'NH': 8, 'HD': 256,
+                'steps': 10, 'layers': self.La, 'enc_seq': self.Se,
+                'total_keys': self.total_keys,
+            }
+            s_dec = self._dec_stream.cuda_stream
+            decoder_forward(self._ctx, fvk, ae_bufs, ae_weights,
+                           ae_dims, stream=s_dec, attn=self._attn,
+                           use_fp8=self.use_fp8)
+
+        # 4. Wait for both streams
+        torch.cuda.synchronize()
+
+        # Save current noise for next call's decoder
+        self._prev_noise = cur_noise
+
+        latency_ms = (time.perf_counter() - t0) * 1000
+        self.latency_records.append(latency_ms)
+
+        # Return actions from the PREVIOUS frame's decoder
+        raw_actions = self._g_noise.float().cpu().numpy()
+        unnorm = unnormalize_actions(raw_actions, self.norm_stats)
+        return {"actions": unnorm[:, :LIBERO_ACTION_DIM]}
 
     # -----------------------------------------------------------------------
     # Real-data recalibration (called once after first real image)
@@ -3644,7 +3552,6 @@ class Pi05TorchFrontendThor:
             'qw':         self._dec_qkv_flat.data_ptr(),
             'Kc':         self._Kc.reshape(-1).data_ptr(),
             'Vc':         self._Vc.reshape(-1).data_ptr(),
-            'dec_devpos': self._attn.dec_devpos.data_ptr(),
             'ow':         self._dec_o_flat.data_ptr(),
             'sf':         self._sf_all.data_ptr(),
             'gw':         self._dec_gu_flat.data_ptr(),
@@ -3661,7 +3568,6 @@ class Pi05TorchFrontendThor:
             'S': Sa, 'D': Da, 'H': Ha, 'NH': 8, 'HD': 256,
             'steps': 10, 'layers': self.La, 'enc_seq': Se,
             'total_keys': total_keys,
-            'fixed_shape': self._fixed_shape_active,
         }
 
         _ae_calib_buf = torch.zeros(ae_scale_count, dtype=torch.float32, device='cuda')
@@ -3680,9 +3586,20 @@ class Pi05TorchFrontendThor:
             self._ae_calib_scales.data_ptr(), stream=0, attn=self._attn)
         torch.cuda.synchronize()
 
-        # Recapture graph with updated scales
+        # Recapture graphs with updated scales.
+        # Both the SigLIP graph (PostLN FP8 scales) and the enc+ae graph
+        # must be refreshed — the SigLIP graph was captured at set_prompt()
+        # time with pre-calibration scales.
+        self._capture_siglip_graph()
         self._capture_enc_ae_graph()
-        logger.info("Recalibrated with real data + graph recaptured")
+        # Also recapture the batched enc+ae graph if batched mode is active.
+        if self._batched and self.B >= 2:
+            if self.batched_graph_autotune and self.autotune > 0:
+                self._autotune_enc_ae_graph_b2(
+                    n_trials=self.autotune, n_bench=10)
+            else:
+                self._capture_enc_ae_graph_b2()
+        logger.info("Recalibrated with real data + graphs recaptured")
 
     # -----------------------------------------------------------------------
     # Multi-sample dataset calibration (N>=2)
@@ -3762,7 +3679,6 @@ class Pi05TorchFrontendThor:
             'qw':         self._dec_qkv_flat.data_ptr(),
             'Kc':         self._Kc.reshape(-1).data_ptr(),
             'Vc':         self._Vc.reshape(-1).data_ptr(),
-            'dec_devpos': self._attn.dec_devpos.data_ptr(),
             'ow':         self._dec_o_flat.data_ptr(),
             'sf':         self._sf_all.data_ptr(),
             'gw':         self._dec_gu_flat.data_ptr(),
@@ -3779,7 +3695,6 @@ class Pi05TorchFrontendThor:
             'S': Sa, 'D': Da, 'H': Ha, 'NH': 8, 'HD': 256,
             'steps': 10, 'layers': La, 'enc_seq': Se,
             'total_keys': total_keys,
-            'fixed_shape': self._fixed_shape_active,
         }
 
         per_sample_enc: list[np.ndarray] = []
