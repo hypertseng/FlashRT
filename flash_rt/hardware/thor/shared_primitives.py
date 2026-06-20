@@ -472,6 +472,14 @@ def encoder_forward(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None,
 
     act_scales = weights['act_scales']  # device float ptr (base of calib tensor)
     alpha_host = weights['alpha_host']  # host float list [L*4]
+    tactic_mode = os.environ.get(
+        "FLASHRT_THOR_ENCODER_B1_TACTICS", "optimized").strip().lower()
+    use_gateup_wide = tactic_mode in (
+        "optimized", "opt", "both", "gateup-wide", "gateup_wide")
+    use_down_t1 = tactic_mode in (
+        "optimized", "opt", "both", "down-t1", "down_t1")
+    gateup_gemm = fvk.cutlass_fp8_wide if use_gateup_wide else fvk.cutlass_fp8_t1
+    down_gemm = fvk.cutlass_fp8_t1 if use_down_t1 else fvk.cutlass_fp8_wide
 
     for l in range(L):
         last = (l == L - 1)
@@ -517,17 +525,33 @@ def encoder_forward(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None,
             fvk.residual_add_rms_norm_fp8_noweight_fp16(x, fg, x_fp8,
                                                           Se, D, as_gu, stream)
 
-            # ── 8. Gate+Up merged GEMM (T1 tile for L2 optimization) ──
-            fvk.cutlass_fp8_t1(x_fp8, weights['gate_w'][l], gate,
-                               Se, H * 2, D, alpha_host[l * 4 + 2], 0.0, stream)
+            # ── 8. Gate+Up merged GEMM ──
+            # Default optimized tactic with an env fallback to legacy. Same
+            # frontend/weights/calibration recapture is bit-exact vs legacy.
+            gateup_gemm(x_fp8, weights['gate_w'][l], gate,
+                        Se, H * 2, D, alpha_host[l * 4 + 2], 0.0, stream)
 
             # ── 9. GELU(gate) × up → FP8 with act_scale ──
             fvk.gate_geglu_merged_fp8_fp16(gate, hid_fp8, Se, H,
                                                as_d, stream)
 
-            # ── 10. Down GEMM ──
-            fvk.cutlass_fp8_wide(hid_fp8, weights['down_w'][l], fg,
-                                  Se, D, H, alpha_host[l * 4 + 3], 0.0, stream)
+<<<<<<< HEAD
+            # ── 10. Down GEMM with residual fusion (beta=1.0) ──
+            # Writes directly to x: x = alpha * (hid_fp8 @ down_w) + x.
+            # CUTLASS epilogue aliases C=D, so beta=1.0 folds the FFN
+            # residual add into the GEMM, eliminating a separate
+            # residual_add_fp16 kernel + one Se*D fp16 memory pass.
+            down_gemm(hid_fp8, weights['down_w'][l], x,
+                      Se, D, H, alpha_host[l * 4 + 3], 1.0, stream)
+=======
+            # ── 10. Down GEMM with residual fusion (beta=1.0) ──
+            # Writes directly to x: x = alpha * (hid_fp8 @ down_w) + x.
+            # CUTLASS epilogue aliases C=D, so beta=1.0 folds the FFN
+            # residual add into the GEMM, eliminating a separate
+            # residual_add_fp16 kernel + one Se*D fp16 memory pass.
+            down_gemm(hid_fp8, weights['down_w'][l], x,
+                      Se, D, H, alpha_host[l * 4 + 3], 1.0, stream)
+>>>>>>> 2b08ed6 (perf: refine thor pi05 optimization probes)
 
             # ── 11. Residual writeback. The next layer recomputes C1
             # RMSNorm→FP8, so no FP8 output is consumed here.

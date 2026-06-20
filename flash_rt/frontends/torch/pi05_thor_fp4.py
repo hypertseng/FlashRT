@@ -3,6 +3,9 @@
 STRICTLY ADDITIVE. Does not modify pi05_thor.py. Subclasses Pi05TorchFrontendThor
 and overrides only the graph-capture method to route encoder forward through
 shared_primitives_fp4.encoder_forward_with_fp4_subset when FP4 is enabled.
+Current scope: this class overrides the single-sample Enc+AE graph. Batched
+B>=2 inference still uses the base Thor batched graph unless a dedicated
+_capture_enc_ae_graph_b2 FP4 path is added and validated.
 
 Usage:
     pipe = Pi05TorchFrontendThorFP4(
@@ -687,8 +690,8 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         }
 
         fp4_layers = self._fp4_layers
-        fp4_weights = self._fp4_weights
-        fp4_scratch = self._fp4_scratch_dict
+        fp4_weights = getattr(self, '_fp4_weights', None)
+        fp4_scratch = getattr(self, '_fp4_scratch_dict', None)
 
         # Warmup
         for _ in range(3):
@@ -710,14 +713,8 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         with torch.cuda.stream(stream):
             self._enc_ae_graph.capture_begin()
             self._Kc.zero_(); self._Vc.zero_()
-            encoder_forward_with_fp4_subset(
-                self._gemm, fvk, fvk_fp4, enc_bufs, enc_weights, enc_dims,
-                stream=s_int, attn=self._attn,
-                fp4_layers=fp4_layers, fp4_weights=fp4_weights,
-                fp4_scratch=fp4_scratch,
-                use_p1_split_gu=self.use_p1_split_gu)
-            decoder_forward(self._ctx, fvk, ae_bufs, ae_weights,
-                            ae_dims, stream=s_int, attn=self._attn)
+            _run_encoder(s_int)
+            _run_decoder(s_int)
             self._enc_ae_graph.capture_end()
         torch.cuda.synchronize()
         logger.info("Enc+AE CUDA graph captured with FP4 layers=%s P1=%s (Se=%d)",
