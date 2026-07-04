@@ -161,6 +161,38 @@ class Pi05TorchFrontendThor:
         self.autotune = int(autotune) if autotune is not True else 3
         if autotune is False:
             self.autotune = 0
+        self.batched_graph_autotune = (
+            os.environ.get("FLASHRT_THOR_BATCH_GRAPH_AUTOTUNE", "0") == "1"
+        )
+        self.batched_siglip_graph_autotune = (
+            os.environ.get("FLASHRT_THOR_BATCH_SIGLIP_GRAPH_AUTOTUNE", "0") == "1"
+        )
+        self.batched_postln_proj_fusion = (
+            os.environ.get("FLASHRT_THOR_BATCH_POSTLN_PROJ_FUSION", "0") == "1"
+        )
+        self.batched_skip_kv_zero = (
+            os.environ.get("FLASHRT_THOR_BATCH_SKIP_KV_ZERO", "1") != "0"
+        )
+        self.batched_sync_after_graph = (
+            os.environ.get("FLASHRT_THOR_BATCH_SYNC_AFTER_GRAPH", "1") != "0"
+        )
+        self.batch_graph_bank_enabled = (
+            os.environ.get("FLASHRT_THOR_BATCH_GRAPH_BANK", "1") == "1"
+        )
+        self._batch_graph_bank = {}
+        self._batch_graph_bank_active_key = None
+        self.prompt_bank_enabled = (
+            os.environ.get("FLASHRT_THOR_PROMPT_BANK", "1") == "1"
+        )
+        self._prompt_bank = {}
+        self._prompt_bank_hits = 0
+        self._prompt_bank_misses = 0
+        self.noise_bank_enabled = (
+            os.environ.get("FLASHRT_THOR_NOISE_BANK", "0") == "1"
+        )
+        self._noise_bank = {}
+        self._noise_bank_hits = 0
+        self._noise_bank_misses = 0
         self.latency_records = []
         self.calibrated = False
         self.graph_captured = False
@@ -1001,6 +1033,9 @@ class Pi05TorchFrontendThor:
         ``_set_prompt_rl`` calls back into ``set_prompt`` with token IDs
         to drive the standard capture path.
         """
+        self._cached_context_ready = False
+        self._cached_enc_x = None
+        self._cached_batched_context_ready = False
         if (self._rl_config is not None
                 and not getattr(self, "_in_rl_set_prompt", False)
                 and isinstance(prompt_text, str)):
@@ -1038,38 +1073,15 @@ class Pi05TorchFrontendThor:
                 prompt_text, self.embedding_weight, max_len=max_len,
                 state=state)
 
-        # Se must be EVEN for cuBLASLt FP8. In fixed state-prompt mode the
-        # graph captures the max state-prompt shape and masks padded K/V rows
-        # through the Thor attention backend's device-side seqused buffers.
-        if fixed_shape:
-            Se = S_sig + self._state_prompt_fixed_max_len
-            if Se % 2 != 0:
-                Se += 1
-            actual_lang = Se - S_sig
-            valid_lang = prompt_len
-            if (S_sig + valid_lang) % 2 != 0:
-                valid_lang += 1
-            if valid_lang > actual_lang:
-                raise ValueError(
-                    f"prompt_len {prompt_len} exceeds fixed state prompt "
-                    f"capacity {actual_lang}")
-            padded = torch.zeros(
-                actual_lang, embeds.shape[1],
-                dtype=embeds.dtype, device=embeds.device)
-            padded[:prompt_len].copy_(embeds)
-            if valid_lang > prompt_len:
-                padded[prompt_len:valid_lang].copy_(embeds[-1:].expand(
-                    valid_lang - prompt_len, -1))
-            embeds = padded
-            valid_prefix = S_sig + valid_lang
-        else:
-            Se = S_sig + prompt_len
-            if Se % 2 != 0:
-                Se += 1
-            actual_lang = Se - S_sig
-            if actual_lang > prompt_len:
-                embeds = torch.cat([embeds, embeds[-1:]], dim=0)
-            valid_prefix = Se
+# Use fixed Se_max for all prompts to avoid graph recapture on prompt change.
+        # Shorter prompts are padded by repeating the last embedding token.
+        Se = self.Se_max  # Fixed max sequence length (Nv*256 + 256)
+        actual_lang = Se - S_sig  # Max prompt tokens we can store
+        # Pad embeds to fill Se_max space (repeat last token)
+        if prompt_len < actual_lang:
+            pad_len = actual_lang - prompt_len
+            embeds = torch.cat([embeds, embeds[-1:].expand(pad_len, -1)], dim=0)
+            prompt_len = actual_lang
 
         if (self.graph_captured and self._lang_emb is not None
                 and self._S_lang == actual_lang and self.Se == Se):
@@ -2440,9 +2452,400 @@ class Pi05TorchFrontendThor:
                 {"actions": unnorm[:, :LIBERO_ACTION_DIM]})
         return results
 
+<<<<<<< HEAD
     # -----------------------------------------------------------------------
     # Autotune: try multiple graph captures, keep the fastest
     # -----------------------------------------------------------------------
+=======
+    def _run_serial_batch(self, obs_list, prompts):
+        """Internal: Run serial inference for each item in the list.
+
+        Used as fallback when B=1 or when batching is not beneficial.
+        Optimized to skip set_prompt when prompt matches current state.
+        """
+        results = []
+        current_prompt = getattr(self, '_current_prompt', None)
+        for obs, prompt in zip(obs_list, prompts):
+            if prompt != current_prompt:
+                self.set_prompt(prompt)
+                current_prompt = prompt
+            if isinstance(obs, dict):
+                if 'images' in obs:
+                    obs_input = obs.copy()
+                elif 'image' in obs:
+                    obs_input = obs
+                else:
+                    obs_input = obs
+            else:
+                obs_input = obs
+            result = self.infer(obs_input)
+            results.append(result)
+        return results
+
+    def infer_multi_prompt_batch(self, batch_data, seed=None):
+        """Run B=N batched inference with DIFFERENT prompts per sample.
+
+        Uses per-sample SigLIP + encoder with per-sample KV cache writes
+        (sequential, B=1 path for exact precision), then batched decoder
+        (B=N via decoder_forward_b2). The encoder runs per-sample so each
+        prompt length gets the correct FP8 calibration and RoPE positions,
+        avoiding the prompt-padding problem that breaks the flat batched encoder.
+
+        Args:
+            batch_data: list of dicts, each with 'observation' and 'prompt'.
+            seed: optional numpy seed for deterministic noise (matches serial).
+
+        Args:
+            batch_data: list of dicts, each with:
+                - 'observation': dict with 'image'/'images'
+                - 'prompt': string prompt text
+
+        Returns:
+            list of dicts with 'actions' key per sample
+        """
+        B = len(batch_data)
+        nv = self.num_views
+        S_sig = self.sig_S
+        De = self.De
+
+        # Step 1: Parse observations and compute lang embeddings
+        samples = []
+        max_S_lang = 0
+        for item in batch_data:
+            obs = item['observation']
+            prompt_text = item['prompt']
+
+            embeds, S_lang = self._get_prompt_bank_entry(
+                prompt_text, max_len=48)
+
+            if 'images' in obs:
+                img_list = obs['images']
+            else:
+                img_list = [obs['image']]
+                if nv >= 2:
+                    img_list.append(obs.get('wrist_image', obs['image']))
+                if nv >= 3:
+                    img_list.append(obs.get('wrist_image_right', img_list[-1]))
+
+            samples.append({
+                'obs': obs,
+                'prompt': prompt_text,
+                'images': img_list,
+                'embeds': embeds,
+                'S_lang': S_lang,
+            })
+            if S_lang > max_S_lang:
+                max_S_lang = S_lang
+
+        if max_S_lang % 2 != 0:
+            max_S_lang += 1
+        # Use fixed self.Se_max for all batches to avoid graph recapture
+        Se_max = self.Se_max
+        batch_S_lang = Se_max - S_sig
+
+        # Lazy initialization: if set_prompt was never called, we need to
+        # call it once to create _lang_emb, _enc_x, and other buffers that
+        # this function depends on.  Use the longest prompt so _lang_emb has
+        # enough capacity for all samples (truncation if prompt exceeds init
+        # is acceptable — callers should call set_prompt explicitly for
+        # production use).
+        if not hasattr(self, '_lang_emb') or self._lang_emb is None:
+            longest_sample = max(samples, key=lambda s: s['S_lang'])
+            self.set_prompt(longest_sample['prompt'])
+
+        if int(getattr(self, "_S_lang", 0) or 0) != int(batch_S_lang):
+            self._S_lang = int(batch_S_lang)
+            self._siglip_batched_graph = None
+            self._batch_graph_bank_active_key = None
+
+        # CRITICAL: trigger lazy real-data calibration here (before the
+        # per-sample loop).  Use multi-frame calibration to handle diverse
+        # images across robots/samples robustly.
+        #
+        # OLD BEHAVIOR: only used first sample's images for calibration,
+        # causing precision issues when images have different distributions.
+        #
+        # NEW BEHAVIOR: collect all samples' observations and use
+        # _calibrate_multi_frame with percentile reduction. This finds
+        # scales that work well across ALL samples, not just the first one.
+        if not self._real_data_calibrated:
+            # Collect observations from all samples for multi-frame calibration
+            def _get_obs_images(sample):
+                obs = sample['obs']  # samples stores observation under 'obs' key
+                if 'images' in obs:
+                    img_list = obs['images']
+                else:
+                    img_list = [obs.get('image', obs.get('wrist_image'))]
+                return {'images': img_list[:self.num_views]}
+
+            obs_list = [_get_obs_images(s) for s in samples]
+            logger.info("Multi-frame calibration across %d samples for robust FP8 scales", B)
+            # Lower percentile (99.0) to reduce sensitivity to outlier activations
+            # from edge cases like pure white/black images. This preserves precision
+            # while avoiding excessive dynamic range compression.
+            self._calibrate_multi_frame(obs_list, percentile=99.0, verbose=False)
+            self._real_data_calibrated = True
+
+        # Step 2: Ensure batched mode with correctly-sized b2 buffers.
+        # The common case is that set_batched_mode() already allocated _Kc_b2
+        # and _enc_x_b2 with the model-level max Se (e.g. 768).  This batch may
+        # use a smaller Se_max (e.g. 528).  We must re-allocate to the exact
+        # Se_max so that _enc_x_b2[b*Se_max : b*Se_max+Se_b] aligns with the
+        # encoder output layout the decoder expects.
+        # For B=1, fall back to serial inference path
+        if B == 1:
+            if self.batch_graph_bank_enabled:
+                self._save_active_batch_graph_bank_entry()
+            obs_list = [item['observation'] for item in batch_data]
+            prompts = [item['prompt'] for item in batch_data]
+            return self._run_serial_batch(obs_list, prompts)
+
+        restored_from_graph_bank = False
+        if self.batch_graph_bank_enabled:
+            self._save_active_batch_graph_bank_entry()
+            restored_from_graph_bank = self._restore_batch_graph_bank_entry(
+                B, Se_max)
+
+        force_realloc = (
+            self._enc_x_b2 is None or
+            self._enc_x_b2.shape[0] < B * Se_max or
+            self._lang_emb_b2 is None or
+            self._lang_emb_b2.shape[0] < B or
+            self._lang_emb_b2.shape[1] < batch_S_lang
+        )
+        if not restored_from_graph_bank and (not self._batched or force_realloc):
+            self._batched = False
+            # Null all b2 buffers so _alloc sees them as None and re-allocates.
+            self._Kc_b2 = self._Vc_b2 = None
+            self._enc_x_b2 = self._enc_x_fp8_b2 = self._enc_qkv_buf_b2 = None
+            self._enc_logits_b2 = self._enc_attn_b2 = self._enc_o_fp8_b2 = None
+            self._enc_gate_b2 = self._enc_hid_fp8_b2 = self._enc_fg_b2 = None
+            self._ae_x_b2 = self._ae_xn_b2 = self._ae_gate_b2 = None
+            self._ae_qkv_b2 = self._ae_logits_b2 = self._ae_attn_b2 = None
+            self._ae_fg_b2 = None
+            self._ae_xn_fp8_b2 = self._ae_hid_fp8_b2 = self._ae_ctx_fp8_b2 = None
+            self._g_noise_b2 = self._v_b2 = None
+            self._sa_all_b2 = self._sf_all_b2 = self._fs_all_b2 = None
+            self._alloc_b2_buffers(B=B, Se_dynamic=Se_max)  # pass correct Se_max NOW
+            self._enc_ae_graph_b2 = None  # force graph re-capture
+            self._batch_graph_bank_active_key = None
+
+        # Update Se/total_keys for graph capture (may differ from set_prompt)
+        if self.Se != Se_max:
+            self.Se = Se_max
+            self.total_keys = Se_max + self.Sa
+            self._enc_ae_graph_b2 = None  # force re-capture
+            self._batch_graph_bank_active_key = None
+
+        # _g_noise_b2 is fully overwritten by the noise generation loop below
+        # (seed path: copy from noise_tensor; no-seed: normal_()). No zero needed.
+        # _ae_x_b2 and _ae_xn_b2 are fully overwritten by decoder GEMMs.
+
+        self._batched = True
+        self.B = int(B)
+
+        # Step 3: Ensure time conditioning buffers for decoder
+        decoder_steps = 10
+        Sa, Da, La = self.Sa, self.Da, self.La
+        D3a = 3 * Da
+
+        if self._sa_all_b2 is None or self._sa_all_b2.shape[0] < decoder_steps * self.La * B * self.Sa:
+            # Reuse base _sa_all/_sf_all/_fs_all from set_prompt if available
+            # (avoids recomputing 880 tiny kernel launches for trig + MLP + matmuls).
+            need_full_recompute = (
+                self._sa_all is None or
+                self._sa_all.shape[0] != decoder_steps * La * Sa
+            )
+            if need_full_recompute:
+                sa_all = torch.zeros(decoder_steps * La * Sa, D3a, dtype=fp16, device='cuda')
+                sf_all = torch.zeros(decoder_steps * La * Sa, D3a, dtype=fp16, device='cuda')
+                fs_all = torch.zeros(decoder_steps * Sa, D3a, dtype=fp16, device='cuda')
+
+                time_embeds = []
+                for step_idx in range(decoder_steps):
+                    t_val = 1.0 - step_idx / decoder_steps
+                    t_tensor = torch.tensor([t_val], device='cuda')
+                    fraction = torch.linspace(0, 1, Da // 2, device='cuda', dtype=torch.float64)
+                    period = 4e-3 * (4.0 / 4e-3) ** fraction
+                    scaling = 1.0 / period * 2 * math.pi
+                    sin_input = scaling * t_tensor.double()
+                    emb = torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=-1).to(fp16)
+                    time_embeds.append(emb)
+
+                for step_idx in range(decoder_steps):
+                    te = time_embeds[step_idx].unsqueeze(0)
+                    tmp = (te @ self._time_mlp_in_w.t() + self._time_mlp_in_b.unsqueeze(0)).float()
+                    tmp = (tmp * torch.sigmoid(tmp)).to(fp16)
+                    tmp2 = (tmp @ self._time_mlp_out_w.t() + self._time_mlp_out_b.unsqueeze(0)).float()
+                    tmp2 = (tmp2 * torch.sigmoid(tmp2)).to(fp16)
+                    time_emb = tmp2.expand(Sa, -1).contiguous()
+                    for layer in range(La):
+                        idx = (step_idx * La + layer) * Sa
+                        sa_all[idx:idx + Sa] = (time_emb @ self._attn_mod_w[layer].t()
+                                                + self._attn_mod_b[layer].unsqueeze(0))
+                        sf_all[idx:idx + Sa] = (time_emb @ self._ffn_mod_w[layer].t()
+                                                + self._ffn_mod_b[layer].unsqueeze(0))
+                    fidx = step_idx * Sa
+                    fs_all[fidx:fidx + Sa] = (time_emb @ self._final_mod_w.t()
+                                              + self._final_mod_b.unsqueeze(0))
+
+                self._sa_all = sa_all
+                self._sf_all = sf_all
+                self._fs_all = fs_all
+            else:
+                sa_all = self._sa_all
+                sf_all = self._sf_all
+                fs_all = self._fs_all
+
+            self._sa_all_b2 = sa_all.view(decoder_steps, La, Sa, D3a).repeat_interleave(
+                B, dim=2).reshape(decoder_steps * La * B * Sa, D3a).contiguous()
+            self._sf_all_b2 = sf_all.view(decoder_steps, La, Sa, D3a).repeat_interleave(
+                B, dim=2).reshape(decoder_steps * La * B * Sa, D3a).contiguous()
+            self._fs_all_b2 = fs_all.view(decoder_steps, Sa, D3a).repeat_interleave(
+                B, dim=1).reshape(decoder_steps * B * Sa, D3a).contiguous()
+            self._enc_ae_graph_b2 = None  # force re-capture with new style buffers
+
+        # Step 5: Batched encoding (SigLIP serial, encoder+decoder via CUDA Graph)
+        # ════════════════════════════════════════════════════════════════════════
+        # INNOVATION: Run complete encoder pipeline (SigLIP + Transformer) for
+        # each sample in parallel using CUDA streams with per-stream buffers.
+        #
+        # Key insight: Use manual siglip_forward/encoder_forward (no CUDA graph)
+        # so each stream can run independently without global state issues.
+        # KV cache zero is not needed here: the encoder overwrites every
+        # KV element the decoder reads for the uniform Se graph contract.
+        # Ensure batched buffers exist
+        # Calculate total_keys based on max_S_lang for proper buffer sizing
+        _max_S_lang = max(s['S_lang'] for s in samples)
+        _total_keys_max = (_max_S_lang if _max_S_lang % 2 == 0 else _max_S_lang + 1) + S_sig + self.Sa
+        if not hasattr(self, '_enc_x_b2') or self._enc_x_b2.shape[0] < B * Se_max:
+            self._enc_x_b2 = torch.empty(B * Se_max, De, dtype=fp16, device='cuda')
+            self._Kc_b2 = torch.zeros(B, self.La * _total_keys_max * self.HDe, dtype=fp16, device='cuda')
+            self._Vc_b2 = torch.zeros(B, self.La * _total_keys_max * self.HDe, dtype=fp16, device='cuda')
+
+        S_sig = nv * 256
+
+        # Step 5a: Batched SigLIP + encoder
+        # Pad all prompts to max length so encoder can run in batch mode.
+        # KV cache does not need a pre-zero for the uniform Se graph path;
+        # encoder_forward_b2 fully covers the ranges decoder_forward_b2 reads.
+
+        S_enc = Se_max  # all samples padded to max length
+
+        # Batched image upload: common uint8 path can directly produce patches.
+        patches_ready = self._upload_images_gpu_batched(
+            samples, self._img_buf_b2_all, self._patches_buf_b2)
+        self._patch_embed_ops_batched(B, 0, patches_ready=patches_ready)
+
+        # Upload per-sample language embeddings. Identical adjacent prompts
+        # are coalesced into one broadcast copy by the helper.
+        self._copy_lang_embeds_batched(samples)
+
+        # Batched SigLIP + PostLN (CUDA graph for reduced kernel launch overhead)
+        from flash_rt.hardware.thor.shared_primitives_batched import (
+            siglip_forward_batched, postln_project_batched)
+
+        # Capture SigLIP + PostLN graph if not already done.
+        if self._siglip_batched_graph is None or self._siglip_batched_B != B:
+            if self.batched_siglip_graph_autotune and self.autotune > 0:
+                self._autotune_siglip_batched_graph(
+                    B, n_trials=self.autotune, n_bench=10)
+            else:
+                self._capture_siglip_batched_graph(B)
+
+        # Batched SigLIP + PostLN (CUDA graph for reduced kernel launch overhead)
+        if (self._siglip_batched_graph is not None and
+                self._siglip_batched_B == B):
+            self._siglip_batched_graph.replay()
+        else:
+            sig_attn = self._sig_attn_b2
+            bufs_b2 = {
+                'x':       self._sig_x_b2.data_ptr(),
+                'x_fp8':   self._sig_x_fp8_b2.data_ptr(),
+                'qkv':     self._sig_qkv_b2.data_ptr(),
+                'attn_out': sig_attn.data_ptr(),
+                'hidden':  self._sig_hidden_b2.data_ptr(),
+                'hid_fp8': self._sig_hid_fp8_b2.data_ptr(),
+                'x_norm':  sig_attn.data_ptr(),
+                'fg':      0,
+            }
+            dims_b2 = {
+                'S': S_sig, 'D': self.sig_D, 'H': self.sig_H,
+                'NH': self.sig_NH, 'HD': self.sig_HD, 'L': self.sig_L,
+                'num_views': nv, 'seq_per_view': 256, 'B': B,
+            }
+            siglip_forward_batched(self._gemm, fvk, bufs_b2,
+                                   self._sig_weights, dims_b2,
+                                   stream=0, attn=self._attn,
+                                   use_fp8=self.use_fp8)
+            postln_bufs_b2 = {
+                'x_sig':    self._sig_x_b2.data_ptr(),
+                'enc_x_b2': self._enc_x_b2.data_ptr(),
+                'scratch':  self._postln_scratch_b2.data_ptr(),
+            }
+            if self._postln_proj_b2 is not None:
+                postln_bufs_b2['proj'] = self._postln_proj_b2.data_ptr()
+            lang_emb_ptrs = [self._lang_emb_b2[b].data_ptr() for b in range(B)]
+            postln_weights_b2 = {
+                'ln_w':         self._postln_w.data_ptr(),
+                'ln_b':         self._postln_b.data_ptr(),
+                'proj_w':       self._proj_w.data_ptr(),
+                'proj_b':       self._proj_b.data_ptr(),
+                'lang_emb_list': lang_emb_ptrs,
+            }
+            postln_dims_b2 = {
+                'S_sig': S_sig, 'D_sig': self.sig_D,
+                'D_enc': self.De, 'S_lang': self._S_lang, 'B': B,
+            }
+            postln_project_batched(self._gemm, fvk, postln_bufs_b2,
+                                   postln_weights_b2, postln_dims_b2, stream=0)
+
+        # Zero out language slots beyond each sample's actual prompt length
+        for b, s in enumerate(samples):
+            n_lang = min(s['S_lang'], S_enc - S_sig)
+            if n_lang < S_enc - S_sig:
+                self._enc_x_b2[b * S_enc + S_sig + n_lang:
+                               (b + 1) * S_enc].zero_()
+
+        # Step 6: Generate noise and run batched encoder+decoder via CUDA Graph
+        if seed is None:
+            self._g_noise_b2.normal_()
+        else:
+            self._fill_seed_noise_batched(samples, seed)
+
+        # Replay encoder+decoder as a single CUDA Graph (b2 path).
+        # By default the graph skips full KV zero because encoder_forward_b2
+        # overwrites the KV ranges read by decoder_forward_b2.
+        # Input buffers (_enc_x_b2, _g_noise_b2) are already filled above.
+        if self._enc_ae_graph_b2 is None:
+            if self.batched_graph_autotune and self.autotune > 0:
+                self._autotune_enc_ae_graph_b2(
+                    n_trials=self.autotune, n_bench=10)
+            else:
+                self._capture_enc_ae_graph_b2()
+        self._mark_batch_graph_bank_entry_ready(B, Se_max)
+        self._enc_ae_graph_b2.replay()
+        if self.batched_sync_after_graph:
+            torch.cuda.synchronize()
+
+        # Step 7: Unpack results (single D2H transfer for all samples)
+        raw_all = self._g_noise_b2[:B * self.Sa].float().cpu().numpy()
+        results = []
+        for b in range(B):
+            raw = raw_all[b * self.Sa:(b + 1) * self.Sa]
+            unnorm = unnormalize_actions(raw, self.norm_stats)
+            results.append({"actions": unnorm[:, :LIBERO_ACTION_DIM]})
+
+        # Step 8: Restore attention slots to serial defaults
+        # Batch modified _attn._slots['encoder'] to point to _Kc_b2/_Vc_b2.
+        # Restore serial pointers so subsequent serial infer() works correctly.
+        self._attn._slots['encoder']['Kc'] = self._Kc.view(-1).data_ptr()
+        self._attn._slots['encoder']['Vc'] = self._Vc.view(-1).data_ptr()
+        self._attn._slots['encoder']['layer_stride'] = int(self.total_keys) * int(self.HDe) * 2
+        self._attn.refresh_per_layer_kv(('encoder',))
+
+        return results
+>>>>>>> 7cbdcdd (feat: add cached context inference support for context reuse benchmarks)
 
     def _autotune_enc_ae(self, n_trials=5, n_bench=10):
         """Autotune Enc+AE graph: recapture until fast schedule is found.
@@ -2506,6 +2909,7 @@ class Pi05TorchFrontendThor:
     # Inference
     # -----------------------------------------------------------------------
 
+<<<<<<< HEAD
     def infer(self, observation, debug=False):
         """Run inference: images -> CUDA graph replay -> actions.
 
@@ -2518,9 +2922,11 @@ class Pi05TorchFrontendThor:
         if self._rl_config is not None:
             return self._infer_cfg(observation, debug)
         t0 = time.perf_counter()
+=======
+    def _observation_images_np(self, observation):
+        """Convert an observation into the fp16 image stack consumed by SigLIP."""
+>>>>>>> 7cbdcdd (feat: add cached context inference support for context reuse benchmarks)
         nv = self.num_views
-
-        # ---- Collect and upload images ----
         if 'images' in observation:
             img_list = observation['images']
         else:
@@ -2539,7 +2945,106 @@ class Pi05TorchFrontendThor:
                 return im
             return (im.astype(np.float32) / 127.5 - 1.0).astype(np.float16)
 
-        images_np = np.stack([_to_np16(im) for im in img_list[:nv]])
+        return np.stack([_to_np16(im) for im in img_list[:nv]])
+
+    def stage_context(self, observation):
+        """Stage visual-language context for repeated action sampling.
+
+        This updates ``_enc_x`` by running the SigLIP/PostLN graph only.
+        Callers may then invoke :meth:`infer_from_cached_context` one or more
+        times while the observation and prompt are unchanged.  The normal
+        :meth:`infer` path is unaffected and remains the correct API when every
+        action request has a fresh observation.
+        """
+        if self._rl_config is not None:
+            raise RuntimeError(
+                "stage_context() is only implemented for the non-CFG Thor path")
+        if getattr(self, "_siglip_graph", None) is None:
+            raise RuntimeError("set_prompt() must be called before stage_context()")
+
+        images_np = self._observation_images_np(observation)
+        self._img_buf.upload(images_np)
+        self._siglip_graph.replay()
+
+        if self.use_fp8 and not self._real_data_calibrated:
+            torch.cuda.synchronize()
+            self._recalibrate_with_real_data()
+            self._real_data_calibrated = True
+            # Graph recapture uses a dummy image; replay the requested
+            # observation again so the cached context is the caller's context.
+            self._img_buf.upload(images_np)
+            self._siglip_graph.replay()
+
+        self._cached_enc_x = self._enc_x[:self.Se].detach().clone()
+        self._cached_context_ready = True
+        return {"cached_context_ready": True}
+
+    def infer_from_cached_context(self, debug=False, seed=None):
+        """Run action generation from the currently staged context.
+
+        Preconditions:
+          * ``set_prompt()`` has been called.
+          * ``stage_context(observation)`` was called for the current
+            observation/prompt.  Full ``infer()`` calls do not stage reusable
+            context because the Enc+AE graph updates ``_enc_x`` in place.
+        """
+        if self._rl_config is not None:
+            raise RuntimeError(
+                "infer_from_cached_context() is only implemented for the "
+                "non-CFG Thor path")
+        if not getattr(self, "_cached_context_ready", False):
+            raise RuntimeError(
+                "No reusable visual-language context is staged; call "
+                "stage_context(observation) first.")
+        cached_enc_x = getattr(self, "_cached_enc_x", None)
+        if cached_enc_x is None:
+            raise RuntimeError(
+                "Cached context snapshot is missing; call "
+                "stage_context(observation) first.")
+        if self._enc_ae_graph is None:
+            self._capture_enc_ae_graph()
+
+        t0 = time.perf_counter()
+        self._enc_x[:self.Se].copy_(cached_enc_x)
+        if seed is not None:
+            R_np = np.random.RandomState(seed).randn(self.Sa, 32).astype(np.float16)
+        else:
+            R_np = np.random.randn(self.Sa, 32).astype(np.float16)
+        R = torch.from_numpy(R_np).to('cuda', non_blocking=True)
+        self._g_noise.view(-1, 32).copy_(R)
+        self._enc_ae_graph.replay()
+        torch.cuda.synchronize()
+
+        latency_ms = (time.perf_counter() - t0) * 1000
+        self.latency_records.append(latency_ms)
+
+        raw_actions = self._g_noise.float().cpu().numpy()
+        unnorm = unnormalize_actions(raw_actions, self.norm_stats)
+        robot_actions = unnorm[:, :LIBERO_ACTION_DIM]
+
+        if debug:
+            logger.info("Cached raw actions[0,:5]: %s", raw_actions[0, :5])
+            logger.info("Cached robot actions[0]: %s", robot_actions[0])
+            logger.info("Cached latency: %.1f ms", latency_ms)
+
+        return {"actions": robot_actions}
+
+    def infer(self, observation, debug=False, seed=None):
+        """Run inference: images -> CUDA graph replay -> actions.
+
+        Args:
+            observation: dict with 'image' and 'wrist_image' (or 'images' list).
+                         Each image is (224,224,3) uint8 or float16 numpy.
+        Returns:
+            {"actions": np.ndarray}  shape (Sa, LIBERO_ACTION_DIM)
+        """
+        if self._rl_config is not None:
+            return self._infer_cfg(observation, debug, seed)
+        self._cached_context_ready = False
+        t0 = time.perf_counter()
+
+        # ---- Collect and upload images ----
+        images_np = self._observation_images_np(observation)
         self._img_buf.upload(images_np)
 
         # ---- Graph 1: SigLIP + PostLN ----
@@ -2553,6 +3058,10 @@ class Pi05TorchFrontendThor:
             torch.cuda.synchronize()
             self._recalibrate_with_real_data()
             self._real_data_calibrated = True
+            # Graph recapture uses a dummy image; replay the current
+            # observation so this inference still consumes the caller's frame.
+            self._img_buf.upload(images_np)
+            self._siglip_graph.replay()
 
         # ---- Graph 2: Encoder + Decoder ----
         # numpy CPU RNG so the bit pattern matches the JAX frontend's
