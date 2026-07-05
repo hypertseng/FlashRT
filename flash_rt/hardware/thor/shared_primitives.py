@@ -535,23 +535,13 @@ def encoder_forward(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None,
             fvk.gate_geglu_merged_fp8_fp16(gate, hid_fp8, Se, H,
                                                as_d, stream)
 
-<<<<<<< HEAD
-            # ── 10. Down GEMM with residual fusion (beta=1.0) ──
+# ── 10. Down GEMM with residual fusion (beta=1.0) ──
             # Writes directly to x: x = alpha * (hid_fp8 @ down_w) + x.
             # CUTLASS epilogue aliases C=D, so beta=1.0 folds the FFN
             # residual add into the GEMM, eliminating a separate
             # residual_add_fp16 kernel + one Se*D fp16 memory pass.
             down_gemm(hid_fp8, weights['down_w'][l], x,
                       Se, D, H, alpha_host[l * 4 + 3], 1.0, stream)
-=======
-            # ── 10. Down GEMM with residual fusion (beta=1.0) ──
-            # Writes directly to x: x = alpha * (hid_fp8 @ down_w) + x.
-            # CUTLASS epilogue aliases C=D, so beta=1.0 folds the FFN
-            # residual add into the GEMM, eliminating a separate
-            # residual_add_fp16 kernel + one Se*D fp16 memory pass.
-            down_gemm(hid_fp8, weights['down_w'][l], x,
-                      Se, D, H, alpha_host[l * 4 + 3], 1.0, stream)
->>>>>>> 2b08ed6 (perf: refine thor pi05 optimization probes)
 
             # ── 11. Residual writeback. The next layer recomputes C1
             # RMSNorm→FP8, so no FP8 output is consumed here.
