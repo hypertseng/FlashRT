@@ -57,3 +57,11 @@ internal-tests/
 internal-docs/
 notes/
 third_party/cutlass
+
+# Benchmark logs and sweeps
+logs/
+latency_sweep*.json
+latency_sweep*.log
+
+# Benchmark / eval scripts
+examples/thor/eval_latency_sweep.py

@@ -122,14 +122,7 @@ class ThorFlashAttnBackend(AttentionBackendBase):
         # (decoder reuses encoder's cache by design).
         self._per_layer_kv: dict[str, list[tuple[int, int]]] = {}
         for site_name in ("encoder", "decoder"):
-            s = self._slots[site_name]
-            nL = spec.site(site_name).num_layers
-            stride = int(s["layer_stride"])
-            Kc = int(s["Kc"])
-            Vc = int(s["Vc"])
-            self._per_layer_kv[site_name] = [
-                (Kc + l * stride, Vc + l * stride) for l in range(nL)
-            ]
+            self._rebuild_per_layer_kv(site_name)
 
         # Lazy-import fvk — importing at class definition time would
         # couple this module to module-load order and break tests that
@@ -161,6 +154,44 @@ class ThorFlashAttnBackend(AttentionBackendBase):
         self._enc_seqused_ptr = self._device_ptr(self.enc_seqused)
         self._dec_seqused_ptr = self._device_ptr(self.dec_seqused)
         self._dec_devpos_ptr = self._device_ptr(self.dec_devpos)
+
+        # Build per-layer KV pointer cache for encoder/decoder sites.
+        self._per_layer_kv: dict[str, list[tuple[int, int]]] = {}
+        for site_name in ("encoder", "decoder"):
+            self._rebuild_per_layer_kv(site_name)
+
+    def _rebuild_per_layer_kv(self, site_name: str) -> None:
+        """Rebuild per-layer K/V pointer cache for a specific site.
+
+        Call this after modifying the site's Kc/Vc or layer_stride to keep
+        the cached values in sync.
+        """
+        if site_name not in ("encoder", "decoder"):
+            return
+        s = self._slots[site_name]
+        nL = self._spec.site(site_name).num_layers
+        stride = int(s["layer_stride"])
+        Kc = int(s["Kc"])
+        Vc = int(s["Vc"])
+        self._per_layer_kv[site_name] = [
+            (Kc + l * stride, Vc + l * stride) for l in range(nL)
+        ]
+
+    def refresh_per_layer_kv(
+        self, sites: str | list[str] | tuple[str, ...]
+    ) -> None:
+        """Refresh the per-layer K/V pointer cache for specified sites.
+
+        Call after modifying a site's Kc, Vc, or layer_stride (e.g., after
+        restoring batched pointers to their serial values).
+
+        Args:
+            sites: "encoder", "decoder", or a list/tuple of them.
+        """
+        if isinstance(sites, str):
+            sites = [sites]
+        for site_name in sites:
+            self._rebuild_per_layer_kv(site_name)
 
     @staticmethod
     def _device_ptr(obj) -> int:
