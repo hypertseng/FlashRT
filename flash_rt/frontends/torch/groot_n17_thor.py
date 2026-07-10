@@ -4,15 +4,11 @@ Public surface mirrors ``GrootTorchFrontendThor`` (N1.6):
 
 * ``__init__(checkpoint_path, num_views, embodiment_tag, ...)``
 * ``set_prompt(prompt: str, embodiment_tag: str | None = None)``
-* ``infer(observation: dict) -> np.ndarray``  # (action_horizon=40, 132)
+* ``infer(state_normalized) -> torch.Tensor``  # (1, action_horizon, 132)
 * ``predict(...)`` — alias kept for API parity
-* ``get_latency_stats()``
-
-
-This commit (Phase 3c.a) lands the foundation: ``__init__`` +
-``_load_weights`` driven by ``MultiSafetensorsSource`` and the
-declarative ``WEIGHT_SPEC`` (Phase 3a). ``set_prompt``/``infer`` are
-still stubbed.
+* ``normalize_state(state_dict) -> torch.Tensor``
+* ``denormalize_action(action_normed, state_dict) -> dict``
+* ``get_latency_stats() -> dict``
 """
 
 from __future__ import annotations
@@ -20,6 +16,7 @@ from __future__ import annotations
 import glob
 import os
 import pathlib
+import time
 import warnings
 from typing import Optional
 
@@ -31,14 +28,10 @@ from flash_rt.frontends._fp8_layout import select_fp8_layout
 class GrootN17TorchFrontendThor:
     """N1.7 Thor inference frontend.
 
-    Phase 3c lands in 4 stages:
-      a. ``_load_weights`` (this commit) — full WEIGHT_SPEC across 2 ckpt
-         shards via MultiSafetensorsSource; per-embodiment slot slicing
-         on the dense (32, ·, ·) tensors.
-      b. ``set_prompt`` — Qwen3-VL processor, M-RoPE cos/sin (mrope_table),
-         timestep emb, DiT cross-KV precompute, calibration cache.
-      c. eager ``infer`` (no graphs).
-      d. CUDA Graph capture for vit / llm / vl_self_attn / dit-per-step.
+    Loads weights from a GR00T-N1.7-3B checkpoint via ``MultiSafetensorsSource``
+    and the declarative ``WEIGHT_SPEC``. Supports per-embodiment slot slicing,
+    FP8 activation calibration, CUDA Graph captured DiT, and fully-kernelized
+    backbone + DiT graph replay.
     """
 
     # Run the DiT action head's compute-bound GEMMs (FFN + self-attn QKV) in
@@ -79,8 +72,10 @@ class GrootN17TorchFrontendThor:
 
         self._load_weights()
 
+        self.latency_records: list[float] = []
+
     # ────────────────────────────────────────────────────────────────
-    # Weight loading (Phase 3c.a)
+    # Weight loading
     # ────────────────────────────────────────────────────────────────
 
     def _load_fmha_strided(self) -> None:
@@ -229,11 +224,7 @@ class GrootN17TorchFrontendThor:
         self._fp16_shadow_weights = shadow
 
     # ────────────────────────────────────────────────────────────────
-    # Phase 3c.b/c/d — pending
-    # ────────────────────────────────────────────────────────────────
-
-    # ────────────────────────────────────────────────────────────────
-    # Phase 3c.b2 — set_prompt
+    # Prompt setup
     # ────────────────────────────────────────────────────────────────
 
     def set_prompt(
@@ -244,8 +235,8 @@ class GrootN17TorchFrontendThor:
     ) -> None:
         """Run the calibration shadow + bake FP8 alphas + cache.
 
-        For 3c.b2 ``aux`` is the bundle of HF-derived setup tensors (the
-        same shape produced by ``tests/_helpers/groot_n17/capture_llm_aux.py``):
+        ``aux`` is the bundle of HF-derived setup tensors (the same shape
+        produced by ``tests/_helpers/groot_n17/capture_llm_aux.py``):
 
           * ``input_ids``           — (1, S)  int64
           * ``visual_pos_masks``    — (1, S)  bool
@@ -254,11 +245,6 @@ class GrootN17TorchFrontendThor:
           * ``llm_input_embeds``    — (1, S, 2048) fp32 (input to truncated LLM)
           * ``pixel_features``      — (S_vit=1024, 1024) fp32 (post-patch_embed+pos_embed)
           * ``grid_thw``            — (num_views, 3) int64
-
-        A future revision (3c.c+) will derive ``aux`` end-to-end from raw
-        ``(prompt, sample_obs)`` via the HF Qwen3VL processor + vision
-        model. For 3c.b2 we accept the pre-captured form so the calibration
-        path can land independently of the production preprocessing path.
 
         After this call, the frontend has:
 
@@ -347,6 +333,7 @@ class GrootN17TorchFrontendThor:
             self._warmup_infer()
         except Exception as e:
             warnings.warn(f"set_prompt warmup failed (non-fatal): {e!r}")
+        self.latency_records.clear()
 
     def _warmup_infer(self) -> None:
         """Single dry-run infer to prime cuBLAS / lazy-init DiT attn."""
@@ -356,7 +343,7 @@ class GrootN17TorchFrontendThor:
         _ = self.infer(warm_state, initial_noise=warm_noise)
 
     # ────────────────────────────────────────────────────────────────
-    # Phase 3c.d — CUDA Graph capture of the 32-layer DiT inner loop
+    # CUDA Graph capture
     # ────────────────────────────────────────────────────────────────
 
     def _precompute_diffusion_modulators(
@@ -1209,7 +1196,7 @@ class GrootN17TorchFrontendThor:
         return spec
 
     # ────────────────────────────────────────────────────────────────
-    # Phase 3c.c — eager infer (4-step flow-matching diffusion loop)
+    # Inference (4-step flow-matching diffusion loop)
     # ────────────────────────────────────────────────────────────────
 
     def infer(
@@ -1232,6 +1219,7 @@ class GrootN17TorchFrontendThor:
         if not hasattr(self, "_backbone_features"):
             raise RuntimeError("call set_prompt before infer")
 
+        t0 = time.perf_counter()
         device = self.device
         D = 1536
         action_dim = 132
@@ -1263,6 +1251,9 @@ class GrootN17TorchFrontendThor:
                     self._k_actions.copy_(torch.randn(
                         action_horizon, action_dim, dtype=torch.bfloat16, device=device))
                 self._k_dit_graph.replay()
+                torch.cuda.synchronize()
+                self.latency_records.append(
+                    (time.perf_counter() - t0) * 1000)
                 return self._k_actions.float().view(1, action_horizon, action_dim)
 
         # Eager fallback: torch cross-KV from backbone (graph path refreshes
@@ -1368,10 +1359,12 @@ class GrootN17TorchFrontendThor:
             # ── Euler step ──────────────────────────────────────────────
             actions = actions + (dt * velocity).to(actions.dtype)
 
+        torch.cuda.synchronize()
+        self.latency_records.append((time.perf_counter() - t0) * 1000)
         return actions.float()
 
     # ────────────────────────────────────────────────────────────────
-    # Internal helpers (eager; will be CUDA-graph wrapped in 3c.d)
+    # Internal helpers
     # ────────────────────────────────────────────────────────────────
 
     def _precompute_dit_cross_kv(self) -> None:
@@ -1538,9 +1531,7 @@ class GrootN17TorchFrontendThor:
         return shifts, scales
 
     def _run_state_encode(self, state_flat: torch.Tensor) -> torch.Tensor:
-        """state (1, 1, 132) → state_features (1, 1, 1536) bf16. Pure PyTorch
-        for 3c.c eager mode (small MLP; perf-irrelevant). bf16 matches the
-        ckpt's native dtype and the DiT main path."""
+        """state (1, 1, 132) → state_features (1, 1, 1536) bf16."""
         x = state_flat.view(1, 132).float()
         h = x @ self._st_enc_l1_W.float() + self._st_enc_l1_b.float()
         h = torch.nn.functional.relu(h)
@@ -1863,5 +1854,18 @@ class GrootN17TorchFrontendThor:
     def predict(self, *args, **kwargs):
         return self.infer(*args, **kwargs)
 
-    def get_latency_stats(self):
-        raise NotImplementedError("Phase 3c.d: latency stats")
+    def get_latency_stats(self) -> dict:
+        if not self.latency_records:
+            return {}
+        import numpy as np
+        lat = np.array(self.latency_records)
+        return {
+            "count": len(lat),
+            "mean_ms": float(np.mean(lat)),
+            "std_ms": float(np.std(lat)),
+            "min_ms": float(np.min(lat)),
+            "max_ms": float(np.max(lat)),
+            "p50_ms": float(np.percentile(lat, 50)),
+            "p95_ms": float(np.percentile(lat, 95)),
+            "hz": float(1000 / np.mean(lat)),
+        }
