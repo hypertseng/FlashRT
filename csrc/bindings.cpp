@@ -1344,6 +1344,22 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
 #endif
 
     // Patch embedding
+    m.def("normalize_uint8_to_fp16", [](uintptr_t input, uintptr_t output,
+                                         int numel, uintptr_t stream) {
+        normalize_uint8_to_fp16(reinterpret_cast<const uint8_t*>(input),
+                                reinterpret_cast<half*>(output),
+                                numel, to_stream(stream));
+    }, py::arg("input"), py::arg("output"),
+       py::arg("numel"), py::arg("stream") = 0);
+
+    m.def("normalize_uint8_to_patches_fp16", [](uintptr_t input, uintptr_t output,
+                                                 int nv, uintptr_t stream) {
+        normalize_uint8_to_patches_fp16(
+            reinterpret_cast<const uint8_t*>(input),
+            reinterpret_cast<half*>(output), nv, to_stream(stream));
+    }, py::arg("input"), py::arg("output"),
+       py::arg("nv"), py::arg("stream") = 0);
+
     m.def("patch_im2col", [](uintptr_t input, uintptr_t output, int nv, uintptr_t stream) {
         patch_im2col(reinterpret_cast<const half*>(input),
                      reinterpret_cast<half*>(output), nv, to_stream(stream));
@@ -1764,6 +1780,72 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
        py::arg("logits"), py::arg("out"),
        py::arg("S"), py::arg("S_kv"), py::arg("NH"), py::arg("HD"),
        py::arg("attn_scale") = 1.0f, py::arg("stream") = 0);
+
+    m.def("attention_qk_gemm_fp16", [](FvkContext& ctx, uintptr_t Q, uintptr_t K,
+                                        uintptr_t logits,
+                                        int S, int S_kv, int NH, int HD,
+                                        int logits_ldc, float attn_scale,
+                                        uintptr_t stream) {
+        attention_qk_gemm_fp16(ctx.cublas_handle,
+            reinterpret_cast<const __half*>(Q),
+            reinterpret_cast<const __half*>(K),
+            reinterpret_cast<__half*>(logits),
+            S, S_kv, NH, HD, logits_ldc, attn_scale, to_stream(stream));
+    }, py::arg("ctx"), py::arg("Q"), py::arg("K"), py::arg("logits"),
+       py::arg("S"), py::arg("S_kv"), py::arg("NH"), py::arg("HD"),
+       py::arg("logits_ldc"), py::arg("attn_scale") = 1.0f,
+       py::arg("stream") = 0);
+
+    m.def("attention_qk_gemm_fp16_strided_batched",
+          [](FvkContext& ctx, uintptr_t Q, uintptr_t K, uintptr_t logits,
+             int S, int S_kv, int NH, int HD, int logits_ldc,
+             long long q_batch_stride, long long k_batch_stride,
+             long long logits_batch_stride, int batch_count,
+             float attn_scale, uintptr_t stream) {
+        attention_qk_gemm_fp16_strided_batched(ctx.cublas_handle,
+            reinterpret_cast<const __half*>(Q),
+            reinterpret_cast<const __half*>(K),
+            reinterpret_cast<__half*>(logits),
+            S, S_kv, NH, HD, logits_ldc,
+            q_batch_stride, k_batch_stride, logits_batch_stride,
+            batch_count, attn_scale, to_stream(stream));
+    }, py::arg("ctx"), py::arg("Q"), py::arg("K"), py::arg("logits"),
+       py::arg("S"), py::arg("S_kv"), py::arg("NH"), py::arg("HD"),
+       py::arg("logits_ldc"), py::arg("q_batch_stride"),
+       py::arg("k_batch_stride"), py::arg("logits_batch_stride"),
+       py::arg("batch_count"), py::arg("attn_scale") = 1.0f,
+       py::arg("stream") = 0);
+
+    m.def("attention_pv_gemm_fp16", [](FvkContext& ctx, uintptr_t V,
+                                        uintptr_t logits, uintptr_t out,
+                                        int S, int S_kv, int NH, int HD,
+                                        int logits_ldc, uintptr_t stream) {
+        attention_pv_gemm_fp16(ctx.cublas_handle,
+            reinterpret_cast<const __half*>(V),
+            reinterpret_cast<const __half*>(logits),
+            reinterpret_cast<__half*>(out),
+            S, S_kv, NH, HD, logits_ldc, to_stream(stream));
+    }, py::arg("ctx"), py::arg("V"), py::arg("logits"), py::arg("out"),
+       py::arg("S"), py::arg("S_kv"), py::arg("NH"), py::arg("HD"),
+       py::arg("logits_ldc"), py::arg("stream") = 0);
+
+    m.def("attention_pv_gemm_fp16_strided_batched",
+          [](FvkContext& ctx, uintptr_t V, uintptr_t logits, uintptr_t out,
+             int S, int S_kv, int NH, int HD, int logits_ldc,
+             long long v_batch_stride, long long logits_batch_stride,
+             long long out_batch_stride, int batch_count, uintptr_t stream) {
+        attention_pv_gemm_fp16_strided_batched(ctx.cublas_handle,
+            reinterpret_cast<const __half*>(V),
+            reinterpret_cast<const __half*>(logits),
+            reinterpret_cast<__half*>(out),
+            S, S_kv, NH, HD, logits_ldc,
+            v_batch_stride, logits_batch_stride, out_batch_stride,
+            batch_count, to_stream(stream));
+    }, py::arg("ctx"), py::arg("V"), py::arg("logits"), py::arg("out"),
+       py::arg("S"), py::arg("S_kv"), py::arg("NH"), py::arg("HD"),
+       py::arg("logits_ldc"), py::arg("v_batch_stride"),
+       py::arg("logits_batch_stride"), py::arg("out_batch_stride"),
+       py::arg("batch_count"), py::arg("stream") = 0);
 
     // Fixed-shape cuBLAS decomposed attention. S_kv_max is graph-captured;
     // seqused_k is a device int32[1] containing the valid K/V rows.

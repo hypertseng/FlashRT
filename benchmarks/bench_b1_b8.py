@@ -23,7 +23,7 @@ import torch
 
 CKPT = os.environ.get(
     "PI05_LIBERO_PYTORCH_CHECKPOINT",
-    "/mnt/home/zengzixuan/workspace/checkpoints/pi05_libero_pytorch",
+    "/mnt/home/luoxing/models/pi05/pi05_libero_pytorch",
 )
 
 

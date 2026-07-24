@@ -22,6 +22,50 @@ void attention_qkv_fp16(
     float attn_scale,        // 1/sqrt(HD)
     cudaStream_t stream = 0);
 
+// Decomposed QK^T GEMM only (no softmax, no PV).
+// logits_ldc is the leading dimension of the column-major logits layout.
+void attention_qk_gemm_fp16(
+    cublasHandle_t handle,
+    const __half* Q, const __half* K, __half* logits,
+    int S, int S_kv, int NH, int HD,
+    int logits_ldc, float attn_scale,
+    cudaStream_t stream = 0);
+
+// Batched QK^T GEMM for independent samples with identical shapes.
+// Strides are in fp16 elements, not bytes.
+void attention_qk_gemm_fp16_strided_batched(
+    cublasHandle_t handle,
+    const __half* Q, const __half* K, __half* logits,
+    int S, int S_kv, int NH, int HD,
+    int logits_ldc,
+    long long q_batch_stride,
+    long long k_batch_stride,
+    long long logits_batch_stride,
+    int batch_count,
+    float attn_scale,
+    cudaStream_t stream = 0);
+
+// Decomposed PV GEMM only (reads pre-computed + softmaxed logits).
+void attention_pv_gemm_fp16(
+    cublasHandle_t handle,
+    const __half* V, const __half* logits, __half* out,
+    int S, int S_kv, int NH, int HD,
+    int logits_ldc,
+    cudaStream_t stream = 0);
+
+// Batched PV GEMM for independent samples with identical shapes.
+// Strides are in fp16 elements, not bytes.
+void attention_pv_gemm_fp16_strided_batched(
+    cublasHandle_t handle,
+    const __half* V, const __half* logits, __half* out,
+    int S, int S_kv, int NH, int HD,
+    int logits_ldc,
+    long long v_batch_stride,
+    long long logits_batch_stride,
+    long long out_batch_stride,
+    int batch_count,
+    cudaStream_t stream = 0);
+
 // Fixed-shape attention with a device-side valid K/V length.
 // QK and PV keep the graph-captured S_kv_max shape; logits rows
 // [seqused_k[0], S_kv_max) are masked before softmax.

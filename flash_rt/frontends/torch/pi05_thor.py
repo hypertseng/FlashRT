@@ -51,6 +51,61 @@ _CALIBRATION_CACHE_METADATA = {
     "pi05_thor_action_update": "fp32_bias_unscaled_v1",
 }
 
+
+def _tensor_debug_stats(name, tensor):
+    arr = tensor.detach().float().reshape(-1).cpu().numpy()
+    finite = np.isfinite(arr)
+    return {
+        f"{name}_size": int(arr.size),
+        f"{name}_finite": int(finite.all()) if arr.size else 1,
+        f"{name}_nan": int(np.isnan(arr).sum()) if arr.size else 0,
+        f"{name}_inf": int(np.isinf(arr).sum()) if arr.size else 0,
+        f"{name}_zero": int((arr == 0).sum()) if arr.size else 0,
+        f"{name}_min": float(np.nanmin(arr)) if arr.size else 0.0,
+        f"{name}_max": float(np.nanmax(arr)) if arr.size else 0.0,
+        f"{name}_mean": float(np.nanmean(arr)) if arr.size else 0.0,
+    }
+
+
+def _array_debug_stats(name, arr):
+    arr = np.asarray(arr, dtype=np.float32).reshape(-1)
+    finite = np.isfinite(arr)
+    return {
+        f"{name}_size": int(arr.size),
+        f"{name}_finite": int(finite.all()) if arr.size else 1,
+        f"{name}_nan": int(np.isnan(arr).sum()) if arr.size else 0,
+        f"{name}_inf": int(np.isinf(arr).sum()) if arr.size else 0,
+        f"{name}_min": float(np.nanmin(arr)) if arr.size else 0.0,
+        f"{name}_max": float(np.nanmax(arr)) if arr.size else 0.0,
+        f"{name}_mean": float(np.nanmean(arr)) if arr.size else 0.0,
+        f"{name}_first8": [float(x) for x in arr[:8]],
+    }
+
+
+def _log_tensor_debug_stats(label, tensor):
+    try:
+        logger.info("FlashRT %s stats: %s", label, _tensor_debug_stats(label, tensor))
+    except Exception as exc:
+        logger.warning("Failed to collect FlashRT %s stats: %s", label, exc)
+
+
+def _env_flag(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_float(name, default):
+    value = os.environ.get(name)
+    if value is None:
+        return float(default)
+    try:
+        return float(value)
+    except ValueError:
+        logger.warning("Invalid float env %s=%r; using %.3f", name, value, default)
+        return float(default)
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -940,22 +995,31 @@ class Pi05TorchFrontendThor:
                 break
 
         if all_u8:
-            host_stack = self._img_stack_host_b2[:B, :nv]
-            for b, s in enumerate(samples):
-                for v, im in enumerate(s['images'][:nv]):
-                    host_stack[b, v] = im
+            has_fused_patches = hasattr(fvk, 'normalize_uint8_to_patches_fp16')
+            has_fused_fp16 = hasattr(fvk, 'normalize_uint8_to_fp16')
+            if (target_patches_buf is not None and has_fused_patches) or (
+                    target_patches_buf is None and has_fused_fp16):
+                host_stack = self._img_stack_host_b2[:B, :nv]
+                for b, s in enumerate(samples):
+                    for v, im in enumerate(s['images'][:nv]):
+                        host_stack[b, v] = im
 
-            numel = host_stack.size
-            src_u8 = self._img_stack_host_torch_b2[:numel]
-            dev_u8 = self._img_staging_torch[:numel]
-            dev_u8.copy_(src_u8, non_blocking=True)
-            if target_patches_buf is not None:
-                fvk.normalize_uint8_to_patches_fp16(
-                    dev_u8.data_ptr(), target_patches_buf.ptr.value, B * nv, 0)
-                return True
-            fvk.normalize_uint8_to_fp16(
-                dev_u8.data_ptr(), target_buf_all.ptr.value, numel, 0)
-            return False
+                numel = host_stack.size
+                src_u8 = self._img_stack_host_torch_b2[:numel]
+                dev_u8 = self._img_staging_torch[:numel]
+                dev_u8.copy_(src_u8, non_blocking=True)
+                if target_patches_buf is not None:
+                    fvk.normalize_uint8_to_patches_fp16(
+                        dev_u8.data_ptr(), target_patches_buf.ptr.value, B * nv, 0)
+                    return True
+                fvk.normalize_uint8_to_fp16(
+                    dev_u8.data_ptr(), target_buf_all.ptr.value, numel, 0)
+                return False
+
+            logger.warning(
+                "FlashRT uint8 normalize fused kernel unavailable; "
+                "falling back to CPU fp16 upload before patch_im2col"
+            )
 
         host_fp16 = self._img_stack_fp16_host_b2[:B, :nv]
         for b, s in enumerate(samples):
@@ -1573,6 +1637,15 @@ class Pi05TorchFrontendThor:
                     cached["ae_scales"], dtype=torch.float32, device='cuda')
             logger.info("Calibration loaded from cache (enc=%d, ae=%d scales)",
                         Le * 4, ae_scale_count)
+            logger.info(
+                "Calibration cache enc stats: %s",
+                _tensor_debug_stats("enc_scale", self._enc_calib_scales),
+            )
+            if compute_ae:
+                logger.info(
+                    "Calibration cache ae stats: %s",
+                    _tensor_debug_stats("ae_scale", self._ae_calib_scales),
+                )
             return
         if cached is not None:
             logger.info("Ignoring stale calibration cache (expected enc=%d, ae=%d scales)",
@@ -1638,7 +1711,15 @@ class Pi05TorchFrontendThor:
         self._enc_alpha_host = [
             float(np.float32(self._enc_calib_scales[i].item()) * np.float32(enc_ws[i]))
             for i in range(Le * 4)]
+        logger.info(
+            "Real-data encoder calibration stats: %s",
+            _tensor_debug_stats("enc_scale", self._enc_calib_scales),
+        )
         logger.info("Encoder calibrated: %d scales", Le * 4)
+        logger.info(
+            "Encoder calibration stats: %s",
+            _tensor_debug_stats("enc_scale", self._enc_calib_scales),
+        )
 
         # Decoder calibration
         Sa, Da, Ha = self.Sa, self.Da, self.Ha
@@ -1703,6 +1784,10 @@ class Pi05TorchFrontendThor:
                 ae_max.data_ptr(), stream=0, attn=self._attn)
             self._ae_calib_scales = ae_max
             logger.info("Decoder calibrated: %d scales", ae_scale_count)
+            logger.info(
+                "Decoder calibration stats: %s",
+                _tensor_debug_stats("ae_scale", self._ae_calib_scales),
+            )
         try:
             save_calibration(
                 checkpoint_path=self._checkpoint_path,
@@ -1780,6 +1865,10 @@ class Pi05TorchFrontendThor:
 
     def _capture_siglip_graph(self):
         """Capture patch_embed + SigLIP + PostLN as CUDA graph."""
+        siglip_use_fp8 = self.use_fp8 and os.environ.get(
+            "FLASHRT_FORCE_SIGLIP_FP16", "0"
+        ).lower() not in ("1", "true", "yes", "on")
+        logger.info("SigLIP capture mode: siglip_fp8=%s", siglip_use_fp8)
         # Warmup: zero SigLIP input to match production (g_xs = zeros).
         # patch_embed runs but its output is zeroed before SigLIP to avoid
         # inf from bias accumulation through 27 layers.
@@ -1790,7 +1879,7 @@ class Pi05TorchFrontendThor:
             self._sig_x.zero_()  # match production: SigLIP sees zeros
             siglip_forward(self._gemm, fvk, self._sig_bufs, self._sig_weights,
                            self._sig_dims, stream=0, attn=self._attn,
-                           use_fp8=self.use_fp8)
+                           use_fp8=siglip_use_fp8)
             self._postln_project_ops(0)
         torch.cuda.synchronize()
 
@@ -1803,7 +1892,7 @@ class Pi05TorchFrontendThor:
             self._patch_embed_ops(s_int)
             siglip_forward(self._gemm, fvk, self._sig_bufs, self._sig_weights,
                            self._sig_dims, stream=s_int, attn=self._attn,
-                           use_fp8=self.use_fp8)
+                           use_fp8=siglip_use_fp8)
             self._postln_project_ops(s_int)
             self._siglip_graph.capture_end()
         torch.cuda.synchronize()
@@ -1915,6 +2004,14 @@ class Pi05TorchFrontendThor:
         Le = self.Le; La = self.La; De = self.De; He = self.He
         NHe = self.NHe; HDe = self.HDe
         Sa = self.Sa; Da = self.Da; Ha = self.Ha
+        enc_use_fp8 = self.use_fp8 and os.environ.get(
+            "FLASHRT_FORCE_ENCODER_FP16", "0"
+        ).lower() not in ("1", "true", "yes", "on")
+        dec_use_fp8 = self.use_fp8 and os.environ.get(
+            "FLASHRT_FORCE_DECODER_FP16", "0"
+        ).lower() not in ("1", "true", "yes", "on")
+        logger.info("Enc+AE capture modes: encoder_fp8=%s decoder_fp8=%s",
+                    enc_use_fp8, dec_use_fp8)
 
         # Build dicts for encoder_forward
         enc_bufs = {
@@ -1998,10 +2095,10 @@ class Pi05TorchFrontendThor:
             self._Kc.zero_(); self._Vc.zero_()
             encoder_forward(self._gemm, fvk, enc_bufs, enc_weights,
                             enc_dims, stream=0, attn=self._attn,
-                            use_fp8=self.use_fp8)
+                            use_fp8=enc_use_fp8)
             decoder_forward(self._ctx, fvk, ae_bufs, ae_weights,
                             ae_dims, stream=0, attn=self._attn,
-                            use_fp8=self.use_fp8)
+                            use_fp8=dec_use_fp8)
         torch.cuda.synchronize()
 
         # Capture
@@ -2013,13 +2110,124 @@ class Pi05TorchFrontendThor:
             self._Kc.zero_(); self._Vc.zero_()
             encoder_forward(self._gemm, fvk, enc_bufs, enc_weights,
                             enc_dims, stream=s_int, attn=self._attn,
-                            use_fp8=self.use_fp8)
+                            use_fp8=enc_use_fp8)
             decoder_forward(self._ctx, fvk, ae_bufs, ae_weights,
                             ae_dims, stream=s_int, attn=self._attn,
-                            use_fp8=self.use_fp8)
+                            use_fp8=dec_use_fp8)
             self._enc_ae_graph.capture_end()
         torch.cuda.synchronize()
         logger.info("Enc+AE CUDA graph captured (Se=%d)", Se)
+
+    def _run_enc_ae_eager(self, *, stream=0):
+        """Run the B=1 Enc+AE path directly, without CUDA Graph replay."""
+        Se = self.Se
+        total_keys = self.total_keys
+        Le = self.Le; La = self.La; De = self.De; He = self.He
+        NHe = self.NHe; HDe = self.HDe
+        Sa = self.Sa; Da = self.Da; Ha = self.Ha
+        enc_use_fp8 = self.use_fp8 and os.environ.get(
+            "FLASHRT_FORCE_ENCODER_FP16", "0"
+        ).lower() not in ("1", "true", "yes", "on")
+        dec_use_fp8 = self.use_fp8 and os.environ.get(
+            "FLASHRT_FORCE_DECODER_FP16", "0"
+        ).lower() not in ("1", "true", "yes", "on")
+
+        enc_bufs = {
+            'x':       self._enc_x.data_ptr(),
+            'x_fp8':   self._enc_x_fp8.data_ptr(),
+            'qkv':     self._enc_qkv_buf.data_ptr(),
+            'logits':  self._enc_logits.data_ptr(),
+            'attn_out': self._enc_attn.data_ptr(),
+            'o_fp8':   self._enc_o_fp8.data_ptr(),
+            'gate':    self._enc_gate.data_ptr(),
+            'hidden':  self._enc_hidden.data_ptr(),
+            'hid_fp8': self._enc_hid_fp8.data_ptr(),
+            'fg':      self._enc_fg.data_ptr(),
+            'ctx':     self._ctx,
+            'x_norm':  self._enc_attn.data_ptr(),
+            'ones':    (self._enc_ones_fp16.data_ptr()
+                        if self._enc_ones_fp16 is not None else 0),
+        }
+        enc_weights = {
+            'qkv_w':     [w.data_ptr() for w in self._enc_qkv_w],
+            'o_w':       [w.data_ptr() for w in self._enc_o_w],
+            'gate_w':    [w.data_ptr() for w in self._enc_gu_w],
+            'down_w':    [w.data_ptr() for w in self._enc_d_w],
+            'rope':      self._enc_rope.data_ptr(),
+            'Kc':        self._Kc.reshape(-1).data_ptr(),
+            'Vc':        self._Vc.reshape(-1).data_ptr(),
+            'act_scales':  self._enc_calib_scales.data_ptr(),
+            'alpha_host':  self._enc_alpha_host,
+        }
+        enc_dims = {
+            'Se': Se, 'D': De, 'H': He, 'NH': NHe, 'HD': HDe,
+            'L': Le, 'total_keys': total_keys,
+        }
+
+        ae_bufs = {
+            'noise':   self._g_noise.data_ptr(),
+            'x':       self._ae_x.data_ptr(),
+            'xn':      self._ae_xn.data_ptr(),
+            'gate':    self._ae_gate.data_ptr(),
+            'qkv':     self._ae_qkv.data_ptr(),
+            'logits':  self._ae_logits.data_ptr(),
+            'attn_out': self._ae_attn.data_ptr(),
+            'hid':     self._ae_hid.data_ptr(),
+            'fg':      self._ae_fg.data_ptr(),
+            'action_f32': self._ae_action_f32.data_ptr(),
+            'xn_fp8':  self._ae_xn_fp8.data_ptr(),
+            'hid_fp8': self._ae_hid_fp8.data_ptr(),
+            'ctx_fp8': self._ae_ctx_fp8.data_ptr(),
+        }
+        ae_weights = {
+            'ain_w':      self._ain_w.data_ptr(),
+            'ain_b':      self._ain_b.data_ptr(),
+            'sa':         self._sa_all.data_ptr(),
+            'qw':         self._dec_qkv_flat.data_ptr(),
+            'Kc':         self._Kc.reshape(-1).data_ptr(),
+            'Vc':         self._Vc.reshape(-1).data_ptr(),
+            'ow':         self._dec_o_flat.data_ptr(),
+            'sf':         self._sf_all.data_ptr(),
+            'gw':         self._dec_gu_flat.data_ptr(),
+            'dw':         self._dec_d_flat.data_ptr(),
+            'aow':        self._aow.data_ptr(),
+            'aob':        self._aob.data_ptr(),
+            'aob_dt':     self._aob_dt.data_ptr(),
+            'dt':         self._ae_dt,
+            'fs':         self._fs_all.data_ptr(),
+            'rope':       self._dec_rope.data_ptr(),
+            'w_scales':   self._ae_w_dev.data_ptr(),
+            'act_scales': self._ae_calib_scales.data_ptr(),
+        }
+        ae_dims = {
+            'S': Sa, 'D': Da, 'H': Ha, 'NH': 8, 'HD': 256,
+            'steps': 10, 'layers': La, 'enc_seq': Se,
+            'total_keys': total_keys,
+        }
+
+        self._Kc.zero_(); self._Vc.zero_()
+        encoder_forward(self._gemm, fvk, enc_bufs, enc_weights,
+                        enc_dims, stream=stream, attn=self._attn,
+                        use_fp8=enc_use_fp8)
+        decoder_forward(self._ctx, fvk, ae_bufs, ae_weights,
+                        ae_dims, stream=stream, attn=self._attn,
+                        use_fp8=dec_use_fp8)
+
+    def _bad_enc_ae_graph_replay(self, raw_actions, graph_ms):
+        """Detect stale/no-op B=1 graph replay using conservative signals."""
+        if not np.isfinite(raw_actions).all():
+            return True, "raw_nonfinite"
+
+        fast_ms = _env_float("FLASHRT_BAD_GRAPH_FAST_MS", 20.0)
+        raw_absmax = float(np.nanmax(np.abs(raw_actions))) if raw_actions.size else 0.0
+        raw_absmax_limit = _env_float("FLASHRT_BAD_GRAPH_RAW_ABSMAX", 2.0)
+        fast = graph_ms >= 0.0 and graph_ms < fast_ms
+        noisy = raw_absmax > raw_absmax_limit
+        if fast and noisy:
+            return True, f"fast_and_noisy(graph_ms={graph_ms:.3f}, raw_absmax={raw_absmax:.3f})"
+        if _env_flag("FLASHRT_BAD_GRAPH_GUARD_FAST_ONLY", False) and fast:
+            return True, f"fast(graph_ms={graph_ms:.3f})"
+        return False, ""
 
     def _capture_enc_ae_graph_b2(self):
         """Capture B=N encoder + decoder as a CUDA graph (Stage 2).
@@ -3122,6 +3330,26 @@ class Pi05TorchFrontendThor:
         """
         if self._rl_config is not None:
             return self._infer_cfg(observation, debug, seed)
+        debug_timing = os.environ.get("FLASHRT_INFER_DEBUG_TIMING", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        stage_ms = {}
+        last_mark = None
+
+        def _mark(name):
+            nonlocal last_mark
+            if not debug_timing:
+                return
+            torch.cuda.synchronize()
+            now = time.perf_counter()
+            if last_mark is not None:
+                stage_ms[name] = (now - last_mark) * 1000.0
+            last_mark = now
+
+        _mark("start")
         t0 = time.perf_counter()
         nv = self.num_views
 
@@ -3145,19 +3373,35 @@ class Pi05TorchFrontendThor:
             return (im.astype(np.float32) / 127.5 - 1.0).astype(np.float16)
 
         images_np = np.stack([_to_np16(im) for im in img_list[:nv]])
+        _mark("image_prepare")
         self._img_buf.upload(images_np)
+        _mark("image_upload")
 
         # ---- Graph 1: SigLIP + PostLN ----
         self._siglip_graph.replay()
+        _mark("siglip_graph")
 
         # ---- Lazy real-data recalibration on first call ----
         # Skip when use_fp8=False: the FP16 baseline path has no FP8
         # scales to refresh, and ``_recalibrate_with_real_data`` reads
         # FP8-specific attrs.
+        recalib_executed = False
         if self.use_fp8 and not self._real_data_calibrated:
             torch.cuda.synchronize()
-            self._recalibrate_with_real_data()
+            recalib_mode = os.environ.get(
+                "FLASHRT_REALDATA_RECALIB_MODE", "full"
+            ).strip().lower()
+            if recalib_mode in {"recapture_only", "recapture-only", "skip_scales"}:
+                self._capture_siglip_graph()
+                self._capture_enc_ae_graph()
+                logger.info(
+                    "Real-data recalibration skipped; graphs recaptured with cached FP8 scales"
+                )
+            else:
+                self._recalibrate_with_real_data()
+                recalib_executed = True
             self._real_data_calibrated = True
+        _mark("realdata_recalib")
 
         # ---- Graph 2: Encoder + Decoder ----
         # numpy CPU RNG so the bit pattern matches the JAX frontend's
@@ -3169,9 +3413,77 @@ class Pi05TorchFrontendThor:
         else:
             R_np = np.random.randn(self.Sa, 32).astype(np.float16)
         R = torch.from_numpy(R_np).to('cuda', non_blocking=True)
+        if os.environ.get("FLASHRT_RECAPTURE_ENC_AE_EACH_INFER", "0").lower() in (
+            "1", "true", "yes", "on"
+        ):
+            self._capture_enc_ae_graph()
+            _mark("enc_ae_recapture")
         self._g_noise.view(-1, 32).copy_(R)
-        self._enc_ae_graph.replay()
-        torch.cuda.synchronize()
+        _mark("noise_upload")
+        enc_ae_mode = "graph"
+        enc_ae_exec_ms = -1.0
+        graph_retry_reason = ""
+        if _env_flag("FLASHRT_DISABLE_ENC_AE_GRAPH", False):
+            enc_ae_mode = "eager"
+            exec_t0 = time.perf_counter()
+            self._run_enc_ae_eager(stream=0)
+            torch.cuda.synchronize()
+            enc_ae_exec_ms = (time.perf_counter() - exec_t0) * 1000.0
+            _mark("enc_ae_eager")
+        else:
+            exec_t0 = time.perf_counter()
+            self._enc_ae_graph.replay()
+            torch.cuda.synchronize()
+            enc_ae_exec_ms = (time.perf_counter() - exec_t0) * 1000.0
+            _mark("enc_ae_graph")
+
+            if _env_flag("FLASHRT_BAD_GRAPH_GUARD", False):
+                raw_probe = self._g_noise.float().cpu().numpy()
+                bad_graph, graph_retry_reason = self._bad_enc_ae_graph_replay(
+                    raw_probe, enc_ae_exec_ms
+                )
+                if bad_graph:
+                    logger.warning(
+                        "Suspicious Enc+AE graph replay detected (%s); "
+                        "recapturing and retrying once",
+                        graph_retry_reason,
+                    )
+                    retry_t0 = time.perf_counter()
+                    self._capture_enc_ae_graph()
+                    retry_capture_ms = (time.perf_counter() - retry_t0) * 1000.0
+                    stage_ms["bad_graph_recapture_ms"] = retry_capture_ms
+                    self._g_noise.view(-1, 32).copy_(R)
+                    retry_t1 = time.perf_counter()
+                    self._enc_ae_graph.replay()
+                    torch.cuda.synchronize()
+                    enc_ae_exec_ms = (time.perf_counter() - retry_t1) * 1000.0
+                    stage_ms["bad_graph_retry_ms"] = enc_ae_exec_ms
+                    enc_ae_mode = "graph_retry"
+                    _mark("enc_ae_graph_retry")
+
+        if os.environ.get("FLASHRT_FP8_DEBUG_BUFFERS", "0").lower() in (
+            "1", "true", "yes", "on"
+        ):
+            for label, tensor in (
+                ("enc_w_scale", getattr(self, "_enc_w_dev", None)),
+                ("ae_w_scale", getattr(self, "_ae_w_dev", None)),
+                ("enc_act_scale", getattr(self, "_enc_calib_scales", None)),
+                ("ae_act_scale", getattr(self, "_ae_calib_scales", None)),
+                ("enc_x", getattr(self, "_enc_x", None)),
+                ("enc_qkv", getattr(self, "_enc_qkv_buf", None)),
+                ("Kc", getattr(self, "_Kc", None)),
+                ("Vc", getattr(self, "_Vc", None)),
+                ("ae_x", getattr(self, "_ae_x", None)),
+                ("ae_xn", getattr(self, "_ae_xn", None)),
+                ("ae_qkv", getattr(self, "_ae_qkv", None)),
+                ("ae_attn", getattr(self, "_ae_attn", None)),
+                ("ae_fg", getattr(self, "_ae_fg", None)),
+                ("ae_hid", getattr(self, "_ae_hid", None)),
+                ("ae_action_f32", getattr(self, "_ae_action_f32", None)),
+                ("g_noise", getattr(self, "_g_noise", None)),
+            ):
+                if tensor is not None:
+                    _log_tensor_debug_stats(label, tensor)
 
         latency_ms = (time.perf_counter() - t0) * 1000
         self.latency_records.append(latency_ms)
@@ -3180,13 +3492,49 @@ class Pi05TorchFrontendThor:
         raw_actions = self._g_noise.float().cpu().numpy()
         unnorm = unnormalize_actions(raw_actions, self.norm_stats)
         robot_actions = unnorm[:, :LIBERO_ACTION_DIM]
+        _mark("postprocess")
+
+        if debug_timing:
+            logger.info("FlashRT raw action stats: %s", _array_debug_stats("raw", raw_actions))
+            if hasattr(self, "_enc_calib_scales"):
+                logger.info(
+                    "FlashRT enc scale stats: %s",
+                    _tensor_debug_stats("enc_scale", self._enc_calib_scales),
+                )
+            if hasattr(self, "_ae_calib_scales"):
+                logger.info(
+                    "FlashRT ae scale stats: %s",
+                    _tensor_debug_stats("ae_scale", self._ae_calib_scales),
+                )
 
         if debug:
             logger.info("Raw actions[0,:5]: %s", raw_actions[0, :5])
             logger.info("Robot actions[0]: %s", robot_actions[0])
             logger.info("Latency: %.1f ms", latency_ms)
 
-        return {"actions": robot_actions}
+        result = {"actions": robot_actions}
+        if debug_timing:
+            stage_ms["enc_ae_exec_ms"] = enc_ae_exec_ms
+            stage_ms["enc_ae_mode"] = {
+                "graph": 0.0,
+                "eager": 1.0,
+                "graph_retry": 2.0,
+            }.get(enc_ae_mode, -1.0)
+            stage_ms["bad_graph_retry"] = 1.0 if enc_ae_mode == "graph_retry" else 0.0
+            stage_ms["total"] = latency_ms
+            stage_ms["realdata_recalib_executed"] = 1.0 if recalib_executed else 0.0
+            stage_ms["realdata_calibrated"] = (
+                1.0 if getattr(self, "_real_data_calibrated", False) else 0.0
+            )
+            stage_ms["raw_finite"] = 1.0 if np.isfinite(raw_actions).all() else 0.0
+            stage_ms["raw_nan_count"] = float(np.isnan(raw_actions).sum())
+            result["frontend_stage_ms"] = stage_ms
+            logger.info(
+                "FlashRT infer stages: %s",
+                {k: round(float(v), 3) for k, v in stage_ms.items()},
+            )
+
+        return result
 
     # -----------------------------------------------------------------------
     # Pipelined Encoder-Decoder Inference
@@ -3585,6 +3933,10 @@ class Pi05TorchFrontendThor:
             self._ctx, fvk, ae_bufs, ae_weights, ae_dims,
             self._ae_calib_scales.data_ptr(), stream=0, attn=self._attn)
         torch.cuda.synchronize()
+        logger.info(
+            "Real-data decoder calibration stats: %s",
+            _tensor_debug_stats("ae_scale", self._ae_calib_scales),
+        )
 
         # Recapture graphs with updated scales.
         # Both the SigLIP graph (PostLN FP8 scales) and the enc+ae graph

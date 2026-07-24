@@ -191,7 +191,7 @@ def encoder_forward_b2(gemm, fvk, bufs, weights, dims, stream=0, *,
             qk_stride_bytes = qk_elem_off * 2
             K_base = Kc_b2[0] + kv_elem_off * 2
             V_base = Vc_b2[0] + kv_elem_off * 2
-            if qk_batched is not None and B > 1:
+            if qk_batched is not None and pv_batched is not None and B > 1:
                 qk_batched(
                     bufs['ctx'],
                     attn_out,
@@ -205,18 +205,7 @@ def encoder_forward_b2(gemm, fvk, bufs, weights, dims, stream=0, *,
                     B,
                     attn_scale,
                     stream)
-            else:
-                for b in range(B):
-                    K_ptr = Kc_b2[b] + kv_elem_off * 2
-                    fvk.attention_qk_gemm_fp16(
-                        bufs['ctx'],
-                        attn_out + b * attn_q_stride_bytes,
-                        K_ptr,
-                        logits + b * qk_stride_bytes,
-                        Se, Se, NH, HD,
-                        Se, attn_scale, stream)
-            fvk.softmax_fp16(logits, B * Se * NH, Se, stream)
-            if pv_batched is not None and B > 1:
+                fvk.softmax_fp16(logits, B * Se * NH, Se, stream)
                 pv_batched(
                     bufs['ctx'],
                     V_base,
@@ -230,15 +219,21 @@ def encoder_forward_b2(gemm, fvk, bufs, weights, dims, stream=0, *,
                     B,
                     stream)
             else:
+                # Current Thor SM110 builds may omit the legacy decomposed
+                # QK/PV helper symbols. Fall back to the fused per-sample
+                # attention kernel that is already used by the B=1 path.
                 for b in range(B):
+                    K_ptr = Kc_b2[b] + kv_elem_off * 2
                     V_ptr = Vc_b2[b] + kv_elem_off * 2
-                    fvk.attention_pv_gemm_fp16(
+                    fvk.attention_qkv_fp16(
                         bufs['ctx'],
+                        attn_out + b * attn_q_stride_bytes,
+                        K_ptr,
                         V_ptr,
                         logits + b * qk_stride_bytes,
                         attn_out + b * attn_q_stride_bytes,
                         Se, Se, NH, HD,
-                        Se, stream)
+                        attn_scale, stream)
 
             # ── 6. Quantize attn → FP8 + O proj GEMM with residual fusion ──
             # Writes directly to x: x = alpha * (o_fp8 @ o_w) + x.

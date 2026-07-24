@@ -68,6 +68,99 @@ void attention_qkv_fp16(
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 }
 
+void attention_qk_gemm_fp16(
+    cublasHandle_t handle,
+    const __half* Q, const __half* K, __half* logits,
+    int S, int S_kv, int NH, int HD,
+    int logits_ldc, float attn_scale,
+    cudaStream_t stream)
+{
+    cublasSetStream(handle, stream);
+    float zero = 0.0f;
+    cublasGemmEx(handle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        S_kv, S * NH, HD,
+        &attn_scale,
+        K, CUDA_R_16F, HD,
+        Q, CUDA_R_16F, HD,
+        &zero,
+        logits, CUDA_R_16F, logits_ldc,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+}
+
+void attention_qk_gemm_fp16_strided_batched(
+    cublasHandle_t handle,
+    const __half* Q, const __half* K, __half* logits,
+    int S, int S_kv, int NH, int HD,
+    int logits_ldc,
+    long long q_batch_stride,
+    long long k_batch_stride,
+    long long logits_batch_stride,
+    int batch_count,
+    float attn_scale,
+    cudaStream_t stream)
+{
+    cublasSetStream(handle, stream);
+    float zero = 0.0f;
+    cublasGemmStridedBatchedEx(handle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        S_kv, S * NH, HD,
+        &attn_scale,
+        K, CUDA_R_16F, HD, k_batch_stride,
+        Q, CUDA_R_16F, HD, q_batch_stride,
+        &zero,
+        logits, CUDA_R_16F, logits_ldc, logits_batch_stride,
+        batch_count,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+}
+
+void attention_pv_gemm_fp16(
+    cublasHandle_t handle,
+    const __half* V, const __half* logits, __half* out,
+    int S, int S_kv, int NH, int HD,
+    int logits_ldc,
+    cudaStream_t stream)
+{
+    cublasSetStream(handle, stream);
+    float zero = 0.0f;
+    float one = 1.0f;
+    cublasGemmEx(handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        HD, S * NH, S_kv,
+        &one,
+        V, CUDA_R_16F, HD,
+        logits, CUDA_R_16F, logits_ldc,
+        &zero,
+        out, CUDA_R_16F, HD,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+}
+
+void attention_pv_gemm_fp16_strided_batched(
+    cublasHandle_t handle,
+    const __half* V, const __half* logits, __half* out,
+    int S, int S_kv, int NH, int HD,
+    int logits_ldc,
+    long long v_batch_stride,
+    long long logits_batch_stride,
+    long long out_batch_stride,
+    int batch_count,
+    cudaStream_t stream)
+{
+    cublasSetStream(handle, stream);
+    float zero = 0.0f;
+    float one = 1.0f;
+    cublasGemmStridedBatchedEx(handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        HD, S * NH, S_kv,
+        &one,
+        V, CUDA_R_16F, HD, v_batch_stride,
+        logits, CUDA_R_16F, logits_ldc, logits_batch_stride,
+        &zero,
+        out, CUDA_R_16F, HD, out_batch_stride,
+        batch_count,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+}
+
 // Mask rows [seqused_k[0], S_kv_max) in every logits column.
 // logits is col-major [S_kv_max, S*NH].
 __global__ void mask_seqused_logits_kernel(

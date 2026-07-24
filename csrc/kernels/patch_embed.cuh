@@ -4,8 +4,21 @@
 // ================================================================
 #pragma once
 
+#include <cstdint>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+
+// Exact uint8 image normalization:
+//   ((float32)x / 127.5f - 1.0f) cast to fp16
+// Matches the original numpy preprocessing path byte-for-byte.
+void normalize_uint8_to_fp16(const uint8_t* input, half* output, int numel,
+                             cudaStream_t stream = 0);
+
+// Exact uint8 normalization fused with the patch im2col layout transform.
+// Input:  (nv, 224, 224, 3) uint8, row-major NHWC
+// Output: (nv*256, 588) fp16, matching normalize_uint8_to_fp16 + patch_im2col.
+void normalize_uint8_to_patches_fp16(const uint8_t* input, half* output, int nv,
+                                     cudaStream_t stream = 0);
 
 // GPU im2col: (nv, 224, 224, 3) → (nv*256, 588)
 // Pure strided copy, bit-exact, no computation.
