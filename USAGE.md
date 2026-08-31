@@ -11,7 +11,7 @@ for the full walkthrough (Docker and non-Docker paths). The short
 version:
 
 ```bash
-git clone https://github.com/LiangSu8899/FlashRT.git
+git clone https://github.com/flashrt-project/FlashRT.git
 cd FlashRT
 git clone --depth 1 --branch v4.4.2 \
     https://github.com/NVIDIA/cutlass.git third_party/cutlass
@@ -213,12 +213,12 @@ model = flash_rt.load_model(
 | `autotune` | `int\|bool` | `3` | CUDA Graph autotune intensity. See [Autotune](#autotune). |
 | `recalibrate` | `bool` | `False` | Force fresh FP8 calibration (and weight cache for JAX), ignoring cache. See [Calibration](#calibration). |
 | `weight_cache` | `bool` | `True` | Cache FP8-quantized weights to disk. **JAX only** — reduces cold start from ~42s to ~6s. Torch loads in ~3s and ignores this. See [Weight Cache](#weight-cache-jax-only). |
-| `config` | `str` | `"pi05"` | Model architecture config: `"pi05"`, `"pi0"`, `"groot"`, `"groot_n17"`, `"pi0fast"`, `"motus"`, `"wan22_ti2v_5b"`, `"cosmos3_video"`. `"cosmos3_video"` is a non-VLA text2video denoise model — drive it with `set_prompt(ref=...)` + `infer(...)`, not `predict()`. |
+| `config` | `str` | `"pi05"` | Model architecture config: `"pi05"`, `"pi0"`, `"groot"`, `"groot_n17"`, `"pi0fast"`, `"motus"`, `"wan22_ti2v_5b"`, `"cosmos3_video"`, `"cosmos3_edge"`. Cosmos video/Edge routes use `set_prompt(...)` + `infer(...)`, not the VLA `predict()` convenience API. |
 | `decode_cuda_graph` | `bool` | `False` | **Pi0-FAST only.** Capture action-phase decode as CUDA Graph. Trades startup time for per-token speed. See [Pi0-FAST](#pi0-fast). |
 | `decode_graph_steps` | `int` | `80` | **Pi0-FAST only.** Number of action tokens to capture in the decode graph. Should cover your longest expected action sequence. |
-| `use_fp4` | `bool` | `False` | **Pi0.5 torch + jax on Thor.** Enable NVFP4 quantization on the encoder FFN stack. When `True`, resolves to the production preset (`fp4_layers=tuple(range(18))` + `use_awq=True` + `use_p1_split_gu=True`). Requires SM100+ GPU. Other configs emit a warning and fall back to FP8. See [NVFP4](#nvfp4-pi05-only). |
-| `fp4_layers` | `tuple[int]` \| `None` | `None` | Encoder layer indices to FP4-quantize. `None` → resolved by the `use_fp4` preset. Passing an explicit tuple overrides the preset. Only `(7,8,9)` and `range(18)`+AWQ are task-level validated. |
-| `use_awq` | `bool` \| `None` | `None` | Activation-aware weight quant. Required for 18-layer FP4 scope (without it, cos collapses to ~0.33). `None` → resolved by the `use_fp4` preset. |
+| `use_fp4` | `bool` | `False` | **Pi0.5 torch + jax on Thor.** Enable NVFP4 quantization on the encoder FFN stack. When `True`, resolves to the production preset (`fp4_layers=tuple(range(17))` + `use_awq=True` + `use_p1_split_gu=True`). Requires SM100+ GPU. Other configs emit a warning and fall back to FP8. See [NVFP4](#nvfp4-pi05-only). |
+| `fp4_layers` | `tuple[int]` \| `None` | `None` | Encoder layer indices to FP4-quantize. `None` → resolved by the `use_fp4` preset. Passing an explicit tuple overrides the preset. Valid live FFN indices are 0-16; `(7,8,9)` and `range(17)`+AWQ are task-level validated. |
+| `use_awq` | `bool` \| `None` | `None` | Activation-aware weight quant. Required for the full 17-layer FP4 scope (without it, cos collapses to ~0.33). `None` → resolved by the `use_fp4` preset. |
 | `awq_alpha` | `float` | `0.5` | AWQ scaling exponent `s[k] = (a[k]/a.mean())^alpha`. |
 | `use_p1_split_gu` | `bool` \| `None` | `None` | P1 split-GU 2-GEMM path (parity on Pi0.5, kernel reusable for Pi0.6). `None` → resolved by the `use_fp4` preset. |
 | `use_fp8` | `bool` | `True` | Enable the selected frontend's FP8 path when available. Set `False` for frontends with a documented BF16 fallback or for explicit full-FP16 reference paths. `groot_n17` on RTX/Thor is stricter: `use_fp8=False` alone raises, and the non-quantized reference path is `use_fp16=True, use_fp8=False`. |
@@ -515,6 +515,68 @@ fe = flash_rt.load_model(
 # equivalently: GrootN17TorchFrontendThorFP16(checkpoint, num_views=2, embodiment_tag=...)
 ```
 
+**NVFP4 tier (opt-in, fastest verified Thor config).** `use_fp4=True`
+keeps the FP8 backbone and moves the action-head side to block-scaled
+NVFP4 with fused epilogues, plus a vectorized small-kernel tier and
+masked-softmax attention across the whole pipeline:
+
+* every DiT GEMM (fused self-attn QKV, cross-attn Q, attention output,
+  both FFN projections) runs as an NVFP4 GEMM with per-16-element
+  dynamic activation scales — no calibration pass — with bias,
+  bias+residual and bias+tanh-GELU+FP4-output fused into the epilogues;
+* the per-frame cross-KV projections are NVFP4 as well;
+* the AdaLN / pre-FFN norms emit FP4 directly, the self-attention reads
+  the fused QKV GEMM output in place, and the backbone's small
+  per-layer kernels (norms, RoPE, FP8 quantizes, GQA expand) run
+  16-byte-load vectorized variants;
+* the masked-softmax attention variants drop the per-layer -inf logits
+  pre-fill, which also makes graph replays exactly deterministic;
+* the three backbone attention sites (ViT, LLM causal-GQA,
+  VL-self-attn) run the vendored FlashAttention-4 (CuTe-DSL) forward
+  when its runtime deps are installed (the `thor-fa4` pip extra),
+  falling back to the fmha/cublas chain otherwise.
+
+```python
+fe = flash_rt.load_model(
+    "/path/to/GR00T-N1.7-3B",
+    framework="torch", config="groot_n17", hardware="thor",
+    use_fp4=True,
+    num_views=2, embodiment_tag="oxe_droid_relative_eef_relative_joint",
+)
+# equivalently: GrootN17TorchFrontendThorFP4(checkpoint, num_views=2, embodiment_tag=...)
+```
+
+Reference (Jetson AGX Thor, JetPack 7.2, MAXN; wall-clock per-frame
+image→action e2e, 4 denoising steps, batch 1, medians over 20
+iterations after 5 warmup iterations, run as one same-session A/B/A
+against the FP8 default):
+
+| Checkpoint / cameras | FP8 | NVFP4 + FA4 | Speedup |
+|---|---:|---:|---:|
+| LIBERO fine-tune (`libero_10`), 1 camera | 36.8 ms (27 Hz) | **23.7 ms (42 Hz)** | 1.56× |
+| Base `GR00T-N1.7-3B`, 2 cameras, `T=40` | 50.2 ms (20 Hz) | **29.9 ms (33 Hz)** | 1.70× |
+
+Action cosine against the FP8 tier is 1.000000 on the LIBERO fixture
+and 0.99994 on the 2-view base-checkpoint fixture; graph replays are
+bit-identical on both tiers. Without the FA4 runtime deps the tier
+still runs (fmha/cuBLAS fallback), roughly 5 ms slower on the 2-view
+shape. (Absolute Thor latencies drift ~1 ms at day scale; the
+same-session speedup is the stable metric.)
+
+Reproduce with:
+
+```bash
+python benchmarks/groot_n17_thor_latency.py \
+    --ckpt <n17-checkpoint-dir> --aux <aux-fixture.pt> \
+    --tier fp4 --views 1 --embodiment libero_sim --warmup 5 --iters 20
+```
+
+Across an 8-sample set captured from the base checkpoint the tier holds
+action cosine ≥ 0.9993 against the FP8 tier on 7 of 8 samples, with a
+worst sample of 0.9976; on the LIBERO fine-tune it matches the FP8 tier
+to 1.000000. For accuracy-critical deployments, validate on the target
+task rather than on cosine alone, or run the FP8 tier.
+
 ### GROOT N1.7 RTX
 
 GROOT N1.7 is registered for the RTX SM120 / SM89 torch path:
@@ -598,13 +660,18 @@ The gripper DOF is a near-constant scalar whose cosine is intrinsically noisy
 (the bf16 reference itself scores ≈ 0.94); the combined action cosine clears
 the ≥ 0.999 bar on both paths.
 
-RTX 5090 latency (warm, P50):
+RTX 5090 latency (warm, P50), with the backbone run eagerly — that is,
+`infer()` without `aux=`:
 
 | Stage | FP8 (default) | full-FP16 (opt-in) |
 |---|---:|---:|
 | Backbone (ViT+LLM+VL self-attn, per observation) | 12.8 ms | 15.3 ms |
 | Infer (DiT 4-step loop, CUDA graph) | 10.7 ms | 10.9 ms |
 | E2E (backbone + infer) | 24.0 ms | 26.6 ms |
+
+Passing `aux=` to `infer()` on the RTX FP8 path captures and replays the
+backbone graph as well, covering the whole backbone-to-action path and
+bringing E2E to **16.61 ms** on RTX 5090 (2-view base checkpoint).
 
 FP8 saves ≈ 2.7 ms E2E (1.11×), concentrated in the backbone GEMMs (1.19×);
 the DiT is never quantized, so infer is effectively the same on both paths.
@@ -613,6 +680,39 @@ once and reused, so per-chunk cost is just the infer row.
 
 This path does not change CMake targets, C++ bindings, or existing
 Pi0/Pi0.5/GROOT N1.6 runtime dispatch.
+
+### Chameleon-7B (Thor)
+
+Standalone Chameleon-7B (text + image) is a direct-instantiation Thor
+frontend — it is registered in `_PIPELINE_MAP` but is **not** dispatched by
+`flash_rt.load_model` (same pattern as Qwen3-VL). The VQGAN image
+tokenizer defaults to the generic eager Chameleon path; if compatible
+TensorRT engines exist in the deployment, it is recommended to opt in
+explicitly (`use_trt_vqgan=True`). A Jetson Orin (SM87) INT8/QuaRot
+frontend is also available; see [`docs/chameleon_usage.md`](docs/chameleon_usage.md),
+[`docs/chameleon_thor_sm110.md`](docs/chameleon_thor_sm110.md) and
+[`docs/chameleon7b_rtx_sm87.md`](docs/chameleon7b_rtx_sm87.md).
+
+```python
+from flash_rt.frontends.torch.chameleon_thor import ChameleonTorchFrontendThor
+
+fe = ChameleonTorchFrontendThor(
+    "/path/to/Chameleon_7B_mGPT",
+    use_fp8=True,            # dynamic per-tensor FP8 (recommended default)
+    use_cuda_graph=True,
+    use_trt_vqgan=False,     # generic default = eager VQGAN; set True when engines exist
+    target_size=512,
+)
+
+out = fe.prefill("Describe the image.", [pil_image])
+# out["logits"]: (65536,) fp32 with mask_image_logits applied
+```
+
+FA4 attention is an explicit opt-in fast path
+(`use_fa4_attn=True` / `FLASHRT_CHAMELEON_FA4_ATTN=1`, needs the
+`thor-fa4` pip extra); measured transformer-prefill-only ≈ **104 ms** at
+Se≈1056 vs ≈111 ms with CUTLASS FMHA. E2E (TRT VQGAN + FA4) ≈ **120 ms**
+vs HF BF16 ≈ 403 ms transformer-only (~3.4×).
 
 ### Wan2.2 TI2V-5B
 
@@ -676,6 +776,37 @@ out = model.infer(
 The model-local kernel is built once on the target GPU (`cd
 flash_rt/models/cosmos3_video/kernels && python3 setup.py build_ext --inplace`).
 See [`docs/cosmos3_video_usage.md`](docs/cosmos3_video_usage.md).
+
+### Cosmos3-Edge AV inverse dynamics
+
+Cosmos3-Edge is registered for PyTorch on Jetson AGX Thor. Run the official
+action-only path first to establish the end-to-end output and baseline:
+
+```python
+import flash_rt
+
+model = flash_rt.load_model(
+    "/path/to/Cosmos3-Edge",
+    framework="torch",
+    config="cosmos3_edge",
+    hardware="thor",
+)
+model.set_prompt(input_json="/path/to/av_inverse_input.json")
+result = model.infer(
+    output_dir="/path/to/output",
+    backend="official_action_only",
+    cosmos_root="/path/to/cosmos-framework",
+    vae_path="/path/to/Wan2.2_VAE.pth",
+    benchmark=True,
+)
+```
+
+The FlashRT denoise engine executes all 30 steps in one CUDA Graph and reaches
+5.72x with FP8 or 6.60x with FP8 plus NVFP4 FFN on the measured Thor workload.
+Optional TeaCache schedules can be much faster, but must be qualified for each
+task distribution and fine-tuned checkpoint. See
+[`docs/cosmos3_edge_thor.md`](docs/cosmos3_edge_thor.md) for the complete table,
+benchmark commands, accuracy gates, and limitations.
 
 ### `model.predict()`
 
@@ -862,6 +993,13 @@ FLASHRT_FP8_NT_AUTOTUNE=safe   # always skip FP8 NT top-N autotune
 ## Calibration
 
 FP8 inference requires calibrated activation scales — per-layer maximum values that determine the FP8 quantization range. Incorrect scales cause precision loss.
+
+> **Native PI0.5 C++ producer:** the Python cache and first-`predict()` flow
+> below do not apply to `io="native_v2"`. Native C++ calibration explicitly
+> creates a session, observes one or more samples, finalizes a safetensors
+> artifact, and passes that artifact to runtime open. See
+> [`docs/pi05_native_calibration.md`](docs/pi05_native_calibration.md) for
+> complete one-view, synchronized multi-view, and dataset examples.
 
 ### How it works
 
@@ -1397,8 +1535,8 @@ model = flash_rt.load_model(
     use_fp4=True,
 )
 # Equivalent to passing:
-#   fp4_layers=tuple(range(18))   # full encoder FFN (18 layers)
-#   use_awq=True                   # required for 18-layer scope
+#   fp4_layers=tuple(range(17))   # all 17 live encoder FFNs
+#   use_awq=True                   # required for full-scope calibration
 #   use_p1_split_gu=True           # production P1 path
 
 # Advanced: override sub-flags for A/B or debug:
@@ -1418,8 +1556,8 @@ When `use_fp4=True` and a sub-flag (`fp4_layers`, `use_awq`,
 
 | Sub-flag | Preset value | Reason |
 |---|---|---|
-| `fp4_layers` | `tuple(range(18))` | Full encoder FFN coverage |
-| `use_awq` | `True` | Required for 18-layer scope (without AWQ, full-scope FP4 cos collapses to ~0.33) |
+| `fp4_layers` | `tuple(range(17))` | All live encoder FFN coverage |
+| `use_awq` | `True` | Required for full-scope calibration (without AWQ, full-scope FP4 cos collapses to ~0.33) |
 | `use_p1_split_gu` | `True` | Split Gate+Up → 2× fp4out GEMM + combiner (Pi0.5 parity, Pi0.6 reusable) |
 
 ### What it does
@@ -1504,9 +1642,9 @@ claim.
 
 ### Layer selection
 
-`fp4_layers` accepts any subset of encoder layer indices 0-17. Two
+`fp4_layers` accepts any subset of live encoder layer indices 0-16. Two
 configurations are task-level LIBERO-validated:
-- `tuple(range(18))` + AWQ (production preset — `--use_fp4` default)
+- `tuple(range(17))` + AWQ (production preset — `--use_fp4` default)
 - `(7, 8, 9)` without AWQ (the conservative subset, from the first FP4 drop)
 
 Other subsets are simulation-only (see the internal precision report).

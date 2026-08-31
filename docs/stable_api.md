@@ -29,7 +29,7 @@ def load_model(
     autotune: int = 3,              # 0=off, 3=default, 5+=thorough
     recalibrate: bool = False,
     weight_cache: bool = True,      # JAX only
-    config: str = "pi05",           # "pi05" | "pi0" | "groot" | "groot_n17" | "pi0fast" | "motus" | "wan22_ti2v_5b" | "cosmos3_video"
+    config: str = "pi05",           # "pi05" | "pi0" | "groot" | "groot_n17" | "pi0fast" | "motus" | "wan22_ti2v_5b" | "cosmos3_video" | "cosmos3_edge" | "chameleon" | "hyvla"
     device=None,                    # reserved
     # Pi0-FAST-specific:
     decode_cuda_graph: bool = False,
@@ -43,8 +43,15 @@ def load_model(
     use_fp4: bool = False,
     fp4_layers: tuple[int, ...] | None = None,
     use_awq: bool | None = None,
-    awq_alpha: float = 0.5,
+    awq_alpha: float | None = None,   # None -> per-stage production value
     use_p1_split_gu: bool | None = None,
+    use_fp4_decoder: bool = False,
+    use_fp4_encoder_attn: bool | None = None,   # None -> preset
+    use_fp4_siglip_ffn: bool | None = None,     # None -> preset
+    use_fa4: bool = False,
+    encoder_p1_combiner: str | None = None,     # None -> preset
+    encoder_down_variant: int = 7,
+    decoder_gate_up_variant: int = 10,
     num_steps: int | None = None,
     vision_pool_factor: int | None = None,
     vision_num_layers: int | None = None,
@@ -68,6 +75,35 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   `use_p1_split_gu` apply to the Pi0.5 torch and JAX NVFP4 encoder path on
   Thor. The JAX path loads Orbax checkpoints; the torch path loads
   safetensors checkpoints.
+- `use_fp4_decoder`, `use_fp4_encoder_attn`, `use_fp4_siglip_ffn`,
+  `encoder_p1_combiner`, `encoder_down_variant` and
+  `decoder_gate_up_variant` extend that Pi0.5 Thor NVFP4 path. They require
+  `use_fp4=True` and Pi0.5 torch on Thor; a `True` value on any other
+  config or hardware raises rather than being silently dropped.
+- `use_fp4_decoder=True` selects the complete Thor NVFP4 tier that the
+  published latency table is measured with, so the sub-flags left at `None`
+  resolve to it: `use_fp4_encoder_attn=True`, `use_fp4_siglip_ffn=True`,
+  `encoder_p1_combiner="epilogue_hw"` and `awq_alpha=0.8`. With
+  `use_fp4=True` alone they resolve to the encoder-only preset
+  (`False`, `False`, `"lut_native"`, `0.5`). Any of them passed explicitly
+  overrides the preset. The measured configuration is therefore exactly:
+
+  ```python
+  model = load_model(checkpoint, config="pi05", framework="torch",
+                     hardware="thor", num_views=3,
+                     use_fp4=True, use_fp4_decoder=True, use_fa4=True)
+  ```
+
+- `use_fa4` selects the FA4 attention backend for SigLIP and encoder
+  attention on Pi0.5 torch/Thor. It is **not** part of the NVFP4 tier and
+  does not require `use_fp4`: both the FP8 frontend and its NVFP4 subclass
+  accept it, and the published NVFP4 speedups are measured against an FP8
+  baseline that also runs FA4. It raises on any other config, framework or
+  hardware.
+- `use_fp4=True` with `config="groot_n17"` on Thor selects the GROOT N1.7
+  NVFP4 tier (NVFP4 DiT action head + cross-KV, vectorized backbone
+  kernels, FA4 attention when available). It takes no Pi0.5 sub-flags and
+  falls back to the FP8 tier when the `flash_rt_fp4` extension is missing.
 - `num_steps`, `vision_pool_factor`, `vision_num_layers`, and
   `cache_frames` apply only to frontends that expose those constructor
   parameters today. The Pi0.5 torch RTX/Orin frontend validates
@@ -113,6 +149,12 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   compare_ref=..., return_metadata=...)`, returning the denoised vision
   latent; `predict()` is not part of this API. Precision is selected with
   `load_model(..., use_fp8=True|False)`. See `docs/cosmos3_video_usage.md`.
+- `config="cosmos3_edge"` is the Thor integration for NVIDIA Cosmos Framework.
+  It exposes `set_prompt(input_json=...)` or `set_prompt(sample=...)`, then
+  `infer(output_dir=..., vae_path=..., cosmos_root=...)`. The official backend
+  establishes the end-to-end reference; the fixture-backed FlashRT backend
+  validates and benchmarks the optimized denoise boundary. See
+  `docs/cosmos3_edge_thor.md`.
 - `config="groot_n17"` is registered for `framework="torch"` on
   `hardware in {"thor", "rtx_sm120", "rtx_sm89"}`. On RTX,
   `rtx_sm120` resolves through the historical shared RTX registration and
@@ -120,6 +162,17 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   frontend; `rtx_sm89` resolves directly to its dedicated SM89 frontend.
   `use_fp16=True, use_fp8=False` requests the explicit RTX reference
   frontend for the selected hardware.
+- `config="chameleon"` is a chat-style VLM and is not served through
+  `load_model`'s VLA wrapper. Calling `load_model(config="chameleon")`
+  raises `NotImplementedError` with direct-construction instructions.
+  Construct the frontend explicitly:
+  `ChameleonTorchFrontendRtxSm87` (Jetson Orin SM87) or
+  `ChameleonTorchFrontendThor` (Jetson Thor SM110).
+  See `docs/chameleon_usage.md`.
+- `config="hyvla"` (Hy-Embodied-0.5-VLA) is registered for
+  `framework="torch"` on `hardware="thor"`. Thor uses runtime dynamic
+  FP8 with fused megakernels and optional NVFP4 FFN (`use_fp4=True`).
+  See `docs/hyvla05_thor_sm110.md`.
 
 ### `flash_rt.VLAModel`
 
@@ -143,6 +196,8 @@ class VLAModel:
     def framework(self) -> str: ...
     @property
     def prompt(self) -> str | None: ...
+    @property
+    def pipeline(self): ...
 ```
 
 - `set_prompt(*args, **kwargs)` — delegate prompt setup to the selected
@@ -152,8 +207,12 @@ class VLAModel:
 
 - `infer(*args, **kwargs)` — delegate inference to the selected frontend.
   GROOT N1.7 currently uses
-  `infer(state_normalized, initial_noise=..., use_dit_graph=...)` and
-  returns normalized actions.
+  `infer(state_normalized, aux=..., initial_noise=..., use_dit_graph=...)` and
+  returns normalized actions. For the RTX FP8 frontend, optional `aux` supplies
+  fresh observation/model inputs and lazily captures, then runs, the backbone
+  graph before the action graph. Fresh inputs must retain the `grid_thw`, visual
+  mask, RoPE tables, and tensor shapes established by `set_prompt()`. Omitting
+  `aux` reuses the eager backbone features without capturing the optional graph.
 
 - `predict(images, prompt, state)` — run one inference step.
   `images`: list of `(224,224,3)` uint8 numpy arrays, or a dict with
@@ -213,6 +272,13 @@ class VLAModel:
 - `recalibrate()` — clear FP8 calibration cache and force re-calibration
   on the next `predict()` call.
 
+- `pipeline` — the wrapped frontend instance. `predict()` is the supported
+  inference entry point; this accessor exists for benchmarking and
+  validation harnesses that need the frontend's own surface (for example
+  the raw pre-decode noise buffer) while still constructing the model
+  through `load_model()`, so that a measured configuration is by
+  construction the one the public API produces.
+
 ---
 
 ## Hardware dispatch (`flash_rt.hardware`)
@@ -241,6 +307,10 @@ based on `use_fp8` / `use_fp16`; `rtx_sm89` resolves directly to the
 dedicated SM89 frontend class.
 Wan2.2 TI2V-5B is registered for `(config="wan22_ti2v_5b",
 framework="torch", arch="rtx_sm120")`.
+Chameleon-7B is registered for `(config="chameleon", framework="torch",
+arch in {"rtx_sm87", "thor"})`.
+Hy-Embodied-0.5-VLA is registered for `(config="hyvla",
+framework="torch", arch in {"thor", "rtx_sm87"})`.
 
 ### `_PIPELINE_MAP`
 

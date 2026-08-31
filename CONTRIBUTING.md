@@ -18,6 +18,8 @@ Before opening a PR:
    - New model integration: [`docs/adding_new_model.md`](docs/adding_new_model.md)
    - Kernel catalog: [`docs/kernel_catalog.md`](docs/kernel_catalog.md)
    - Calibration contract: [`docs/calibration.md`](docs/calibration.md)
+   - Structures contributions and self-review:
+     [`docs/structure_contributing.md`](docs/structure_contributing.md)
 2. Build the extension modules locally.
 3. Run the smallest test set that covers your change.
 4. Include the exact GPU, CUDA, command lines, and latency/precision numbers
@@ -30,7 +32,7 @@ the source tree under `flash_rt/`, so non-editable installs commonly import
 a stale copy.
 
 ```bash
-git clone https://github.com/LiangSu8899/FlashRT.git
+git clone https://github.com/flashrt-project/FlashRT.git
 cd FlashRT
 git clone --depth 1 --branch v4.4.2 \
     https://github.com/NVIDIA/cutlass.git third_party/cutlass
@@ -172,8 +174,9 @@ live in [`docs/exec_contract.md`](docs/exec_contract.md) §9; the essentials:
   host, never in the contract.
 - GPU/model state stays owned by the frontend. The serving layer holds metadata
   only (token journal, cache plan, episode bookkeeping).
-- Capture, calibration, and warmup stay in the Python frontend; the contract
-  only **adopts** the resulting instantiated graph and owns replay-time.
+- Capture, calibration, and warmup stay in the setup producer or model
+  frontend, which may be Python or native C++; `exec/`, `runtime/`, Nexus and
+  serving hosts only adopt or consume the resulting graph/runtime handle.
 - `exec/` is a top-level sibling of `csrc/` with zero `csrc` dependency. It must
   not include or link kernel sources.
 - Integration is additive and opt-in (e.g. `FLASHRT_QWEN36_USE_EXEC`): the
@@ -193,9 +196,22 @@ same mechanism-not-policy rule. Design:
 [`docs/runtime_contract.md`](docs/runtime_contract.md). The essentials
 reviewers hold every PR to:
 
+- Optional model-runtime capabilities append only to the main struct tail and
+  require an independent size probe. Never grow the embedded verbs table.
+- Extension IDs and tables are core-owned. Provider/model/backend names,
+  private registries, post-finish table attachment, and parallel identity/hash
+  implementations are rejected.
+- One runtime publishes one selected execution authority: legacy stages,
+  generic stages, or step-only. A new capability must include authority,
+  malformed-table, owner-lifetime, fingerprint and baseline-prefix tests.
+- Metadata-only exports are zero-resource identity/lifetime anchors. They must
+  not fake an exec context or imply snapshot/restore support.
+
 - `runtime/` headers are the ONLY frozen surface and are additive-only after
-  v1: append fields (bump ABI version + struct_size), append enum values,
-  never reorder or remove. Nothing under `cpp/` is ABI.
+  v1: append fields/enums, never reorder or remove. Export revisions follow
+  their documented version policy; model-runtime v1 tails use independent
+  size probes without changing the required prefix. Nothing under `cpp/` is
+  ABI.
 - The contract is data first, verbs as sugar: ports (with update class) and
   the stage DAG are the standard face; `step` is convenience, never the
   center. Do not add scenario fields, model names, or scheduling concepts to
@@ -225,6 +241,26 @@ reviewers hold every PR to:
   cut is a re-ordering, not an approximation — split-vs-full replay must stay
   bit-exact (`cpp/tests/gate_pi05_model_runtime_export.py` is the gate).
 
+Native C++ model work is opt-in under `FLASHRT_ENABLE_NATIVE_CPP` and an
+explicit model-level option. Hardware targets require that model option; the
+native umbrella alone must not compile any model source or test. A model PR
+must leave the default Python build graph and every existing common `csrc`
+symbol unchanged. Native-only operation gaps belong in `csrc/native_cpp/` and
+must remain model-independent, hidden from the producer library's dynamic
+symbol surface, and unreachable when the option is disabled. Do not modify a
+shared kernel's math, workspace stride, signature or packaging to satisfy one
+native frontend. Propose a genuinely common correction separately with a
+caller inventory, cross-model numerical tests and cache/artifact compatibility
+analysis.
+
+Reuse an existing common operation whenever its contract matches the native
+call site. Do not add a shadow implementation merely to change rounding or
+reduction behavior. A native-only operation is justified only when the common
+surface lacks the required signature, layout, workspace contract or host-free
+setup capability. Numerical parity must be checked against the unchanged
+current producer; matching a branch-local frozen producer that used the same
+shadow implementation is not sufficient evidence.
+
 ### Calibration And Precision
 
 FP8/NVFP4 changes must preserve the calibration cache contract described in
@@ -234,6 +270,12 @@ calibration, or graph capture behavior, include a precision comparison:
 - cosine vs the relevant reference when a fixture exists
 - action sanity check for quickstart-only paths
 - latency before/after for performance-sensitive changes
+
+A native calibration path must replay the model's one semantic pipeline. The
+target may provide observers, packing and private scratch, but must not own a
+second model forward. Dataset iteration and sample selection stay in the host;
+artifact identity must bind checkpoint, tokenizer, hardware, dtype and all
+shape-affecting setup fields.
 
 ### Performance Measurement
 
@@ -295,12 +337,12 @@ say so in the PR and include the reason.
 For external contributors, use the standard fork workflow:
 
 ```bash
-# 1. Fork LiangSu8899/FlashRT on GitHub, then clone your fork.
+# 1. Fork flashrt-project/FlashRT on GitHub, then clone your fork.
 git clone git@github.com:<your-user>/FlashRT.git
 cd FlashRT
 
 # 2. Keep the upstream repository available for sync.
-git remote add upstream git@github.com:LiangSu8899/FlashRT.git
+git remote add upstream git@github.com:flashrt-project/FlashRT.git
 git fetch upstream
 
 # 3. Start from the latest upstream main.
@@ -322,6 +364,9 @@ Open the pull request from:
 
 Before requesting review:
 
+- For changes under `flash_rt/structures/`, complete the dedicated
+  [`structures contribution and PR self-review`](docs/structure_contributing.md)
+  checklist.
 - Read the full public review standard in
   [`docs/pr_review_checklist.md`](docs/pr_review_checklist.md) for the
   long-term maintenance rules reviewers will apply.

@@ -27,5 +27,26 @@ int quantize_fp4_dynamic_sfa_fp16(
     int N, int D, bool is_sfb,
     cudaStream_t stream);
 
+// Weight-oriented variant: choose each 16-value UE4M3 scale from a compact
+// candidate set by minimizing reconstruction MSE. Layout and packed format are
+// identical to quantize_fp4_dynamic_sfa_fp16.
+int quantize_fp4_dynamic_sfa_mse_fp16(
+    const void* src_fp16,
+    void* dst_packed,
+    void* dst_sfa,
+    int N, int D, bool is_sfb,
+    cudaStream_t stream);
+
+// Vectorized bit-exact variant of quantize_fp4_dynamic_sfa_fp16 (16B loads,
+// 8B packed stores). Returns nonzero without launching when src/packed are
+// not 16B/8B aligned; callers fall back to the scalar kernel.
+// Implemented in quantize_fp4_sfa_vec.cu.
+int quantize_fp4_dynamic_sfa_fp16_vec(
+    const void* src_fp16,
+    void* dst_packed,
+    void* dst_sfa,
+    int N, int D, bool is_sfb,
+    cudaStream_t stream);
+
 }  // namespace fp4
 }  // namespace flash_rt

@@ -49,6 +49,18 @@ class VLAModel:
             and hasattr(pipe, "calibrated")
         )
 
+    @property
+    def pipeline(self):
+        """The wrapped frontend instance.
+
+        ``predict()`` is the supported inference entry point. This accessor
+        exists for benchmarking and validation harnesses that need the
+        frontend's own calibrate/infer surface while still constructing the
+        model through ``load_model()``, so that measured configurations are
+        by construction the ones the public API produces.
+        """
+        return self._pipe
+
     @staticmethod
     def _snapshot_prompt_state(state):
         if state is None:
@@ -211,6 +223,28 @@ class VLAModel:
                 "This frontend does not expose infer().")
         return self._pipe.infer(*args, **kwargs)
 
+    def release_resident(self) -> int:
+        """Release device memory a frontend holds between calls.
+
+        Returns the bytes freed. A frontend that keeps nothing resident
+        answers 0 rather than refusing: "nothing to release" is a true
+        answer to this question, and a caller writing a serving loop should
+        not have to know which frontends hold weights across calls to be
+        able to ask.
+        """
+        release = getattr(self._pipe, "release_resident", None)
+        return release() if callable(release) else 0
+
+    def close(self) -> int:
+        """Release everything the frontend holds. Idempotent.
+
+        Frontends that implement it stay usable afterwards: the next call
+        reloads what it needs. Frontends that do not implement it hold
+        nothing to release, so this is 0 and the model is unchanged.
+        """
+        close = getattr(self._pipe, "close", None)
+        return close() if callable(close) else 0
+
     def calibrate(
         self,
         observations,
@@ -288,9 +322,13 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                embodiment_tag=None,
                action_horizon=None,
                use_fp4=False,
+               use_fp4_decoder=False,
+               use_fp4_encoder_attn=None,
+               use_fp4_siglip_ffn=None,
+               use_fa4=False,
                fp4_layers=None,
                use_awq=None,
-               awq_alpha=0.5,
+               awq_alpha=None,
                use_p1_split_gu=None,
                num_steps=None,
                vision_pool_factor=None,
@@ -299,7 +337,26 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                use_fp16=False,
                use_fp8=True,
                state_prompt_mode="exact",
-               state_prompt_fixed_max_len=None):
+               state_prompt_fixed_max_len=None,
+               *,
+               mmproj_path=None,
+               backend="cpu",
+               action_steps=None,
+               action_dim=None,
+               lib_path=None,
+               n_ctx=0,
+               n_threads=0,
+               temp=0.8,
+               top_k=40,
+               top_p=0.9,
+               seed=1,
+               max_tokens=512,
+               encoder_p1_combiner=None,
+               encoder_down_variant=7,
+               decoder_gate_up_variant=10,
+               attention=None,
+               fuse=None,
+               compile_mode=None):
     """Load a FlashRT model.
 
     Args:
@@ -318,9 +375,15 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         weight_cache: if True (default), cache FP8-quantized weights to disk
             after first load. Only affects JAX.
         config: model config name: "pi05", "pi0", "groot", "groot_n17",
-            "pi0fast", "motus", "wan22_ti2v_5b", "cosmos3_video".
+            "pi0fast", "motus", "wan22_ti2v_5b", "cosmos3_video",
+            "cosmos3_edge", "ltx25".
+            "ltx25" is the LTX-2.5 22B distilled audio+video generator:
+            drive it with set_prompt(...) + infer(...), not predict().
             "cosmos3_video" is a non-VLA text2video denoise model: drive it with
             set_prompt(ref=<reference dump>) + infer(...), not predict().
+            "cosmos3_edge" is the official Cosmos Framework Thor baseline
+            runner: drive it with set_prompt(sample=... or input_json=...) +
+            infer(output_dir=..., vae_path=...).
         device: ignored (auto-detects GPU). Reserved for future multi-GPU.
         decode_cuda_graph: Pi0-FAST only. Capture action-phase decode as CUDA
             Graph for max throughput (trades startup time for per-token speed).
@@ -361,11 +424,43 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             Validated on LIBERO Spatial for the torch path: 491/500 = 98.2%
             (matches baseline). JAX FP4 has Thor precision / replay-latency
             validation against a same-origin PyTorch reference.
+        use_fp4_decoder: Pi0.5 torch on Thor only. Explicitly enable NVFP4 for
+            all four action-expert decoder projections in addition to
+            ``use_fp4=True``. Default False. Requires ``use_fp4=True`` and a
+            working SM110 NVFP4 extension; unsupported configurations raise
+            instead of selecting another precision path.
+        use_fp4_encoder_attn: Pi0.5 torch on Thor only. NVFP4 encoder
+            attention output projections. ``None`` resolves to the preset
+            (True with ``use_fp4_decoder=True``, False otherwise); an
+            explicit bool overrides it. Requires ``use_fp4=True``.
+        use_fp4_siglip_ffn: Pi0.5 torch on Thor only. NVFP4 SigLIP FFN on
+            all 27 vision layers. ``None`` resolves to the preset (True with
+            ``use_fp4_decoder=True``, False otherwise); an explicit bool
+            overrides it. Requires ``use_fp4=True``.
+        use_fa4: Pi0.5 torch on Thor only. Explicitly require FA4 for SigLIP
+            and encoder attention. Default False. It is independent of the
+            NVFP4 flags and is supported on both the FP8 and the NVFP4
+            Pi0.5 Thor path — the published NVFP4 speedups are measured
+            against an FP8 baseline that also runs FA4. Missing runtime
+            dependencies and unsupported fixed-shape state-prompt mode raise
+            immediately; this option never selects an alternate attention
+            implementation.
         fp4_layers: Tuple of encoder layer indices to FP4-quantize (only
             applies when use_fp4=True). ``None`` resolves to the production
-            preset, full 18 encoder FFN layers with AWQ + P1 split-GU.
+            preset, all 17 live encoder FFN layers with AWQ + P1 split-GU.
             Explicit tuples override the preset; `(7, 8, 9)` is the
             conservative middle-FFN subset.
+        awq_alpha: AWQ activation scaling exponent. ``None`` selects 0.8 for
+            the encoder-FP4 + decoder-FP4 preset and 0.5 otherwise.
+        encoder_p1_combiner: FP4 encoder split-GU combiner. ``None`` resolves
+            to the preset: ``"epilogue_hw"`` (fused GeGLU epilogue) with
+            ``use_fp4_decoder=True``, ``"lut_native"`` otherwise.
+            ``"direct"``, ``"lut"`` and ``"epilogue"`` remain available for
+            explicit A/B runs.
+        encoder_down_variant: Cutlass NVFP4 encoder Down GEMM variant
+            (production default ``7``).
+        decoder_gate_up_variant: Cutlass NVFP4 decoder Gate+Up GEMM variant
+            (production default ``10``).
         use_fp8: Enable FP8 execution where the selected frontend supports
             an FP8/BF16 switch. Defaults to True to preserve existing
             performance-oriented behavior.
@@ -430,28 +525,120 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             "import Qwen3VlFp8Sm89Frontend\n"
             "    from flash_rt.frontends.torch.qwen3_vl_rtx import "
             "Qwen3VlTorchFrontendRtx\n"
-            "See docs/qwen3_vl_fp8_sm89.md and docs/qwen3_vl_nvfp4.md.")
+            "    from flash_rt.frontends.torch.qwen3_vl_thor import "
+            "Qwen3VlTorchFrontendThor\n"
+            "    from flash_rt.frontends.torch.qwen3_vl_rtx_bf16 import "
+            "Qwen3VlTorchFrontendRtxBF16\n"
+            "See docs/qwen3_vl_fp8_sm89.md, docs/qwen3_vl_nvfp4.md, "
+            "docs/qwen3_vl_thor.md and docs/qwen3_vl_rtx_bf16.md.")
 
-    if config not in ("pi05", "groot", "groot_n17", "pi0", "pi0fast",
-                      "motus", "wan22_ti2v_5b", "cosmos3_video", "nexn2"):
+    if framework == "jetson_pi" and (use_fp4_decoder or use_fa4):
+        raise ValueError(
+            "use_fp4_decoder/use_fa4 are unsupported with framework="
+            "'jetson_pi'; use the Thor torch FP4/FA4 frontend instead")
+
+    # Chameleon-7B is a chat-style VLM, not a VLA: its frontends expose
+    # set_prompt(...) + generate() rather than predict(images, ...), so
+    # VLAModel's result['actions'] contract does not apply. Registered in
+    # _PIPELINE_MAP for discoverability only.
+    if config == "chameleon":
+        raise NotImplementedError(
+            "config='chameleon' is a chat-style VLM and is not served through "
+            "load_model's VLA wrapper. Construct it directly:\n"
+            "    from flash_rt.frontends.torch.chameleon_rtx_sm87 import "
+            "ChameleonTorchFrontendRtxSm87  # Jetson Orin SM87\n"
+            "    from flash_rt.frontends.torch.chameleon_thor import "
+            "ChameleonTorchFrontendThor  # Jetson Thor SM110\n"
+            "    f = ChameleonTorchFrontendRtxSm87('/path/to/Chameleon_7B_mGPT')\n"
+            "    f.set_prompt('<image>Describe this image.', images=[img])\n"
+            "    print(f.generate(max_new_tokens=32))\n"
+             "See docs/chameleon7b_rtx_sm87.md, docs/chameleon_thor_sm110.md "
+             "and docs/chameleon_usage.md.")
+
+    if framework == "jetson_pi":
+        if config not in ("pi0", "pi05", "llm", "mllm"):
+            raise ValueError(
+                f"Unknown Jetson-PI config: {config}. "
+                "Supported: pi0, pi05, llm, mllm")
+    elif config not in ("pi05", "groot", "groot_n17", "pi0", "pi0fast",
+                      "motus", "wan22_ti2v_5b", "cosmos3_video",
+                      "cosmos3_edge", "nexn2", "qwen36_moe", "hyvla",
+                      "ltx25"):
         raise ValueError(
             f"Unknown config: {config}. "
             f"Supported: pi05, groot, groot_n17, pi0, pi0fast, motus, "
-            f"wan22_ti2v_5b, cosmos3_video, nexn2")
-    if framework not in ("torch", "jax"):
+            f"wan22_ti2v_5b, cosmos3_video, cosmos3_edge, nexn2, "
+            f"qwen36_moe, hyvla, ltx25")
+    if framework not in ("torch", "jax", "jetson_pi"):
         raise ValueError(
-            f"Unknown framework: {framework}. Supported: torch, jax")
+            f"Unknown framework: {framework}. Supported: torch, jax, jetson_pi")
+
+    # Drives the Jetson-PI provider through frt_model_runtime_v1 via ctypes.
+    # No torch/jax or GPU architecture detection is involved. The action chunk
+    # shape is passed explicitly by the caller (the verified pi0_base is 50x32).
+    if framework == "jetson_pi":
+        if config == "llm":
+            from flash_rt.frontends.jetson_pi.llm import LlmJetsonPiFrontend
+            return LlmJetsonPiFrontend(
+                checkpoint,
+                backend=backend,
+                n_ctx=n_ctx,
+                n_threads=n_threads,
+                temp=temp,
+                top_k=top_k,
+                top_p=top_p,
+                seed=seed,
+                max_tokens=max_tokens,
+                lib_path=lib_path)
+        if config == "mllm":
+            from flash_rt.frontends.jetson_pi.mllm import MllmJetsonPiFrontend
+            return MllmJetsonPiFrontend(
+                checkpoint,
+                mmproj_path=mmproj_path,
+                backend=backend,
+                n_ctx=n_ctx,
+                n_threads=n_threads,
+                temp=temp,
+                top_k=top_k,
+                top_p=top_p,
+                seed=seed,
+                max_tokens=max_tokens,
+                lib_path=lib_path)
+        # default / "pi0": VLA path
+        from flash_rt.frontends.jetson_pi.pi0 import Pi0JetsonPiFrontend
+        pipe = Pi0JetsonPiFrontend(
+            checkpoint,
+            mmproj_path=mmproj_path,
+            backend=backend,
+            num_views=num_views,
+            action_steps=action_steps,
+            action_dim=action_dim,
+            lib_path=lib_path)
+        return VLAModel(pipe, framework)
 
     # When use_fp4=True, the default resolves to the best-known production
-    # FP4 config (full 18 encoder FFN layers + AWQ + P1 split-GU). Passing
-    # any sub-flag explicitly overrides the preset; None means "use preset".
+    # FP4 config (all 17 live encoder FFN layers + AWQ + P1 split-GU). Adding
+    # use_fp4_decoder=True selects the full Thor NVFP4 tier the published
+    # latency table is measured with: NVFP4 encoder attention output
+    # projections, NVFP4 SigLIP FFN, and the fused GeGLU epilogue combiner.
+    # Passing any sub-flag explicitly overrides the preset; None means
+    # "use preset".
     if use_fp4:
         if fp4_layers is None:
-            fp4_layers = tuple(range(18))
+            fp4_layers = tuple(range(17))
         if use_awq is None:
             use_awq = True
         if use_p1_split_gu is None:
             use_p1_split_gu = True
+        if awq_alpha is None:
+            awq_alpha = 0.8 if use_fp4_decoder else 0.5
+        if use_fp4_encoder_attn is None:
+            use_fp4_encoder_attn = bool(use_fp4_decoder)
+        if use_fp4_siglip_ffn is None:
+            use_fp4_siglip_ffn = bool(use_fp4_decoder)
+        if encoder_p1_combiner is None:
+            encoder_p1_combiner = ("epilogue_hw" if use_fp4_decoder
+                                   else "lut_native")
     else:
         if fp4_layers is None:
             fp4_layers = (7, 8, 9)
@@ -459,6 +646,14 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             use_awq = False
         if use_p1_split_gu is None:
             use_p1_split_gu = False
+        if awq_alpha is None:
+            awq_alpha = 0.5
+        if use_fp4_encoder_attn is None:
+            use_fp4_encoder_attn = False
+        if use_fp4_siglip_ffn is None:
+            use_fp4_siglip_ffn = False
+        if encoder_p1_combiner is None:
+            encoder_p1_combiner = "lut_native"
 
     # Nex-N2-mini (qwen3_5_moe) is a text LLM, not a VLA: its frontend exposes
     # infer()->logits / generate() rather than the predict(images, ...) surface
@@ -472,6 +667,20 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             "    from flash_rt.frontends.torch.nexn2_rtx import "
             "Nexn2TorchFrontendRtx\n"
             "See docs/nexn2_usage.md.")
+    if config == "qwen36_moe":
+        raise NotImplementedError(
+            "config='qwen36_moe' is a text LLM and is not served through "
+            "load_model's VLA wrapper. Construct it directly:\n"
+            "    from flash_rt.frontends.torch.qwen36_moe import "
+            "Qwen36MoeTextFrontend\n"
+            "See docs/qwen36_moe_usage.md.")
+
+    # Refuse before the frontend import: a frontend that imports the
+    # extension at module scope would otherwise fail as a bare
+    # ModuleNotFoundError, which reads as a broken install rather than as
+    # a build the user still has to run.
+    from flash_rt import _extensions
+    _extensions.require(config=config)
 
     from flash_rt.hardware import detect_arch, resolve_pipeline_class
     arch = detect_arch() if hardware == "auto" else hardware
@@ -515,6 +724,31 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                 "('groot', 'torch', 'thor'/'rtx_sm120'), and "
                 "('groot_n17', 'torch', 'thor'/'rtx_sm120'/'rtx_sm89')")
 
+    # FA4 is an attention-backend choice, not part of the NVFP4 tier: both
+    # the FP8 Pi0.5 Thor frontend and its NVFP4 subclass accept use_fa4, and
+    # the published NVFP4 speedups are measured against an FA4 FP8 baseline.
+    # It is therefore deliberately independent of use_fp4 and only gated on
+    # config/framework/hardware.
+    if use_fa4 and (
+            config != "pi05" or framework != "torch" or arch != "thor"):
+        raise ValueError(
+            "use_fa4=True only supports config='pi05', framework='torch' "
+            f"on Thor; got config={config!r}, framework={framework!r}, "
+            f"hardware={arch!r}")
+
+    for _name, _value in (("use_fp4_decoder", use_fp4_decoder),
+                          ("use_fp4_encoder_attn", use_fp4_encoder_attn),
+                          ("use_fp4_siglip_ffn", use_fp4_siglip_ffn)):
+        if not _value:
+            continue
+        if not use_fp4:
+            raise ValueError(f"{_name}=True requires use_fp4=True")
+        if (config, framework, arch) != ("pi05", "torch", "thor"):
+            raise ValueError(
+                f"{_name}=True only supports config='pi05', "
+                "framework='torch', hardware='thor'; got "
+                f"config={config!r}, framework={framework!r}, hardware={arch!r}")
+
     pipe_cls = resolve_pipeline_class(config, framework, arch)
 
     # GROOT N1.7 on RTX defaults to the framework-conforming FP8 frontend.
@@ -544,6 +778,15 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             "GROOT N1.7 on Thor defaults to FP8; there is no BF16-only "
             "fallback. For the non-quantized full-FP16 reference pass "
             "use_fp16=True together with use_fp8=False.")
+
+    # GROOT N1.7 on Thor with use_fp4=True: NVFP4 DiT action head +
+    # NVFP4 cross-KV + vectorized backbone tier on top of the FP8
+    # backbone (fastest verified Thor config).
+    _n17_thor_fp4 = (use_fp4 and config == "groot_n17"
+                     and framework == "torch" and arch == "thor")
+    if _n17_thor_fp4 and use_fp16:
+        raise ValueError("use_fp4=True is incompatible with use_fp16=True "
+                         "for GROOT N1.7 on Thor")
 
     if use_fp16:
         if config == "pi05" and framework == "torch" and arch == "thor":
@@ -589,30 +832,80 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                     )
                     pipe_cls = GrootN17TorchFrontendRtxFP16
 
-    # ── FP4 routing (Pi0.5 torch + Pi0.5 JAX on Thor) ──
-    if use_fp4:
-        if config != "pi05" or framework not in ("torch", "jax") or arch != "thor":
+    # ── FP4 routing (GROOT N1.7 torch on Thor) ──
+    if _n17_thor_fp4:
+        try:
+            import flash_rt.flash_rt_fp4 as _fvk_fp4_n17
+            if not _fvk_fp4_n17.has_nvfp4():
+                logger.warning(
+                    "flash_rt_fp4 loaded but has_nvfp4()=False (SM100+ "
+                    "required). Falling back to the FP8 tier.")
+                _n17_thor_fp4 = False
+        except ImportError:
             logger.warning(
-                "use_fp4=True is only supported for config='pi05' with "
-                "framework in ('torch', 'jax') on Thor; got config='%s' "
-                "framework='%s' hardware='%s'. Falling back to FP8.",
-                config, framework, arch)
+                "flash_rt_fp4 extension not available. Falling back to the "
+                "FP8 tier.")
+            _n17_thor_fp4 = False
+        if _n17_thor_fp4:
+            from flash_rt.frontends.torch.groot_n17_thor_fp4 import (
+                GrootN17TorchFrontendThorFP4,
+            )
+            pipe_cls = GrootN17TorchFrontendThorFP4
+            logger.info("GROOT N1.7 Thor NVFP4 tier enabled")
+        use_fp4 = False  # do not fall through to the Pi0.5 FP4 routing
+
+    # ── FP4 routing (Pi0.5 torch + Pi0.5 JAX on Thor, HyVLA torch on Thor) ──
+    _hyvla_fp4 = False
+    if use_fp4:
+        _fp4_ok = (
+            (config == "pi05" and framework in ("torch", "jax") and arch == "thor")
+            or (config == "hyvla" and framework == "torch" and arch == "thor")
+        )
+        if not _fp4_ok:
+            if config == "hyvla" and arch == "rtx_sm87":
+                logger.warning(
+                    "use_fp4=True is not supported for config='hyvla' on "
+                    "Jetson Orin SM87 (no native FP4 tensor cores). "
+                    "Falling back to the HyVLA INT8/BF16 path.")
+            else:
+                logger.warning(
+                    "use_fp4=True is only supported for config='pi05' with "
+                    "framework in ('torch', 'jax') on Thor, or config='hyvla' "
+                    "with framework='torch' on Thor; got config='%s' "
+                    "framework='%s' hardware='%s'. Falling back to FP8.",
+                    config, framework, arch)
             use_fp4 = False
         else:
             try:
                 import flash_rt.flash_rt_fp4 as _fvk_fp4
                 if not _fvk_fp4.has_nvfp4():
+                    if use_fp4_decoder:
+                        raise RuntimeError(
+                            "use_fp4_decoder=True requires flash_rt_fp4 built "
+                            "with SM110 NVFP4 support")
                     logger.warning(
                         "flash_rt_fp4 loaded but has_nvfp4()=False (SM100+ required). "
                         "Falling back to FP8.")
                     use_fp4 = False
-            except ImportError:
+            except ImportError as exc:
+                if use_fp4_decoder:
+                    raise RuntimeError(
+                        "use_fp4_decoder=True requires the flash_rt_fp4 "
+                        "extension") from exc
                 logger.warning(
                     "flash_rt_fp4 extension not available. Falling back to FP8.")
                 use_fp4 = False
 
             if use_fp4:
-                if framework == "torch":
+                if config == "hyvla":
+                    from flash_rt.frontends.torch.hyvla_thor import (
+                        HyVLATorchFrontendThor,
+                    )
+                    pipe_cls = HyVLATorchFrontendThor
+                    _hyvla_fp4 = True
+                    logger.info("HyVLA Thor FP4 tier enabled")
+                    use_fp4 = False  # routed; skip Pi0.5 path below
+                elif framework == "torch":
                     from flash_rt.frontends.torch.pi05_thor_fp4 import (
                         Pi05TorchFrontendThorFP4,
                     )
@@ -623,8 +916,9 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                     )
                     pipe_cls = Pi05JaxFrontendThorFP4
                 logger.info(
-                    "FP4 enabled (framework=%s): encoder FFN layers %s",
-                    framework, sorted(fp4_layers))
+                    "FP4 enabled (framework=%s): encoder FFN layers %s, "
+                    "decoder=%s",
+                    framework, sorted(fp4_layers), use_fp4_decoder)
 
     # Build the kwarg set per-model so we only pass args the target class
     # actually accepts. Keeps the dispatch table simple while still letting
@@ -636,6 +930,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         kwargs["hardware"] = arch
     if "use_fp8" in sig.parameters:
         kwargs["use_fp8"] = use_fp8
+    if use_fa4 and "use_fa4" in sig.parameters:
+        kwargs["use_fa4"] = True
     if config == "pi0fast":
         kwargs.update(
             autotune=autotune,
@@ -656,6 +952,33 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     elif config == "wan22_ti2v_5b":
         if "autotune" in sig.parameters:
             kwargs["autotune"] = autotune
+    elif config == "ltx25":
+        # The execution assembly is the decision a caller of this model has
+        # to make, so it belongs in the signature rather than in an
+        # environment variable: which attention backend, whether the fused
+        # FFN chain is installed, and whether the denoise loop is compiled
+        # and captured. Each is forwarded only when the frontend declares
+        # it, and only when the caller asked -- leaving the frontend's own
+        # defaults in place otherwise.
+        for name, value in (("attention", attention), ("fuse", fuse),
+                            ("compile_mode", compile_mode)):
+            if value is not None and name in sig.parameters:
+                kwargs[name] = value
+    elif config == "hyvla":
+        # The routed FP4 tier must reach the frontend explicitly; the
+        # generic kwarg set never forwards use_fp4.
+        if _hyvla_fp4 and "use_fp4" in sig.parameters:
+            kwargs["use_fp4"] = True
+        # FP8 tier = the validated production config (fp8 + fused
+        # megakernels); select it explicitly when the frontend accepts it.
+        if use_fp8 and "use_fused" in sig.parameters:
+            kwargs["use_fused"] = True
+        if "use_autotune" in sig.parameters:
+            kwargs["use_autotune"] = bool(autotune)
+    elif config == "cosmos3_edge":
+        # Official Cosmos Framework baseline runner. Runtime knobs such as
+        # output_dir, seed, benchmark, and local Wan VAE path are infer() args.
+        pass
     else:
         # pi05, pi0 — both Thor and rtx variants take (checkpoint, num_views, autotune)
         # or (checkpoint, num_views). Feature-detect.
@@ -684,11 +1007,24 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         if use_fp4 and "use_fp4_encoder_ffn" in sig.parameters:
             kwargs["use_fp4_encoder_ffn"] = True
             kwargs["fp4_layers"] = fp4_layers
+            if use_fp4_decoder and "use_fp4_decoder" in sig.parameters:
+                kwargs["use_fp4_decoder"] = True
+            if "use_fp4_encoder_attn" in sig.parameters:
+                kwargs["use_fp4_encoder_attn"] = bool(use_fp4_encoder_attn)
+            if "use_fp4_siglip_ffn" in sig.parameters:
+                kwargs["use_fp4_siglip_ffn"] = bool(use_fp4_siglip_ffn)
             if "use_awq" in sig.parameters:
                 kwargs["use_awq"] = bool(use_awq)
                 kwargs["awq_alpha"] = float(awq_alpha)
             if "use_p1_split_gu" in sig.parameters:
                 kwargs["use_p1_split_gu"] = bool(use_p1_split_gu)
+            if "encoder_p1_combiner" in sig.parameters:
+                kwargs["encoder_p1_combiner"] = encoder_p1_combiner
+            if "encoder_down_variant" in sig.parameters:
+                kwargs["encoder_down_variant"] = int(encoder_down_variant)
+            if "decoder_gate_up_variant" in sig.parameters:
+                kwargs["decoder_gate_up_variant"] = int(
+                    decoder_gate_up_variant)
 
     pipe = pipe_cls(checkpoint, **kwargs)
 

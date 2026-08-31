@@ -6,6 +6,8 @@
 
 #include "quantize.cuh"
 #include "common.cuh"
+#include "norm.cuh"
+#include "activation.cuh"
 
 
 // ── FP8 Quantize ──
@@ -343,98 +345,10 @@ void quantize_fp8_device_fp16(const __half* input, __nv_fp8_e4m3* output,
 //  UE4M3 (unsigned E4M3): scale factor per 16-element block
 // ================================================================
 
-// FP4 E2M1 value table (magnitude only, 3 bits):
-//   0b000 = 0.0   (E=0, M=0)
-//   0b001 = 0.5   (E=0, M=1, subnormal)
-//   0b010 = 1.0   (E=1, M=0)
-//   0b011 = 1.5   (E=1, M=1)
-//   0b100 = 2.0   (E=2, M=0)
-//   0b101 = 3.0   (E=2, M=1)
-//   0b110 = 4.0   (E=3, M=0)
-//   0b111 = 6.0   (E=3, M=1)
-
-__device__ __forceinline__ uint8_t float_to_fp4_e2m1(float v) {
-    uint8_t sign = (v < 0.0f) ? 0x8u : 0x0u;
-    float a = fabsf(v);
-    uint8_t mag;
-    if      (a < 0.25f)  mag = 0;  // -> 0.0
-    else if (a < 0.75f)  mag = 1;  // -> 0.5
-    else if (a < 1.25f)  mag = 2;  // -> 1.0
-    else if (a < 1.75f)  mag = 3;  // -> 1.5
-    else if (a < 2.5f)   mag = 4;  // -> 2.0
-    else if (a < 3.5f)   mag = 5;  // -> 3.0
-    else if (a < 5.0f)   mag = 6;  // -> 4.0
-    else                 mag = 7;  // -> 6.0
-    return sign | mag;
-}
-
-// Branchless equivalent of float_to_fp4_e2m1 — bit-identical, but the 8-way
-// if-else (which diverges across a warp and serializes) becomes a sum of
-// threshold comparisons (predicated, no divergence). Used by the prefetch _v2
-// quant/norm kernels where the encode is the hot per-element op.
-__device__ __forceinline__ uint8_t float_to_fp4_e2m1_branchless(float v) {
-    float a = fabsf(v);
-    uint8_t sign = (v < 0.0f) ? 0x8u : 0x0u;
-    uint8_t mag = (uint8_t)((a >= 0.25f) + (a >= 0.75f) + (a >= 1.25f)
-                          + (a >= 1.75f) + (a >= 2.5f)  + (a >= 3.5f)
-                          + (a >= 5.0f));
-    return sign | mag;
-}
-
-__device__ __forceinline__ float fp4_e2m1_to_float(uint8_t v) {
-    float mag;
-    switch (v & 0x7u) {
-        case 0: mag = 0.0f; break;
-        case 1: mag = 0.5f; break;
-        case 2: mag = 1.0f; break;
-        case 3: mag = 1.5f; break;
-        case 4: mag = 2.0f; break;
-        case 5: mag = 3.0f; break;
-        case 6: mag = 4.0f; break;
-        default: mag = 6.0f; break;
-    }
-    return (v & 0x8u) ? -mag : mag;
-}
-
-// Convert float to UE4M3 (unsigned, 4-bit exponent, 3-bit mantissa)
-// Rounds UP (ceil) so that scale >= true_amax / 6.0 (avoids FP4 overflow)
-// UE4M3: bias=7, normal = 2^(E-7) * (1 + M/8), subnormal = 2^(-6) * M/8
-// Range: [~0.002, 240]
-__device__ __forceinline__ uint8_t float_to_ue4m3_ceil(float v) {
-    if (v <= 0.0f) return 0;
-    if (v > 240.0f) return 0xFE;  // max finite: E=14, M=7 -> 2^7 * 1.875 = 240
-
-    uint32_t bits = __float_as_uint(v);
-    int float_exp = ((bits >> 23) & 0xFF) - 127;  // unbiased float exponent
-    uint32_t frac = bits & 0x7FFFFF;               // 23-bit float mantissa
-
-    int ue_exp = float_exp + 7;  // UE4M3 bias = 7
-
-    if (ue_exp <= 0) {
-        // Subnormal in UE4M3: value = 2^(-6) * M/8
-        float scaled = v * 512.0f;  // v / (2^(-6) / 8)
-        int m = (int)ceilf(scaled);
-        if (m > 7) return (1 << 3) | 0;  // smallest normal: E=1, M=0
-        if (m < 1) m = 1;
-        return (uint8_t)m;
-    }
-    if (ue_exp >= 15) return 0xFE;  // clamp to max
-
-    // Extract top 3 mantissa bits, round up
-    int m = (int)(frac >> 20);  // top 3 of 23 bits
-    if (frac & 0xFFFFF) m++;    // ceil: round up if remaining bits nonzero
-    if (m >= 8) { m = 0; ue_exp++; }
-    if (ue_exp >= 15) return 0xFE;
-
-    return (uint8_t)((ue_exp << 3) | m);
-}
-
-__device__ __forceinline__ float ue4m3_to_float(uint8_t v) {
-    int e = (v >> 3) & 0xF;
-    int m = v & 0x7;
-    if (e == 0) return ldexpf((float)m / 8.0f, -6);
-    return ldexpf(1.0f + (float)m / 8.0f, e - 7);
-}
+// The element and scale-factor converters live in nvfp4_convert.cuh so the
+// gated qwen3_5_moe grouped quantiser encodes the same wire format with the
+// same code instead of a second copy. Definitions are unchanged.
+#include "nvfp4_convert.cuh"
 
 // UE8M0 conversion: 8-bit unsigned exponent, 0 mantissa bits, bias=127
 // value = 2^(exp - 127), same as IEEE FP32 exponent extraction
@@ -2804,3 +2718,220 @@ void dequant_int32_to_bf16(const int32_t* input, __nv_bfloat16* output,
     dequant_int32_to_bf16_kernel<<<blocks, threads, 0, stream>>>(
         input, output, d_act_scale, d_weight_scale, n);
 }
+
+// ── Fused norm/activation + dynamic per-tensor FP8 quantize (FP16) ──
+// The amax needed for the scale is measured inside the norm/activation
+// kernel's own output-write pass instead of a separate absmax_kernel read
+// pass over the output buffer. CUDA-Graph safe (all ops device-side).
+
+// Fused RMSNorm + dynamic per-tensor FP8 quantize. Saves one full read of
+// xn_out (Se*D elements) vs. rms_norm_fp16 + quantize_fp8_device_fp16
+// called back-to-back. xn_out still holds the fp16 RMSNorm output
+// (unchanged contract) in case a caller needs it.
+void rms_norm_quantize_dynamic_fp8_fp16(const __half* x, const __half* weight,
+                                         __half* xn_out, __nv_fp8_e4m3* fp8_out,
+                                         float* d_scale, int seq_len, int dim,
+                                         float eps, cudaStream_t stream) {
+    cudaMemsetAsync(d_scale, 0, sizeof(float), stream);
+    rms_norm_amax_fp16(x, weight, xn_out, d_scale, seq_len, dim, eps, stream);
+    compute_scale_kernel<<<1, 1, 0, stream>>>(d_scale, d_scale);
+
+    int n = seq_len * dim;
+    int threads = 256;
+    int n2 = n >> 1;
+    int blocks = (n2 + threads - 1) / threads;
+    quantize_fp8_kernel_generic<__half><<<blocks, threads, 0, stream>>>(xn_out, fp8_out, d_scale, n);
+}
+
+// Fused SwiGLU (GELU(gate)*up) + dynamic per-tensor FP8 quantize. Saves
+// one full read of the Se*Dff intermediate vs. gate_geglu_fp16 +
+// quantize_fp8_device_fp16 called back-to-back. h_out still holds the
+// fp16 SwiGLU output (unchanged contract), e.g. for a caller that needs
+// to clamp it instead of using this fused path on outlier-clamp layers.
+void gate_geglu_quantize_dynamic_fp8_fp16(const __half* gate, const __half* up,
+                                           __half* h_out, __nv_fp8_e4m3* fp8_out,
+                                           float* d_scale, int n, cudaStream_t stream) {
+    cudaMemsetAsync(d_scale, 0, sizeof(float), stream);
+    gate_geglu_amax_fp16(gate, up, h_out, d_scale, n, stream);
+    compute_scale_kernel<<<1, 1, 0, stream>>>(d_scale, d_scale);
+
+    int threads = 256;
+    int n2 = n >> 1;
+    int blocks = (n2 + threads - 1) / threads;
+    quantize_fp8_kernel_generic<__half><<<blocks, threads, 0, stream>>>(h_out, fp8_out, d_scale, n);
+}
+
+// Fused residual add (in-place, fp16-rounded) + RMSNorm + dynamic
+// per-tensor FP8 quantize. Replaces residual_add_fp16 + rms_norm_fp16 +
+// amax + quantize with one elementwise kernel (register-cached residual,
+// amax folded into the xn write pass) plus the scale/quantize pass.
+// xn_out still holds the fp16 RMSNorm output for callers that need it.
+void residual_add_rms_norm_quantize_dynamic_fp8_fp16(
+    __half* residual, const __half* x, const __half* weight,
+    __half* xn_out, __nv_fp8_e4m3* fp8_out, float* d_scale,
+    int seq_len, int dim, float eps, cudaStream_t stream) {
+    cudaMemsetAsync(d_scale, 0, sizeof(float), stream);
+    residual_add_rms_norm_amax_fp16(residual, x, weight, xn_out, d_scale,
+                                    seq_len, dim, eps, stream);
+    compute_scale_kernel<<<1, 1, 0, stream>>>(d_scale, d_scale);
+
+    int n = seq_len * dim;
+    int threads = 256;
+    int n2 = n >> 1;
+    int blocks = (n2 + threads - 1) / threads;
+    quantize_fp8_kernel_generic<__half><<<blocks, threads, 0, stream>>>(xn_out, fp8_out, d_scale, n);
+}
+
+#ifdef FLASHRT_ENABLE_CHAMELEON
+// ── FP16-input per-row INT8 quantization ──
+// FP16 siblings of quantize_int8_rowwise (bf16). Skip the FP16→BF16 cast
+// a FP16-backbone model on Orin SM87 would otherwise pay before the bf16
+// kernel.
+__global__ void quantize_int8_rowwise_fp16_kernel(
+    const __half* __restrict__ input,
+    int8_t* __restrict__ output,
+    float* __restrict__ scales,
+    int rows, int cols)
+{
+    int row = blockIdx.x;
+    if (row >= rows) return;
+
+    const __half* in_row = input + static_cast<size_t>(row) * cols;
+    int8_t* out_row = output + static_cast<size_t>(row) * cols;
+
+    float tmax = 0.0f;
+    for (int j = threadIdx.x; j < cols; j += blockDim.x) {
+        tmax = fmaxf(tmax, fabsf(to_f32(in_row[j])));
+    }
+
+    for (int off = 16; off > 0; off >>= 1) {
+        tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffff, tmax, off));
+    }
+
+    __shared__ float warp_max[8];
+    int wid = threadIdx.x >> 5;
+    int lid = threadIdx.x & 31;
+    if (lid == 0) {
+        warp_max[wid] = tmax;
+    }
+    __syncthreads();
+
+    if (wid == 0) {
+        tmax = (lid < (blockDim.x >> 5)) ? warp_max[lid] : 0.0f;
+        for (int off = 4; off > 0; off >>= 1) {
+            tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffff, tmax, off));
+        }
+    }
+
+    __shared__ float scale_s;
+    if (threadIdx.x == 0) {
+        float s = fmaxf(tmax / 127.0f, 1e-10f);
+        scales[row] = s;
+        scale_s = s;
+    }
+    __syncthreads();
+
+    float inv_s = 1.0f / scale_s;
+    for (int j = threadIdx.x; j < cols; j += blockDim.x) {
+        float v = to_f32(in_row[j]) * inv_s;
+        int q = __float2int_rn(v);
+        q = (q < -127) ? -127 : ((q > 127) ? 127 : q);
+        out_row[j] = static_cast<int8_t>(q);
+    }
+}
+
+// Vectorized variant: 16B loads (8 elems) + the row cached in smem so
+// the quant pass re-reads smem instead of DRAM (a >L2 row makes the
+// scalar kernel's second global read pure DRAM traffic). Max-reduce is
+// order-independent and the quant math elementwise → output is
+// bit-identical to the scalar kernel. Requires cols % 8 == 0.
+// smem = cols*2 B (22 KB at cols=11008; 7 blocks/SM on Orin's 164 KB).
+__global__ void quantize_int8_rowwise_fp16_vec8_kernel(
+    const __half* __restrict__ input,
+    int8_t* __restrict__ output,
+    float* __restrict__ scales,
+    int rows, int cols)
+{
+    extern __shared__ char smem_raw[];
+    uint4* srow = reinterpret_cast<uint4*>(smem_raw);
+
+    int row = blockIdx.x;
+    if (row >= rows) return;
+
+    const uint4* in4 = reinterpret_cast<const uint4*>(
+        input + static_cast<size_t>(row) * cols);
+    uint2* out2 = reinterpret_cast<uint2*>(
+        output + static_cast<size_t>(row) * cols);
+    const int n8 = cols >> 3;
+
+    float tmax = 0.0f;
+    for (int j = threadIdx.x; j < n8; j += blockDim.x) {
+        uint4 v = in4[j];
+        srow[j] = v;
+        const __half2* p = reinterpret_cast<const __half2*>(&v);
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            tmax = fmaxf(tmax, fmaxf(fabsf(to_f32(p[k].x)),
+                                     fabsf(to_f32(p[k].y))));
+        }
+    }
+
+    for (int off = 16; off > 0; off >>= 1) {
+        tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffff, tmax, off));
+    }
+    __shared__ float warp_max[8];
+    int wid = threadIdx.x >> 5;
+    int lid = threadIdx.x & 31;
+    if (lid == 0) warp_max[wid] = tmax;
+    __syncthreads();
+    if (wid == 0) {
+        tmax = (lid < (blockDim.x >> 5)) ? warp_max[lid] : 0.0f;
+        for (int off = 4; off > 0; off >>= 1) {
+            tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffff, tmax, off));
+        }
+    }
+    __shared__ float scale_s;
+    if (threadIdx.x == 0) {
+        float s = fmaxf(tmax / 127.0f, 1e-10f);
+        scales[row] = s;
+        scale_s = s;
+    }
+    __syncthreads();
+
+    float inv_s = 1.0f / scale_s;
+    for (int j = threadIdx.x; j < n8; j += blockDim.x) {
+        uint4 v = srow[j];
+        const __half2* p = reinterpret_cast<const __half2*>(&v);
+        uint2 o;
+        int8_t* ob = reinterpret_cast<int8_t*>(&o);
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            float v0 = to_f32(p[k].x) * inv_s;
+            float v1 = to_f32(p[k].y) * inv_s;
+            int q0 = __float2int_rn(v0);
+            int q1 = __float2int_rn(v1);
+            q0 = (q0 < -127) ? -127 : ((q0 > 127) ? 127 : q0);
+            q1 = (q1 < -127) ? -127 : ((q1 > 127) ? 127 : q1);
+            ob[2 * k] = static_cast<int8_t>(q0);
+            ob[2 * k + 1] = static_cast<int8_t>(q1);
+        }
+        out2[j] = o;
+    }
+}
+
+void quantize_int8_rowwise_fp16(const __half* input, int8_t* output,
+                                 float* d_scales, int rows, int cols,
+                                 cudaStream_t stream) {
+    if ((cols & 7) == 0) {
+        int smem = cols * 2;
+        quantize_int8_rowwise_fp16_vec8_kernel
+            <<<rows, 256, smem, stream>>>(input, output, d_scales, rows, cols);
+        return;
+    }
+    int threads = (cols < 256) ? cols : 256;
+    threads = ((threads + 31) / 32) * 32;
+    if (threads < 32) threads = 32;
+    quantize_int8_rowwise_fp16_kernel<<<rows, threads, 0, stream>>>(
+        input, output, d_scales, rows, cols);
+}
+#endif  // FLASHRT_ENABLE_CHAMELEON

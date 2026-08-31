@@ -13,11 +13,17 @@ layer norms: [`runtime_contract.md`](runtime_contract.md).
 | layout | `FLAT 0` · `HWC 1` · `NHWC 2` · `CHW 3` · `NCHW 4` |
 | direction | `IN 0` · `OUT 1` |
 | update | `SWAP 0` · `STAGED 1` · `SETUP 2` |
+| generic executor | `GRAPH 0` · `OPAQUE 1` |
 
 `STATE` is reserved for real proprioception; internal embedding/residual
 windows are `TENSOR`. A `STAGED` declaration is a promise the port accepts hot
 updates — a producer that cannot deliver that declares `SETUP` or omits the
 port, never advertise-and-refuse.
+
+The Python `build_model_runtime()` helper enforces this mechanically: STAGED
+inputs require `set_input`, and STAGED outputs require `get_output`. Internal
+declaration-only handoffs may bypass that check only while constructing a
+native verb overlay; the declaration is not an adoptable runtime.
 
 ## Payload conventions (STAGED `set_input`)
 
@@ -30,7 +36,7 @@ port, never advertise-and-refuse.
 ## Descriptors
 
 `frt_runtime_port_desc` — one dynamic input/output:
-`name`, `modality`, `dtype` (device-side tensor), `layout`, `direction`,
+`name`, `modality`, `dtype` (logical payload/target tensor), `layout`, `direction`,
 `update`, `required`, `shape[rank]` (−1 = bucket-variable),
 `cadence_hint_hz` (advisory only), and the SWAP window `buffer`/`offset`/
 `bytes` (null buffer = staged-only). Strings/arrays are owned by the runtime
@@ -55,8 +61,24 @@ frt_model_runtime_v1 {
   stages / n_stages                  subgraph DAG
   self + verbs                       producer verbs (below)
   owner / retain / release           lifetime (see below)
+  query_extension                    optional, size-probed capability tail
 }
 ```
+
+`FRT_MODEL_RUNTIME_V1_BASE_SIZE` is the only required size for the published v1
+prefix above. Consumers reject `struct_size < BASE_SIZE`; they must not require
+the latest `sizeof(frt_model_runtime_v1)`. Any future additive tail has its own
+required-size probe before it is read. The embedded `frt_model_runtime_verbs`
+table is not tail-extensible: growing it would move `owner/retain/release` and
+break this prefix.
+
+Before reading `query_extension`, require
+`struct_size >= FRT_MODEL_RUNTIME_V1_QUERY_EXTENSION_SIZE`. A
+baseline-prefix producer is valid and simply has no extension tail. Every
+tail-capable core builder installs a callable query function, even when it
+returns `-3` (unsupported) for every ID. Query failures clear the output
+pointer; version zero is invalid (`-1`). Extension tables are runtime-owned and
+stable while the caller holds a model-runtime reference.
 
 **Verbs** (`frt_model_runtime_verbs`; every entry is always callable — absent
 producer verbs are filled with unsupported stubs returning `-3`):
@@ -69,11 +91,62 @@ producer verbs are filled with unsupported stubs returning `-3`):
 | `step(self)` | HOT (sugar) | fire all stages in declared order; scheduling hosts fire stages themselves |
 | `last_error(self)` | — | message for the most recent failure |
 
-Status codes follow the pi05 C face: `0` ok, `-1` invalid, `-2` not found,
+Status codes follow the common runtime convention: `0` ok, `-1` invalid, `-2` not found,
 `-3` unsupported, `-4` shape mismatch, `-5` insufficient storage, `-6` backend.
 
 **Hot contract** (SWAP writes and both hot verbs): never recapture, never
 allocate, never rebind graph pointers — only buffer contents change.
+
+## Execution authority and generic selected plans
+
+One runtime instance has exactly one execution authority:
+
+| legacy stages | generic plan | real `step` | result |
+|---:|---:|---:|---|
+| nonempty | absent | optional | legacy GRAPH plan |
+| empty | nonempty | optional | generic selected plan |
+| empty | absent | present | step-only black box |
+| nonempty | present | any | invalid |
+| empty | empty/absent | absent | invalid |
+
+`step` is whole-model sugar for a declared plan, not a second DAG. A host uses
+either `step()` or manual selected-plan scheduling for a tick.
+
+`FRT_EXT_GENERIC_STAGE_PLAN_V1` is the only extension currently assigned. Its
+table contains a frozen-stride descriptor array:
+
+```c
+frt_generic_stage_desc_v1 {
+  name;
+  executor_kind;   /* GRAPH or OPAQUE */
+  executor_ref;    /* graph index or provider-private uint32 */
+  n_after / after; /* strictly increasing earlier stage indices */
+}
+```
+
+GRAPH references index `exp->graphs`. OPAQUE references are passed unchanged
+to `run_opaque(stage_self, executor_ref)`; core does not interpret them or keep
+a provider registry. M0 OPAQUE execution is synchronous and blocking. It does
+not promise async submission, cancellation, graph capture, no host allocation,
+or model-level snapshot/restore. A mixed GRAPH/OPAQUE consumer must honor every
+dependency conservatively before starting downstream work.
+
+Generic names are unique valid UTF-8, contain no ASCII control bytes, and are
+at most `FRT_GENERIC_STAGE_NAME_MAX_BYTES` bytes. A generic plan must contain
+at least one OPAQUE stage; pure GRAPH plans use the legacy stage array. OPAQUE
+plans require one builder-registered runner and a real `last_error` verb.
+
+All three construction paths enforce the STAGED promise: any STAGED `IN`
+requires a non-null `set_input`, and any STAGED `OUT` requires a non-null
+`get_output`. Missing verbs remain legal for SWAP/SETUP-only declarations and
+are filled with the callable `-3` stubs. A contract-validation failure retains
+no owner/export/base object; `finish_model` additionally leaves its builder
+unconsumed so the producer can supply corrected verbs and retry.
+`build_model_runtime()` performs the equivalent check against the actual
+Python callbacks before `_assemble()`. The pybind trampolines are therefore
+never allowed to conceal a missing Python implementation:
+`Builder.finish_model()` maps each `None` callback to a null verb before core
+validation.
 
 **Lifetime**: the consumer retains/releases only the model runtime; the owner
 holds one export reference internally. `retain`/`release` are thread-safe;
@@ -93,6 +166,35 @@ frt_runtime_builder_add_stage(b, graph_index, after, n_after);
 frt_model_runtime_v1* m = frt_runtime_builder_finish_model(
     b, &verbs, verbs_self, owner, retain_owner, release_owner);
 ```
+
+For a generic selected plan, use the same builder and identity:
+
+```c
+frt_runtime_builder_add_generic_stage(
+    b, "prefill", FRT_GENERIC_STAGE_OPAQUE, 10, NULL, 0);
+uint32_t after[] = {0};
+frt_runtime_builder_add_generic_stage(
+    b, "decode", FRT_GENERIC_STAGE_OPAQUE, 11, after, 1);
+frt_runtime_builder_set_generic_stage_runner(b, provider, run_opaque);
+```
+
+The builder appends one canonical record per selected stage:
+
+```text
+gstage-v1:<i>:<name_len>:<name_bytes>:<kind>:<executor_ref>:<n_after>:<after...>\n
+```
+
+`name_len` is the UTF-8 byte length, so delimiters inside names cannot collide.
+The builder remains the only fingerprint implementation. With no generic plan,
+legacy identity bytes and fingerprints are unchanged.
+
+Providers with no FlashRT resources use
+`frt_model_runtime_builder_create_metadata()`. It produces a non-null export
+whose `ctx` is null and whose stream/graph/buffer/region counts are all zero.
+That export is only the common identity, fingerprint and lifetime anchor. The
+restricted builder accepts identity/manifest, unbound STAGED or SETUP ports,
+and all-OPAQUE generic or step-only authority; it rejects resources, SWAP,
+GRAPH/mixed plans, standalone export finish, and legacy wrapping.
 
 Identity covers each port's schema **and its bound window** (buffer index
 into the declared buffers array, offset, bytes) plus the stage DAG; only
@@ -114,6 +216,10 @@ frt_model_runtime_v1* m = frt_model_runtime_wrap(
     &verbs, verbs_self, wrapper_owner, wrapper_release);
 ```
 
+This path is intentionally narrow: it requires a real non-null exec context
+and a nonempty legacy graph plan. It cannot turn a metadata anchor or a
+zero-stage export into a new authority under an inherited fingerprint.
+
 **Verb override** — inherit an existing model-runtime declaration and replace
 only verbs. This is the standard hand-off when a setup producer owns capture,
 ports, stage DAG and fingerprint, while a native C++ runtime owns hot-path
@@ -129,6 +235,33 @@ The override retains `producer_model`, so inherited port/stage pointers remain
 valid even if the original producer reference is released first. Deployment
 identity is unchanged.
 
+Step-only runtimes cannot be overridden because `step` is their sole identity-
+bound authority. An all-OPAQUE generic runtime may be overridden: query is
+forwarded to the retained base, the original `stage_self`/runner remain in
+force, and OPAQUE errors continue to use the base `last_error`. M0 rejects a
+mixed-plan override rather than publishing an ambiguous error/owner surface.
+Before retaining either owner, the override validates an external generic
+table's runner, error authority, names, executor references and dependency DAG.
+Malformed or dual-authority tables fail closed and are never republished.
+
+Python exposes the same two producer modes:
+
+```python
+from flash_rt.runtime.export import (
+    GenericStageSpec, build_metadata_model_runtime,
+)
+
+runtime = build_metadata_model_runtime(
+    identity={"provider_build": digest},
+    generic_stages=[GenericStageSpec("infer", "opaque", 7)],
+    run_opaque=lambda executor_ref: provider.run(executor_ref),
+)
+```
+
+`finish_model`, `wrap`, and `override_verbs` apply the same STAGED verb check
+before taking ownership. A producer must not publish a STAGED declaration and
+rely on the final unsupported stub as its implementation.
+
 **Native factory (symbol convention)** — a model-runtime `.so` exports
 `FRT_MODEL_RUNTIME_OPEN_V1_SYMBOL`:
 `int frt_model_runtime_open_v1(const char* config_json, frt_model_runtime_v1** out)`.
@@ -136,11 +269,14 @@ identity is unchanged.
 **Reference producers**: `Pi05Pipeline.export_model_runtime()`
 (`flash_rt/models/pi05/runtime_export.py`, via
 `flash_rt.runtime.export.build_model_runtime`) and the native Pi0.5 verb
-overlay `frt_pi05_model_runtime_create_over` (`cpp/models/pi05/`).
+overlay `frt_pi05_model_runtime_create_over` (`cpp/models/pi05/`). PI0.5 also
+implements a fully native `io="native_v2"` checkpoint producer through
+`frt_model_runtime_open_v1`; see
+[`pi05_native_cpp.md`](pi05_native_cpp.md).
 
-## Producer layout: model contract vs hardware pipeline
+## Producer layout: model contract vs target lowering
 
-The clean default is one export module per logical model family contract:
+The Python producer keeps one export module per logical model family contract:
 
 ```
 flash_rt/models/<model>/runtime_export.py     ports, stages, identity, export helpers
@@ -155,6 +291,13 @@ ports, graph/stage descriptors, stream placement, identity fields, and optional
 stage-plan selection. Each hardware pipeline owns its graph capture, buffers,
 kernel choices, calibration, and setup policy, then delegates
 `export_model_runtime(...)` to that model export module.
+
+A fully native producer follows the same ownership rule: one model semantic
+pipeline declares model order and logical buffers; target lowering supplies
+kernel binding, precision packing, optional private scratch and observers. A
+target must not duplicate model layer loops, stage plans, checkpoint mapping or
+calibration traversal. Different precisions may produce different lowered
+execution plans while preserving the same semantic pipeline.
 
 The C++ runtime consumes the resulting declaration. It distinguishes the model
 by the native factory/overlay it loads (`cpp/models/<model>/...`) and by the
@@ -188,7 +331,9 @@ Pi0.5 export knobs:
   `(chunk_length,) f32`, and `guidance_weight` `(1,) f32`.
 - `io="python"` exports the Python frontend SWAP-tensor face.
 - `io="native"` exports the C++ runtime face (`images/actions` STAGED,
-  `noise` SWAP), intended for `frt_pi05_model_runtime_create_over`.
+  `noise` SWAP). It requires `native_overlay`, a callable around
+  `frt_pi05_model_runtime_create_over`; the temporary declaration is never
+  published without the real C++ verbs.
 
 For VLA outputs, the `actions` port shape is the logical host-visible action
 chunk after postprocess: `(chunk_length, robot_action_dim)` for flat robot
@@ -228,14 +373,24 @@ Export-time selection:
 model = pipeline.export_model_runtime(
     stage_plan="prefill_decode",
     io="native",
+    native_overlay=overlay,
 )
 
 chunked = pipeline.export_model_runtime(
     stage_plan="denoise_chunks",
     stage_plan_kwargs={"chunk_size": 5, "total_steps": 10},
     io="native",
+    native_overlay=overlay,
 )
 ```
+
+Pi0.5 native declarations also take `robot_action_dim` from the frontend's
+checkpoint metadata. `io="native_v2"` additionally takes `state_dim`; neither
+deployment dimension is inferred from or stored in the semantic pipeline.
+For Pi0.5, `overlay(declaration_ptr)` must return the non-null runtime pointer
+created by `frt_pi05_model_runtime_create_over`. The overlay owns its config
+resources for the returned runtime lifetime. Export fails before publication
+if no overlay is supplied or overlay construction fails.
 
 Every graph named by the resolved plan must already exist in the producer's
 export. Validation happens during export: unknown graph, unknown stream, stream
@@ -258,7 +413,7 @@ size_t frt_graph_variant_count(frt_graph);
 ## Validation
 
 ```
-./runtime/build/test_model_runtime                     # ABI, identity, lifetime, stubs
+./runtime/build/test_model_runtime                     # prefix ABI, STAGED guards, identity, lifetime
 ctest --test-dir cpp/build                             # modalities, staging pool, pi05 faces
 PYTHONPATH=.:./exec/build:./runtime/build \
   python runtime/tests/test_model_runtime_py.py        # Python producer through C fn pointers

@@ -22,78 +22,13 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
+#include "attention/fa2_wrapper.h"
+
 namespace py = pybind11;
 
 static cudaStream_t to_stream(uintptr_t s) {
     return reinterpret_cast<cudaStream_t>(s);
 }
-
-// Forward declarations (definitions in csrc/attention/fa2_wrapper.cu).
-extern "C" void fvk_attention_fa2_fwd_fp16(
-    const void* q_ptr, const void* k_ptr, const void* v_ptr,
-    void* o_ptr, void* softmax_lse_ptr,
-    void* softmax_lse_accum_ptr, void* o_accum_ptr,
-    int batch, int seqlen_q, int seqlen_k,
-    int num_heads_q, int num_heads_kv, int head_dim,
-    int q_batch_stride, int q_row_stride, int q_head_stride,
-    int k_batch_stride, int k_row_stride, int k_head_stride,
-    int v_batch_stride, int v_row_stride, int v_head_stride,
-    int o_batch_stride, int o_row_stride, int o_head_stride,
-    float softmax_scale, int num_sms, cudaStream_t stream);
-
-extern "C" void fvk_attention_fa2_fwd_bf16(
-    const void* q_ptr, const void* k_ptr, const void* v_ptr,
-    void* o_ptr, void* softmax_lse_ptr,
-    void* softmax_lse_accum_ptr, void* o_accum_ptr,
-    int batch, int seqlen_q, int seqlen_k,
-    int num_heads_q, int num_heads_kv, int head_dim,
-    int q_batch_stride, int q_row_stride, int q_head_stride,
-    int k_batch_stride, int k_row_stride, int k_head_stride,
-    int v_batch_stride, int v_row_stride, int v_head_stride,
-    int o_batch_stride, int o_row_stride, int o_head_stride,
-    float softmax_scale, int num_sms, cudaStream_t stream);
-
-// seqused_k variant — definition in csrc/attention/fa2_wrapper.cu. Reads the
-// per-batch K length from device memory so one captured graph serves any pos.
-extern "C" void fvk_attention_fa2_fwd_bf16_seqused(
-    const void* q_ptr, const void* k_ptr, const void* v_ptr,
-    void* o_ptr, void* softmax_lse_ptr, const void* seqused_k_ptr,
-    int batch, int seqlen_q, int seqlen_k,
-    int num_heads_q, int num_heads_kv, int head_dim,
-    int q_batch_stride, int q_row_stride, int q_head_stride,
-    int k_batch_stride, int k_row_stride, int k_head_stride,
-    int v_batch_stride, int v_row_stride, int v_head_stride,
-    int o_batch_stride, int o_row_stride, int o_head_stride,
-    float softmax_scale, int num_sms, cudaStream_t stream);
-
-// seqused_k + split-KV variant (experimental; caller pre-inits lse_accum=-inf).
-extern "C" void fvk_attention_fa2_fwd_bf16_seqused_splitkv(
-    const void* q_ptr, const void* k_ptr, const void* v_ptr,
-    void* o_ptr, void* softmax_lse_ptr, const void* seqused_k_ptr,
-    void* softmax_lse_accum_ptr, void* o_accum_ptr,
-    int batch, int seqlen_q, int seqlen_k,
-    int num_heads_q, int num_heads_kv, int head_dim,
-    int q_batch_stride, int q_row_stride, int q_head_stride,
-    int k_batch_stride, int k_row_stride, int k_head_stride,
-    int v_batch_stride, int v_row_stride, int v_head_stride,
-    int o_batch_stride, int o_row_stride, int o_head_stride,
-    float softmax_scale, int num_sms, cudaStream_t stream);
-
-// Causal variant — definition in csrc/attention/fa2_wrapper_causal.cu.
-// Currently only (bf16, head_dim=128) is built. Used by Qwen3-8B
-// prefill (S=N causal self-attention).
-extern "C" void fvk_attention_fa2_fwd_bf16_causal(
-    const void* q_ptr, const void* k_ptr, const void* v_ptr,
-    void* o_ptr, void* softmax_lse_ptr,
-    void* softmax_lse_accum_ptr, void* o_accum_ptr,
-    int batch, int seqlen_q, int seqlen_k,
-    int num_heads_q, int num_heads_kv, int head_dim,
-    int q_batch_stride, int q_row_stride, int q_head_stride,
-    int k_batch_stride, int k_row_stride, int k_head_stride,
-    int v_batch_stride, int v_row_stride, int v_head_stride,
-    int o_batch_stride, int o_row_stride, int o_head_stride,
-    float softmax_scale, int num_sms, cudaStream_t stream);
-
 
 // Shared docstring. pybind::def's doc arg takes a single string; we want the
 // same text for both fwd_fp16 and fwd_bf16 so deduplicate via static const.
@@ -249,8 +184,9 @@ PYBIND11_MODULE(flash_rt_fa2, m) {
 
     // Causal sibling. Same signature as fwd_bf16 but applies a causal
     // mask inside FA2 (template Is_causal=true). Currently only
-    // head_dim=128 is built; calls with other head_dim abort with a
-    // clear message. Used by Qwen3-8B prefill (S=N causal self-attn).
+    // head_dim=128 is built; calls with other head_dim raise a
+    // RuntimeError with a clear message. Used by Qwen3-8B prefill
+    // (S=N causal self-attn).
     m.def("fwd_bf16_causal", make_fwd(&fvk_attention_fa2_fwd_bf16_causal),
         py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"), py::arg("softmax_lse"),
         py::arg("softmax_lse_accum") = 0, py::arg("o_accum") = 0,
@@ -262,4 +198,20 @@ PYBIND11_MODULE(flash_rt_fa2, m) {
         py::arg("num_sms") = 0,
         py::arg("stream") = 0,
         kDocstring);
+
+#ifdef FLASHRT_ENABLE_CHAMELEON
+    // FP16 causal sibling — head_dim=128 only. Used by Chameleon-7B
+    // causal self-attention (32 layers MHA 32x128) on Orin SM87.
+    m.def("fwd_fp16_causal", make_fwd(&fvk_attention_fa2_fwd_fp16_causal),
+        py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"), py::arg("softmax_lse"),
+        py::arg("softmax_lse_accum") = 0, py::arg("o_accum") = 0,
+        py::arg("batch"), py::arg("seqlen_q"), py::arg("seqlen_k"),
+        py::arg("num_heads_q"), py::arg("num_heads_kv"), py::arg("head_dim"),
+        py::arg("q_strides"), py::arg("k_strides"),
+        py::arg("v_strides"), py::arg("o_strides"),
+        py::arg("softmax_scale") = 1.0f,
+        py::arg("num_sms") = 0,
+        py::arg("stream") = 0,
+        kDocstring);
+#endif
 }
