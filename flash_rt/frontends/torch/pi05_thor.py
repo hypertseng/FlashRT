@@ -161,7 +161,7 @@ class Pi05TorchFrontendThor:
                  use_cuda_graph: bool = True, autotune: int = 3,
                  use_fp8: bool = True, state_prompt_mode: str = "exact",
                  state_prompt_fixed_max_len: Optional[int] = None,
-                 use_fa4: bool = False):
+                 use_fa4: bool = False, rtc_prefix_len: int = 0):
         """
         Args:
             autotune: CUDA Graph autotune trials per set_prompt().
@@ -173,6 +173,10 @@ class Pi05TorchFrontendThor:
         self.use_cuda_graph = use_cuda_graph
         self.use_fp8 = bool(use_fp8)
         self.use_fa4 = bool(use_fa4)
+        self._rtc_prefix_len = max(0, int(rtc_prefix_len))
+        if self._rtc_prefix_len > 10:
+            raise ValueError("rtc_prefix_len must be <= action horizon 10")
+        self._rtc_prev_action_chunk = None
         self.autotune = int(autotune) if autotune is not True else 3
         if autotune is False:
             self.autotune = 0
@@ -547,6 +551,8 @@ class Pi05TorchFrontendThor:
         self._ae_hid_fp8 = torch.zeros(Sa * Ha, dtype=torch.uint8, device='cuda')
         self._ae_ctx_fp8 = torch.zeros(Sa * 8 * 256, dtype=torch.uint8, device='cuda')
         self._g_noise = torch.zeros(Sa, 32, dtype=fp16, device='cuda')
+        # Previous normalized action chunk consumed by Prefix RTC.
+        self._rtc_prev_action_chunk = torch.zeros(Sa, 32, dtype=fp16, device='cuda')
 
         # Calibration scale buffers
         self._enc_calib_scales = torch.zeros(Le * 4, dtype=torch.float32, device='cuda')
@@ -1751,6 +1757,7 @@ class Pi05TorchFrontendThor:
             'xn_fp8':  self._ae_xn_fp8.data_ptr(),
             'hid_fp8': self._ae_hid_fp8.data_ptr(),
             'ctx_fp8': self._ae_ctx_fp8.data_ptr(),
+            'rtc_prev_action_chunk': self._rtc_prev_action_chunk.data_ptr(),
         }
         ae_weights = {
             'ain_w':     self._ain_w.data_ptr(),
@@ -2109,6 +2116,7 @@ class Pi05TorchFrontendThor:
             'xn_fp8':  self._ae_xn_fp8.data_ptr(),
             'hid_fp8': self._ae_hid_fp8.data_ptr(),
             'ctx_fp8': self._ae_ctx_fp8.data_ptr(),
+            'rtc_prev_action_chunk': self._rtc_prev_action_chunk.data_ptr(),
         }
         ae_weights = {
             'ain_w':      self._ain_w.data_ptr(),
@@ -2144,7 +2152,8 @@ class Pi05TorchFrontendThor:
                             use_fp8=enc_use_fp8)
             decoder_forward(self._ctx, fvk, ae_bufs, ae_weights,
                             ae_dims, stream=0, attn=self._attn,
-                            use_fp8=dec_use_fp8)
+                            use_fp8=dec_use_fp8,
+                            rtc_prefix_len=self._rtc_prefix_len)
         torch.cuda.synchronize()
 
         # Capture
@@ -2159,7 +2168,8 @@ class Pi05TorchFrontendThor:
                             use_fp8=enc_use_fp8)
             decoder_forward(self._ctx, fvk, ae_bufs, ae_weights,
                             ae_dims, stream=s_int, attn=self._attn,
-                            use_fp8=dec_use_fp8)
+                            use_fp8=dec_use_fp8,
+                            rtc_prefix_len=self._rtc_prefix_len)
             self._enc_ae_graph.capture_end()
         torch.cuda.synchronize()
         logger.info("Enc+AE CUDA graph captured (Se=%d)", Se)
@@ -2257,7 +2267,8 @@ class Pi05TorchFrontendThor:
                         use_fp8=enc_use_fp8)
         decoder_forward(self._ctx, fvk, ae_bufs, ae_weights,
                         ae_dims, stream=stream, attn=self._attn,
-                        use_fp8=dec_use_fp8)
+                        use_fp8=dec_use_fp8,
+                        rtc_prefix_len=self._rtc_prefix_len)
 
     def _bad_enc_ae_graph_replay(self, raw_actions, graph_ms):
         """Detect stale/no-op B=1 graph replay using conservative signals."""
@@ -3365,7 +3376,33 @@ class Pi05TorchFrontendThor:
     # Inference
     # -----------------------------------------------------------------------
 
-    def infer(self, observation, debug=False, seed=None):
+    def configure_rtc_prefix(self, prefix_len: int) -> None:
+        """Enable fixed-length Prefix RTC for subsequent graph captures."""
+        prefix = max(0, int(prefix_len))
+        if prefix > int(self.Sa):
+            raise ValueError(f"rtc prefix_len {prefix} exceeds action horizon {self.Sa}")
+        if prefix == self._rtc_prefix_len:
+            return
+        self._rtc_prefix_len = prefix
+        self._enc_ae_graph = None
+        logger.info("Prefix RTC %s (prefix_len=%d)",
+                    "enabled" if prefix else "disabled", prefix)
+
+    def set_rtc_prev_action_chunk(self, actions: np.ndarray | None) -> None:
+        """Upload previous normalized 32-D action chunk for Prefix RTC."""
+        if self._rtc_prev_action_chunk is None:
+            raise RuntimeError("RTC buffers are not initialized; call set_prompt first")
+        self._rtc_prev_action_chunk.zero_()
+        if actions is None:
+            return
+        arr = np.asarray(actions, dtype=np.float16)
+        if arr.ndim != 2 or arr.shape[1] != 32:
+            raise ValueError(f"rtc previous chunk must be (N, 32), got {arr.shape}")
+        n = min(int(arr.shape[0]), int(self.Sa))
+        self._rtc_prev_action_chunk[:n].copy_(
+            torch.from_numpy(np.ascontiguousarray(arr[:n])).to(device="cuda"))
+
+    def infer(self, observation, debug=False, seed=None, rtc_prev_action_chunk=None):
         """Run inference: images -> CUDA graph replay -> actions.
 
         Args:
@@ -3376,6 +3413,8 @@ class Pi05TorchFrontendThor:
         """
         if self._rl_config is not None:
             return self._infer_cfg(observation, debug, seed)
+        if self._rtc_prefix_len:
+            self.set_rtc_prev_action_chunk(rtc_prev_action_chunk)
         debug_timing = os.environ.get("FLASHRT_INFER_DEBUG_TIMING", "0").lower() in (
             "1",
             "true",
@@ -3582,6 +3621,8 @@ class Pi05TorchFrontendThor:
             logger.info("Latency: %.1f ms", latency_ms)
 
         result = {"actions": robot_actions}
+        if self._rtc_prefix_len:
+            result["rtc_raw_actions"] = raw_actions.astype(np.float16, copy=True)
         if debug_timing:
             stage_ms["enc_ae_exec_ms"] = enc_ae_exec_ms
             stage_ms["enc_ae_mode"] = {
