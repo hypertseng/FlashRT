@@ -105,6 +105,15 @@ enum frt_rt_port_update {
     FRT_RT_PORT_SETUP  = 2
 };
 
+enum frt_generic_stage_executor_kind_v1 {
+    FRT_GENERIC_STAGE_GRAPH  = 0,
+    FRT_GENERIC_STAGE_OPAQUE = 1
+};
+
+#define FRT_GENERIC_STAGE_NAME_MAX_BYTES 255u
+#define FRT_GENERIC_STAGE_PLAN_ABI_VERSION 1u
+#define FRT_EXT_GENERIC_STAGE_PLAN_V1 UINT64_C(0x0000000000000001)
+
 /* ------------------------------------------------------------------ */
 /* Payload types (STAGED lane).                                        */
 /* ------------------------------------------------------------------ */
@@ -159,6 +168,29 @@ typedef struct frt_runtime_stage_desc {
     const uint32_t* after;     /* stage indices                            */
 } frt_runtime_stage_desc;
 
+/* Generic selected-plan descriptors. Unlike extension tables, array elements
+ * have frozen size/stride and must not receive additive tail fields. */
+typedef struct frt_generic_stage_desc_v1 {
+    const char* name;
+    uint32_t executor_kind;
+    uint32_t executor_ref;
+    uint32_t n_after;
+    const uint32_t* after;
+} frt_generic_stage_desc_v1;
+
+typedef struct frt_generic_stage_plan_ext_v1 {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    const frt_generic_stage_desc_v1* stages;
+    uint64_t n_stages;
+    void* stage_self;
+    int (*run_opaque)(void* stage_self, uint32_t executor_ref);
+} frt_generic_stage_plan_ext_v1;
+
+#define FRT_GENERIC_STAGE_PLAN_EXT_V1_SIZE \
+    ((uint32_t)(offsetof(frt_generic_stage_plan_ext_v1, run_opaque) + \
+                sizeof(((frt_generic_stage_plan_ext_v1*)0)->run_opaque)))
+
 /* ------------------------------------------------------------------ */
 /* Verbs — implemented by the producer, called by the host.            */
 /* set_input / get_output are HOT (contract above); prepare is WARM;   */
@@ -194,9 +226,25 @@ typedef struct frt_model_runtime_verbs {
     const char* (*last_error)(void* self);
 } frt_model_runtime_verbs;
 
+/* ABI-frozen in v1. Do not append fields here: this table is embedded in the
+ * middle of frt_model_runtime_v1, so growing it would move owner/retain/release
+ * and break the v1 prefix. New optional entry points belong in an additive
+ * tail on frt_model_runtime_v1 itself. */
+
 /* ------------------------------------------------------------------ */
 /* The model runtime object.                                           */
 /* ------------------------------------------------------------------ */
+struct frt_model_runtime_v1;
+
+/* Optional capabilities are discovered through an additive tail instead of
+ * growing the ABI-frozen verbs table. Consumers must probe the runtime's
+ * struct_size before reading this function pointer. */
+typedef int (*frt_model_runtime_query_extension_fn)(
+    const struct frt_model_runtime_v1* runtime,
+    uint64_t extension_id,
+    uint32_t min_version,
+    const void** out_extension);
+
 typedef struct frt_model_runtime_v1 {
     uint32_t abi_version;      /* = FRT_MODEL_RUNTIME_ABI_VERSION          */
     uint32_t struct_size;      /* = sizeof(frt_model_runtime_v1)           */
@@ -217,7 +265,22 @@ typedef struct frt_model_runtime_v1 {
     void* owner;
     void (*retain)(void* owner);
     void (*release)(void* owner);
+
+    /* Additive v1 tail. Baseline-prefix producers end before this field. */
+    frt_model_runtime_query_extension_fn query_extension;
 } frt_model_runtime_v1;
+
+/* Minimum byte prefix every v1 consumer may require. Keep this anchored to
+ * the last v1 field instead of sizeof(frt_model_runtime_v1): future additive
+ * tail fields must remain optional for baseline-prefix producers and invisible
+ * to prefix-only consumers. Read a tail only after probing its required size. */
+#define FRT_MODEL_RUNTIME_V1_BASE_SIZE \
+    ((uint32_t)(offsetof(frt_model_runtime_v1, release) + \
+                sizeof(((frt_model_runtime_v1*)0)->release)))
+
+#define FRT_MODEL_RUNTIME_V1_QUERY_EXTENSION_SIZE \
+    ((uint32_t)(offsetof(frt_model_runtime_v1, query_extension) + \
+                sizeof(((frt_model_runtime_v1*)0)->query_extension)))
 
 /* Factory symbol convention for NATIVE model runtimes: a model-runtime .so
  * exports exactly this symbol. Returns a retained object (caller releases). */
@@ -244,11 +307,26 @@ int frt_runtime_builder_add_port(frt_runtime_builder, const char* name,
                                  uint64_t bytes);
 int frt_runtime_builder_add_stage(frt_runtime_builder, uint32_t graph,
                                   const uint32_t* after, uint32_t n_after);
+int frt_runtime_builder_add_generic_stage(
+    frt_runtime_builder, const char* name, uint32_t executor_kind,
+    uint32_t executor_ref, const uint32_t* after, uint32_t n_after);
+int frt_runtime_builder_set_generic_stage_runner(
+    frt_runtime_builder, void* stage_self,
+    int (*run_opaque)(void* stage_self, uint32_t executor_ref));
+
+/* Create a model-only builder for a provider that owns no FlashRT execution
+ * resources. Its export remains the identity/lifetime anchor, with null ctx
+ * and zero resource arrays. The builder is deliberately restricted to
+ * identity/manifest, unbound STAGED or SETUP ports, and all-OPAQUE generic or
+ * step-only authority. */
+frt_runtime_builder frt_model_runtime_builder_create_metadata(void);
 
 /* Like frt_runtime_builder_finish, but returns the model runtime whose
  * `exp` is the internally-built export (one object, one refcount). `verbs`
- * is copied; entries may be null (the runtime then reports them
- * unsupported). Consumes the builder. */
+ * is copied; entries may be null except that every STAGED input requires a
+ * real set_input and every STAGED output requires a real get_output. A
+ * contract-validation failure returns null without consuming the builder or
+ * retaining owner; success consumes the builder. */
 frt_model_runtime_v1* frt_runtime_builder_finish_model(
     frt_runtime_builder,
     const frt_model_runtime_verbs* verbs, void* verbs_self,
@@ -262,7 +340,8 @@ frt_model_runtime_v1* frt_runtime_builder_finish_model(
 /* producer builds both. Descriptor arrays are copied. The wrapper     */
 /* takes one export reference and calls `wrapper_release(wrapper_owner)`*/
 /* exactly once when its refcount hits zero (use it to destroy the     */
-/* producer instance behind `verbs_self`).                             */
+/* producer instance behind `verbs_self`). STAGED declarations require */
+/* matching input/output verbs, as on construction path 1.             */
 /* ------------------------------------------------------------------ */
 frt_model_runtime_v1* frt_model_runtime_wrap(
     const frt_runtime_export_v1* exp,
@@ -278,7 +357,8 @@ frt_model_runtime_v1* frt_model_runtime_wrap(
 /* a native runtime owns hot-path transforms. The override retains `in` */
 /* so all inherited descriptor pointers stay valid; consumers release   */
 /* only the returned object. `retain_owner`/`release_owner` manage the  */
-/* native verb object, called once at construction/destruction.         */
+/* native verb object, called once at construction/destruction. The new */
+/* verbs must satisfy every inherited STAGED input/output declaration.   */
 /* ------------------------------------------------------------------ */
 frt_model_runtime_v1* frt_model_runtime_override_verbs(
     const frt_model_runtime_v1* in,

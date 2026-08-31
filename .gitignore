@@ -65,3 +65,5 @@ latency_sweep*.log
 
 # Benchmark / eval scripts
 examples/thor/eval_latency_sweep.py
+
+/artifacts/omega_e0m3/*.pt

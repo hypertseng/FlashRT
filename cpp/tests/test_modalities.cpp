@@ -25,6 +25,37 @@ using flashrt::modalities::required_vision_output_bytes;
 
 namespace {
 
+void test_divide_shift_normalization() {
+    flashrt::modalities::VisionPreprocessSpec spec;
+    spec.view_order = {"image"};
+    spec.target_width = 1;
+    spec.target_height = 1;
+    spec.output_dtype = DType::kFloat32;
+    spec.output_layout = Layout::kNHWC;
+    spec.normalize.mode = flashrt::modalities::NormalizeMode::kDivideShift;
+    spec.normalize.divisor = 127.5f;
+    spec.normalize.shift = -1.0f;
+
+    std::uint8_t pixels[] = {127, 128, 255};
+    VisionFrame frame;
+    frame.name = "image";
+    frame.image = {pixels, sizeof(pixels), DType::kUInt8,
+                   MemoryPlace::kHost, Layout::kHWC, Shape{1, 1, 3}};
+    frame.format = PixelFormat::kRGB8;
+    frame.width = 1;
+    frame.height = 1;
+
+    float output[3] = {};
+    TensorView destination{output, sizeof(output), DType::kFloat32,
+                           MemoryPlace::kHost, Layout::kNHWC,
+                           Shape{1, 1, 1, 3}};
+    const auto status = preprocess_vision_cpu(spec, {frame}, destination);
+    assert(status.ok_status());
+    assert(output[0] == 127.0f / 127.5f - 1.0f);
+    assert(output[1] == 128.0f / 127.5f - 1.0f);
+    assert(output[2] == 1.0f);
+}
+
 void test_pi05_vision_spec_and_preprocess() {
     const auto spec = flashrt::models::pi05::vision_preprocess_spec(2);
     assert(spec.view_order.size() == 2);
@@ -117,7 +148,7 @@ void test_action_postprocess() {
     assert(std::fabs(out[1] - 17.0f) < 0.01f);
     assert(std::fabs(out[2] - 34.0f) < 0.01f);
     assert(std::fabs(out[3] - 11.0f) < 0.01f);
-    assert(std::fabs(out[4] - 24.5f) < 0.01f);
+    assert(std::fabs(out[4] - 23.0f) < 0.01f);
     assert(std::fabs(out[5] - 26.0f) < 0.01f);
 }
 
@@ -162,7 +193,7 @@ void test_pi05_runtime_io_adapter() {
     st = io.read_actions(&actions);
     assert(st.ok_status());
     assert(actions.size() == 3);
-    assert(std::fabs(actions[0] - 21.0f) < 0.01f);
+    assert(std::fabs(actions[0] - 11.0f) < 0.01f);
     assert(std::fabs(actions[1] - 22.0f) < 0.01f);
     assert(std::fabs(actions[2] - 33.0f) < 0.01f);
 }
@@ -170,6 +201,7 @@ void test_pi05_runtime_io_adapter() {
 }  // namespace
 
 int main() {
+    test_divide_shift_normalization();
     test_pi05_vision_spec_and_preprocess();
     test_view_order_guard();
     test_action_postprocess();

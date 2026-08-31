@@ -125,6 +125,19 @@ Keep responsibilities in their owner layer.
 | `serving/` | scenario hosts, sessions, protocols, request policy | kernel implementation, default core imports, common execution policy |
 | `training/` | training and finetuning paths | inference hot-path dependencies unless explicitly shared and tested |
 
+For a model-runtime capability change, require all of the following:
+
+- the released prefix, verbs size/offsets, enum values and ABI version remain
+  exact; each additive tail/table has its own required-size probe;
+- an independently compiled baseline-prefix producer and a tail-aware consumer
+  prove no out-of-bounds tail read;
+- extension IDs and canonical identity records are assigned in core, contain no
+  provider/model/backend names, and are emitted only by the common builder;
+- authority XOR, malformed/unknown table, owner retention, override forwarding,
+  metadata restrictions and fingerprint change/no-change matrices are tested;
+- OPAQUE execution does not silently acquire graph hot-path, async, cancellation
+  or model-state guarantees that its table does not declare.
+
 Blockers:
 
 - A frontend imports a serving host or server-only dependency.
@@ -135,8 +148,10 @@ Blockers:
 - `exec/` gains a field or verb whose meaning is specific to one model family,
   protocol, session policy, scheduler policy, or KV-cache policy.
 - `runtime/` gains a model-named field, a scenario verb, or a non-additive
-  struct change; or a port is declared `STAGED` while its `set_input` refuses
-  hot updates (advertise-and-refuse).
+  struct change; a consumer requires the latest full
+  `sizeof(frt_model_runtime_v1)` instead of `FRT_MODEL_RUNTIME_V1_BASE_SIZE`;
+  or a port is declared `STAGED` without a working input `set_input` / output
+  `get_output` hot verb (advertise-and-refuse).
 - A hot-path verb (`set_input`/`get_output`, SWAP writes, tick) allocates,
   recaptures, or rebinds graph pointers.
 
@@ -198,6 +213,21 @@ Required:
   and docs entry.
 - Architecture labels and CMake feature flags must be consistent with runtime
   hardware detection and routing.
+- Native C++ model producers must be absent from the default build. Require a
+  three-level umbrella, model and hardware-target gate; enabling only the
+  umbrella must not compile model sources or tests.
+- A native producer shared library must use hidden visibility and an exact C
+  API export allowlist; check the complete set, not only symbol presence.
+- A native model PR must show that existing common `csrc` files are unchanged
+  from the base revision. Native-only operation gaps may live under
+  `csrc/native_cpp/` only when they are model-independent and opt-in.
+- Each native-only operation must identify the missing common contract
+  dimension. Reject shadow implementations when an existing operation already
+  satisfies the call site, especially copies that differ only in rounding or
+  reduction details.
+- Numerical parity evidence must use the unchanged current producer as the
+  reference. A frozen producer built from the same modified operation sources
+  is useful for refactor regression, but is not an independent parity oracle.
 
 Blockers:
 
@@ -207,6 +237,11 @@ Blockers:
 - Architecture-specific kernels compile into unsupported architecture targets.
 - Vendor-specific compile options leak into generic targets without a gate.
 - Binding list and required-symbol list are not updated together.
+- Internal CUDA/C++/vendor symbols leak from a native producer shared library.
+- Enabling a native target changes the default Python module's math, link
+  ownership, dynamic dependencies or install unit.
+- A model adaptation changes an existing common operation's signature,
+  numerical behavior or workspace contract instead of isolating the need.
 
 Build checks:
 
@@ -223,6 +258,12 @@ cmake -S . -B <build-dir> \
   -D<FEATURE_FLAG>=ON
 cmake --build <build-dir> --target <target_module> -j$(nproc)
 ```
+
+For native C++ model work, also configure the option OFF and confirm the model
+producer target is absent; configure target ON with the umbrella OFF and
+confirm configuration fails; build every selected hardware target; and on
+Linux compare `nm -D --defined-only` against the checked-in C API allowlist.
+SM110 builds must not gain an FA2 dependency merely because SM120 uses it.
 
 Import check:
 
@@ -345,20 +386,26 @@ Blockers:
 
 Required:
 
-- Use one pipeline per `(model, hardware)` for graph-captured or VLA-style
-  runtime paths.
-- Use one frontend per `(model, framework, hardware)`.
+- Use one semantic pipeline per `(model, framework)` for graph-captured or
+  VLA-style runtime paths. Hardware and precision may produce different
+  lowered execution plans.
+- Hardware targets bind capabilities, layouts and kernels; they do not
+  duplicate model math.
 - Routing map entries must be explicit.
-- Hardware-specific path names should include hardware in file or class names.
-- Cross-hardware sharing should go through small helpers, not large runtime
-  `if arch` branches.
+- Hardware-specific path names should include hardware only for real target
+  bindings, packing, private scratch or unsupported capabilities.
+- Cross-hardware selection should be capability-driven. Keep architecture names
+  out of shared operation bodies.
 - Existing routing defaults must not change unless the PR is explicitly a
   routing migration with old-path evidence.
 - Plugin or model registration must remain additive and explicit.
 
 Blockers:
 
-- Multiple hardware targets share one frontend with many runtime branches.
+- A shared frontend accumulates architecture-name branches instead of selecting
+  a target profile or capability.
+- Hardware targets duplicate model layer/step loops, stage plans, checkpoint
+  mapping or calibration traversal.
 - A new path changes default routing for existing models.
 - A framework path silently enters another framework's unvalidated route.
 - Hardware behavior is selected by guesswork rather than explicit capability.
@@ -381,10 +428,13 @@ Pipeline responsibilities:
 
 - Compose already-owned buffers and weights through kernel calls.
 - Keep launch order deterministic for capture.
+- Own one readable semantic topology per model; subgraphs are scheduling views
+  of that topology, not separate forwards.
 - Accept raw pointers, primitive dims, backend handles, streams, and small
   immutable config objects.
-- Keep hardware-specific compute in `pipeline_<hardware>.py` or model-local
-  helpers imported only by that hardware path.
+- Bind hardware-specific compute through target profiles or model-local target
+  helpers. Precision may change the lowered plan, packing and private scratch
+  without changing semantic model order.
 
 Pipeline must not:
 
@@ -412,8 +462,9 @@ Required files or explicit non-applicability:
 
 - Config or documented direct-instantiation path.
 - Routing registration for each validated `(config, framework, arch)`.
-- One frontend per `(model, framework, hardware)`.
-- One compute pipeline per `(model, hardware)` when graph-captured.
+- One semantic frontend pipeline per `(model, framework)`.
+- One explicit target binding/profile per validated hardware and precision;
+  multiple lowered execution plans may share the semantic pipeline.
 - Weight spec or documented checkpoint adapter.
 - Attention spec/backend selection when the model uses attention.
 - Calibration/precision spec when FP8, FP4, NVFP4, INT8, or similar is used.
@@ -440,6 +491,12 @@ Required:
 - Quantized paths need cosine, token-match, or domain-specific validation
   against the relevant reference.
 - Cache reuse must document exactly what is cached and when it is invalidated.
+- Native calibration must replay the production semantic pipeline; targets may
+  add observers, packing and private scratch but not another model traversal.
+- Artifact identity must cover checkpoint/tokenizer digests, target and dtype,
+  plus every shape-affecting setup field.
+- VLA calibration changes need configured single-view and multi-view coverage,
+  repeated observations, deterministic reduction and final runtime-open proof.
 
 Blockers:
 
@@ -450,6 +507,8 @@ Blockers:
 - Speed is reported without correctness.
 - Low correctness is accepted without comparing to the right reference noise
   floor.
+- Dataset iteration or sample-selection policy is embedded in runtime, Nexus or
+  a hardware target.
 
 Minimum correctness evidence:
 
@@ -630,6 +689,8 @@ Before merge, verify:
 - [ ] Hardware-specific behavior is isolated.
 - [ ] Unsupported hardware/platform combinations fail clearly.
 - [ ] Precision/cache/graph changes have correctness evidence.
+- [ ] Calibration reuses the semantic pipeline and its artifact identity is
+      complete; multi-view/repeated-sample cases are covered where applicable.
 - [ ] Docs match actual API, flags, modules, and behavior.
 - [ ] Performance claims include reproducible commands and correctness.
 

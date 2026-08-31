@@ -102,6 +102,12 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     ("pi0", "jax", "rtx_sm89"):
         ("flash_rt.frontends.jax.pi0_rtx", "Pi0JaxFrontendRtx"),
 
+    # ── Hy-Embodied-0.5-VLA (HunYuan MoT dual-tower + flow matching) ──
+    ("hyvla", "torch", "thor"):
+        ("flash_rt.frontends.torch.hyvla_thor", "HyVLATorchFrontendThor"),
+    ("hyvla", "torch", "rtx_sm87"):
+        ("flash_rt.frontends.torch.hyvla_orin", "HyVLATorchFrontendOrin"),
+
     # ── GROOT N1.6 ──
     ("groot", "torch", "thor"):
         ("flash_rt.frontends.torch.groot_thor", "GrootTorchFrontendThor"),
@@ -129,6 +135,10 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     ("wan22_ti2v_5b", "torch", "rtx_sm120"):
         ("flash_rt.frontends.torch.wan22_rtx", "Wan22TorchFrontendRtx"),
 
+    # ── LTX-2.5 22B distilled audio+video (RTX SM120 only) ──
+    ("ltx25", "torch", "rtx_sm120"):
+        ("flash_rt.frontends.torch.ltx25_rtx", "Ltx25TorchFrontendRtx"),
+
     # ── Cosmos3-Nano text2video FP8 denoise (RTX SM120 only) ──
     ("cosmos3_video", "torch", "rtx_sm120"):
         ("flash_rt.frontends.torch.cosmos3_video_rtx", "Cosmos3VideoTorchFrontendRtx"),
@@ -145,17 +155,64 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     ("qwen3_vl", "torch", "rtx_sm89"):
         ("flash_rt.frontends.torch.qwen3_vl_fp8_sm89_multimodal",
          "Qwen3VlFp8Sm89Frontend"),
+    # Jetson Thor (SM110): BF16 frontend. The vendored FA2 is not built on
+    # sm_110, so attention runs through the Thor SDPA backend; dims come from
+    # config.json. See docs/qwen3_vl_thor.md.
+    ("qwen3_vl", "torch", "thor"):
+        ("flash_rt.frontends.torch.qwen3_vl_thor",
+         "Qwen3VlTorchFrontendThor"),
+    # Jetson Orin (SM87, Ampere): no FP8/FP4 tensor cores, so neither the FP8
+    # nor the NVFP4 Qwen3-VL path applies. BF16 language stack over the FA2
+    # (sm_80 codegen) attention backend, with opt-in INT8/INT4 decode weight
+    # quantization. See docs/qwen3_vl_rtx_bf16.md.
+    ("qwen3_vl", "torch", "rtx_sm87"):
+        ("flash_rt.frontends.torch.qwen3_vl_rtx_bf16",
+         "Qwen3VlTorchFrontendRtxBF16"),
+
+    # ── Chameleon-7B ──
+    # Direct frontend (set_prompt/generate), not the VLA predict() surface.
+    # Orin SM87: INT8/INT4+QuaRot-Hadamard path; compute in
+    # flash_rt/models/chameleon/pipeline_rtx.py. Registered for resolver /
+    # direct-construction discovery only; load_model(config="chameleon")
+    # raises a redirect because this exposes set_prompt() + generate(),
+    # not the VLA predict() surface. See docs/chameleon7b_rtx_sm87.md.
+    ("chameleon", "torch", "rtx_sm87"):
+        ("flash_rt.frontends.torch.chameleon_rtx_sm87",
+         "ChameleonTorchFrontendRtxSm87"),
+    # Thor SM110: dynamic-FP8 backbone (optional NVFP4 FFN), attention via
+    # the dedicated Chameleon Thor backend (FA4 -> CUTLASS causal FMHA ->
+    # cuBLAS fallback). Compute in flash_rt/models/chameleon/pipeline_thor.py.
+    # See docs/chameleon_usage.md.
+    ("chameleon", "torch", "thor"):
+        ("flash_rt.frontends.torch.chameleon_thor",
+         "ChameleonTorchFrontendThor"),
+
+    # Cosmos3-Edge official Thor baseline.
+    ("cosmos3_edge", "torch", "thor"):
+        ("flash_rt.frontends.torch.cosmos3_edge_thor", "Cosmos3EdgeTorchFrontendThor"),
 
     # ── Nex-N2-mini / Qwen3.6-35B-A3B (qwen3_5_moe) ──
     # Text LLM, not a VLA: GDN linear-attn + full-attn-every-4th + 256-expert
-    # NVFP4 MoE. RTX 5090 (SM120) only, and requires the gated kernel build
-    # (-DFLASHRT_ENABLE_QWEN35MOE=ON). Registered here for discoverability /
-    # resolve_pipeline_class, but the frontend exposes an LLM surface
-    # (infer()->logits, generate_greedy) rather than the VLA predict(images)
-    # API, so it is used via direct instantiation of Nexn2TorchFrontendRtx
-    # (see docs/nexn2_usage.md) rather than load_model's VLAModel wrapper.
+    # NVFP4 MoE. Registered here for discoverability / resolve_pipeline_class,
+    # but the frontend exposes an LLM surface (infer()->logits,
+    # generate_greedy) rather than the VLA predict(images) API, so these are
+    # used via direct frontend construction rather than load_model's VLAModel
+    # wrapper.
+    #
+    # Nex-N2 is RTX 5090 (SM120) and needs the full gated kernel build
+    # (-DFLASHRT_ENABLE_QWEN35MOE=ON).
     ("nexn2", "torch", "rtx_sm120"):
         ("flash_rt.frontends.torch.nexn2_rtx", "Nexn2TorchFrontendRtx"),
+    # Qwen3.6 runs the same frontend on RTX SM120 and on Jetson AGX Thor
+    # (SM110). The two differ only in which kernel tiers the build has:
+    # SM120 takes the whole switch, Thor takes the two tiers its toolchain can
+    # compile. See docs/qwen36_moe_usage.md for the exact command per target.
+    ("qwen36_moe", "torch", "rtx_sm120"):
+        ("flash_rt.frontends.torch.qwen36_moe",
+         "Qwen36MoeTextFrontend"),
+    ("qwen36_moe", "torch", "thor"):
+        ("flash_rt.frontends.torch.qwen36_moe",
+         "Qwen36MoeTextFrontend"),
 
     # ── Pi0-FAST ── (SM120 runtime fork inside pipeline, no AttentionBackend protocol.)
     ("pi0fast", "torch", "thor"):
@@ -169,6 +226,18 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
 }
 
 
+# (config, framework, "rtx_sm87") keys supported on Jetson Orin. Ampere has no
+# FP8/FP4 tensor cores, so each model needs an arch-specific INT8/BF16
+# frontend; an explicit allowlist keeps an unrelated FP8 frontend from
+# resolving here and crashing later at the first kernel launch.
+_SM87_ALLOWED = {
+    ("pi05", "torch", "rtx_sm87"),
+    ("chameleon", "torch", "rtx_sm87"),
+    ("qwen3_vl", "torch", "rtx_sm87"),
+    ("hyvla", "torch", "rtx_sm87"),
+}
+
+
 def resolve_pipeline_class(config: str, framework: str, arch: str):
     """Resolve (config, framework, arch) to a pipeline class object.
 
@@ -176,11 +245,12 @@ def resolve_pipeline_class(config: str, framework: str, arch: str):
     does not pull in torch/jax/rtx code until a load happens.
     """
     key = (config, framework, arch)
-    if arch == "rtx_sm87" and key != ("pi05", "torch", "rtx_sm87"):
+    if arch == "rtx_sm87" and key not in _SM87_ALLOWED:
+        supported = sorted({c for (c, f, _) in _SM87_ALLOWED if f == framework})
         raise RuntimeError(
-            "FlashRT: Jetson Orin SM87 currently supports only "
-            "config='pi05' with framework='torch'. "
-            f"config={config!r} framework={framework!r} is not supported yet."
+            "FlashRT: Jetson Orin SM87 supports the following configs with "
+            f"framework={framework!r}: {supported}. "
+            f"config={config!r} is not supported yet."
         )
     if key not in _PIPELINE_MAP:
         supported = sorted(

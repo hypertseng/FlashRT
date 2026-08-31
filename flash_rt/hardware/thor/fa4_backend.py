@@ -1,7 +1,8 @@
 """Isolated FlashAttention-4 (CuTe-DSL) backend for Thor (sm_110).
 
-FA4's SM100 Blackwell forward kernel runs on Thor when compiled for ``sm_101a``
-(the legacy alias of sm_110; the ``sm_110a`` path hits a cutlass-dsl chip bug).
+FA4's SM100-compatible forward kernel runs on Thor through the ``sm_101a``
+CuTe-DSL compilation alias. Runtime dispatch still uses the physical device
+capability (SM110); the compilation alias must never select SM100-only kernels.
 At the LingBot denoise shape (Sq=51, Skv~891, GQA 16/2, HD=128) with
 ``pack_gqa`` it is ~17% faster than the vendored fmha kernel, cos=1.0, and is
 CUDA-graph capture-safe.
@@ -51,9 +52,12 @@ def _load() -> None:
         _REASON = "disabled (FLASHRT_THOR_FA4=0)"
         return
 
-    # Thor target: sm_101a (sm_110's Blackwell alias). Don't clobber a user value.
+    # Thor compilation target: sm_101a (the legacy alias of sm_110).
+    # Must be set BEFORE importing cutlass-dsl, which caches the device
+    # arch at import time; setting it after is too late (NVVM ICE on
+    # sm_110a). Requires nvidia-cutlass-dsl >= 4.5 (which accepts the
+    # sm_101a alias); 4.4.x only knows sm_110a and is NOT supported.
     os.environ.setdefault("CUTE_DSL_ARCH", "sm_101a")
-    os.environ.setdefault("FLASH_ATTENTION_ARCH", "sm_100a")
 
     # Allow an override dir (e.g. for local FA4 development), else the vendor.
     src = os.environ.get("LINGBOT_FA4_SRC") or (

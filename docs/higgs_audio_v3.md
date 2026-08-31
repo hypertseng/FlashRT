@@ -3,8 +3,10 @@
 > Single-stream, zero-shot text-to-speech: an **FP8 W8A8 Qwen3-4B** backbone
 > drives a fused 8-codebook head under a delay pattern, decoded autoregressively
 > and synthesised by the bundled neural codec — **text → 24 kHz waveform in one
-> process, no server required.** Per-frame decode is fully kernelised (no torch
-> in the math path) behind a clean `generate(text) -> waveform` API.
+> process, no server required.** The default greedy path and the explicit
+> temperature-sampling fallback are both implemented by FlashRT-owned CUDA
+> kernels (no sampler dependency) behind a clean `generate(text) -> waveform`
+> API.
 
 Model: [`bosonai/higgs-audio-v3-tts-4b`](https://huggingface.co/bosonai/higgs-audio-v3-tts-4b)
 — a dense Qwen3-4B backbone (36 layers, hidden 2560, GQA 32q/8kv, head_dim 128,
@@ -20,17 +22,18 @@ Jump to: [Usage](#3-quickstart) · [Python API](#4-python-api) ·
 
 ## Performance
 
-Measured on a single **RTX 5090** (SM120), single stream, warm (numbers vary
-with text and clocks). Two precisions, auto-selected by GPU (see *Hardware-
-adaptive* below): **FP8 W8A8** (SM120) and **BF16 W16A16** (the unquantised path,
-also the auto-selection on non-FP8 builds):
+Measured on a single **RTX 5090** (SM120), single stream, warm, using the native
+greedy default (`temperature=0`; numbers vary with text and clocks). Two
+precisions, auto-selected by GPU (see *Hardware-adaptive* below): **FP8 W8A8**
+(SM120) and **BF16 W16A16** (the unquantised path, also the auto-selection on
+non-FP8 builds):
 
 | Metric | **FP8** (default) | **BF16** (`fp8=False`) |
 |---|---|---|
-| Real-time factor (RTF) | **0.095 – 0.11** (≈ 9–10× real time) | **0.15** (≈ 6.5× real time) |
-| Time to first audio (TTFA) | **≈ 94 ms** | **≈ 138 ms** |
-| Autoregressive decode | **≈ 3.2 ms/frame** | **≈ 6.1 ms/frame** (at the BF16 bandwidth wall) |
-| Prompt prefill | **≈ 1.0 ms/token** | **≈ 0.9 ms/token** (cuBLAS, weight-once) |
+| Real-time factor (RTF) | **≈ 0.09** (≈ 11× real time) | **0.15** (≈ 6.5× real time) |
+| Time to first audio (TTFA) | **≈ 79 ms** | **≈ 127 ms** |
+| Autoregressive decode | **≈ 3.6 ms/frame** | **≈ 6.0 ms/frame** (at the BF16 bandwidth wall) |
+| Prompt prefill | **≈ 0.42 ms/token** at P=13 (≈ 5.5 ms total) | **≈ 0.52 ms/token** at P=13 (≈ 6.8 ms total; weight-once) |
 | Peak VRAM | **6.6 GB** | **9.6 GB** |
 | Fidelity | teacher-forced logits **cos 1.0**; codec **cos 0.99993**; streamed == one-shot **cos 1.0** | same (bit-exact vs eager) |
 | Prefix reuse | shared `system` preamble cuts prefill **~64 %**, output bit-identical | same |
@@ -39,6 +42,18 @@ Both precisions run the **same** fully-kernelised, zero-torch decode path
 (position-agnostic CUDA graph, batched prefill, prefix reuse). BF16 reads 2× the
 weight bytes of FP8, so its per-frame is ~1.7× — the bandwidth floor, not
 overhead.
+
+The BF16 batched prefill path is also fully kernelised. In a same-prompt
+prefill-only comparison, the BF16 path improves from **8.42 → 6.73 ms** at P=6
+and **11.74 → 6.82 ms** at P=13. The short-prompt EOC regression case
+`"Four score."` now exits in about **1 s** of audio in BF16 instead of running
+to the 40.68 s generation cap.
+
+FP8 activation calibration is fixed to a built-in short calibration prompt
+rather than the user's first request, so startup order no longer changes the
+scale set used for later prompts. A deterministic repeated-code stop guard also
+terminates pathological no-EOC loops before the generation cap; normal EOC
+termination remains unchanged.
 
 **Hardware-adaptive**: the precision is auto-selected from the GPU
 (`fp8=None`, the default) — FP8 where its kernels are compiled in, else BF16;
@@ -55,8 +70,8 @@ eager backbone):
 
 | Stage | PyTorch eager | FlashRT FP8 | |
 |---|---|---|---|
-| Autoregressive decode (no codec) | 10.8 ms/frame | **3.2 ms/frame** | **3.3× faster** |
-| Prompt prefill | 3.7 ms/token | **1.0 ms/token** | **3.7× faster** |
+| Autoregressive decode (no codec) | 10.8 ms/frame | **3.6 ms/frame** | **3.0× faster** |
+| Prompt prefill | 3.7 ms/token | **0.42 ms/token** | **8.8× faster** |
 | Backbone weight VRAM | 7.3 GB (bf16) | **3.6 GB (FP8)** | **2× smaller** |
 
 The decode math path is fully kernelised (RMSNorm + quant, dedicated M=1 GEMV
@@ -108,21 +123,26 @@ The directory must contain `config.json`, `model.safetensors`, and
 python examples/higgs_audio_v3_quickstart.py \
     --text "The quick brown fox jumps over the lazy dog." \
     --out fox.wav --benchmark 3
+
+# Explicit fallback matching the upstream default sampling distribution:
+python examples/higgs_audio_v3_quickstart.py \
+    --text "The quick brown fox jumps over the lazy dog." \
+    --temperature 1.0 --seed 1234 --out fox-sampled.wav
 ```
 
 Expected output on a 5090 (numbers vary with text length and clocks):
 
 ```
 [FP8 W8A8] 'The quick brown fox jumps over the lazy dog.'
-  -> fox.wav  (~3.0s audio, ~4.5s wall incl 1st-call setup)
-  bench 1: AR decode ~290 ms (~3.8 ms/frame)
-  bench 2: AR decode ~290 ms (~3.8 ms/frame)
+  -> fox.wav  (~4.0s audio, ~3s wall incl 1st-call setup)
+  bench 1: AR decode ~355 ms (~3.6 ms/frame)
+  bench 2: AR decode ~355 ms (~3.6 ms/frame)
   ...
 ```
 
 First call pays a one-time cost: FP8 activation-scale **calibration** (a short
-BF16 free-run) and **codec load**. Subsequent calls are warm. Add `--bf16` to
-run the BF16 backbone instead of FP8.
+BF16 free-run on a built-in calibration prompt) and **codec load**. Subsequent
+calls are warm. Add `--bf16` to run the BF16 backbone instead of FP8.
 
 ---
 
@@ -135,6 +155,9 @@ fe = HiggsAudioV3TorchFrontendRtx(CHECKPOINT_DIR)   # fp8=None (default): auto F
 # fe = HiggsAudioV3TorchFrontendRtx(CHECKPOINT_DIR, fp8=False)   # force BF16
 
 wav = fe.generate("Hello from FlashRT.")     # text -> 24 kHz mono waveform [L] (cpu f32)
+
+# Explicit dependency-free CUDA sampling fallback. Greedy stays the default.
+wav = fe.generate("Hello from FlashRT.", temperature=1.0, seed=1234)
 
 # or split the stages:
 codes = fe.predict("Hello from FlashRT.")    # [T, 8] acoustic codes (int64, cpu)
@@ -163,6 +186,17 @@ The reuse is a frontend mechanism (the KV cache is owned by the frontend); the
 caching/eviction policy belongs in the serving layer
 (`serving/higgs_audio_agent` forwards the request `instructions` as `system`).
 
+**Sampling policy.** `temperature=0.0` is intentionally the default: it uses
+the original fused argmax + delay-mask + embedding kernel, keeps the native
+path deterministic, and preserves its measured latency. Some prompts can enter
+a repeated-code attractor under greedy decoding in both FlashRT and the
+upstream engine. For those workloads, explicitly pass `temperature=1.0` to use
+the upstream default sampling distribution. This fallback is still a native
+FlashRT kernel: stable softmax, stateless categorical sampling, delay masking,
+and codebook embedding run in CUDA without SGLang, FlashInfer sampling, or
+another runtime dependency. `seed` is an optional uint64 request seed; a fixed
+value reproduces the same draws.
+
 ---
 
 ## 5. What runs under the hood
@@ -180,6 +214,11 @@ rms_norm_fp8 (norm + quant)
   -> M=1 FP8 GEMV  (down_proj, fused residual epilogue: h += down)
   -> rms_norm + quantize_fp8_static -> GEMV (fused 8-codebook head)
 ```
+
+The default argmax/embed epilogue remains one fused helper. With an explicit
+positive temperature, a separate FlashRT CUDA helper performs the categorical
+draw and embedding; it does not alter the backbone graph or the greedy launch
+sequence.
 
 The M=1 GEMV (`csrc/gemm/fp8_gemv_m1_sm120.cu`) is the key kernel: the hand-tuned
 MMA GEMMs pad M=1 to BLOCK_M=16 and starve the SMs on the N=2560 projections;
@@ -212,18 +251,35 @@ teacher-forced cosine above, and the codec is bit-faithful on identical codes.
 
 Headline numbers are in [Performance](#performance) above. Methodology:
 
+Public AR decode harness:
+
+```bash
+python examples/higgs_audio_v3_quickstart.py \
+    --checkpoint <checkpoint> \
+    --text "The quick brown fox jumps over the lazy dog." \
+    --benchmark 10
+
+python examples/higgs_audio_v3_quickstart.py \
+    --checkpoint <checkpoint> \
+    --text "The quick brown fox jumps over the lazy dog." \
+    --bf16 --benchmark 10
+```
+
 - **Full pipeline, warm.** RTF / TTFA are end-to-end text→waveform through the
   standardized `generate` / `generate_stream` frontend, FP8 backbone, after a
   warm-up call (lazy FP8 calibration + codec load + CUDA-graph capture happen
   once on the first call and are excluded).
-- **Decode floor 3.2 ms/frame** is the clean single-position CUDA-graph replay;
+- **Decode floor 3.6 ms/frame** is the clean single-position CUDA-graph replay;
   the per-token GEMMs read 3.6 GB of distinct FP8 weights, so this is genuinely
   HBM-bound (micro-benchmarks that reuse weights report L2-cached fiction). The
   full-pipeline per-frame is slightly higher because attention cost grows with KV
   length over a long generation.
-- **Prefill** is one batched M=P forward (≈ 1 ms/token); a shared `system`
+- **Prefill** is one batched M=P forward (FP8 ≈ 5.5 ms total; BF16 ≈ 6.8 ms total
+  for a 13-token prompt in the benchmark sentence); a shared `system`
   preamble reuses its resident KV across requests (only the new text suffix is
-  prefilled — bit-identical to a cold prefill).
+  prefilled — bit-identical to a cold prefill). Prefill-only numbers time
+  `set_prompt(...)` + `prefill()` after one warm-up and report the median of 20
+  iterations.
 - **Codec** runs in fp32 (ConvTranspose is unstable in low precision) as one
   small pass at the end (≤ 50 ms for 40 s of audio); in streaming it is decoded
   in overlapping windows so the streamed waveform matches the one-shot output.
@@ -235,8 +291,11 @@ Headline numbers are in [Performance](#performance) above. Methodology:
 ## 8. Notes & limitations
 
 - **FP8 calibration** is per-tensor static (activation `amax/448`), measured
-  once from a short BF16 free-run of the first prompt and reused. Activation
-  ranges are stable across prompts; re-instantiate the frontend to recalibrate.
+  once from a short BF16 free-run of a built-in calibration prompt and reused.
+  This keeps activation scales independent of the first user request.
+- **Decode policy.** Greedy is the dependency-free native default. Temperature
+  sampling is an explicit, also dependency-free CUDA fallback; top-p/top-k are
+  not part of this narrow fallback surface.
 - The BF16 projection weights are freed after calibration (the FP8 backbone is
   the active path); pass `fp8=False` for the BF16 backbone, which keeps them.
 - **GPU support / precision auto-selection.** The build auto-detects the GPU
