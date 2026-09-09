@@ -3315,12 +3315,13 @@ class Pi05TorchFrontendThor:
         return results
 
     def _autotune_enc_ae(self, n_trials=5, n_bench=10):
-        """Autotune Enc+AE graph: recapture until fast schedule is found.
+        """Autotune Enc+AE graph: benchmark every capture and keep fastest.
 
         CUDA Graph instantiation is non-deterministic on Thor — the same kernels
         can produce different schedules with ~2ms variance. This recaptures the
-        graph until a fast schedule is obtained or max trials are exhausted.
-        The LAST captured graph is always used (no stale references).
+        graph ``n_trials`` times and retains the capture with the lowest measured
+        median.  Selection is deliberately relative: a fixed latency threshold
+        is invalid across different MIG profiles, clocks, and batch shapes.
 
         Benchmark replicates real infer() flow: SigLIP replay → noise → Enc+AE,
         because SigLIP changes L2 cache state which affects Enc+AE performance.
@@ -3346,31 +3347,43 @@ class Pi05TorchFrontendThor:
 
         logger.info("Autotune: up to %d trials for best Enc+AE graph...", n_trials)
 
+        candidates = []
         for trial in range(n_trials):
             self._capture_enc_ae_graph()
+            graph = self._enc_ae_graph
 
             # Benchmark with SigLIP in front (replicates real infer flow)
             latencies = []
             for _ in range(n_bench):
                 self._siglip_graph.replay()
                 e0, e1 = _make_ev(), _make_ev()
-                _crt.cudaEventRecord(e0, ctypes.c_void_p(0))
-                self._g_noise.normal_()
-                self._enc_ae_graph.replay()
-                _crt.cudaEventRecord(e1, ctypes.c_void_p(0))
-                torch.cuda.synchronize()
-                latencies.append(_elapsed(e0, e1))
+                try:
+                    _crt.cudaEventRecord(e0, ctypes.c_void_p(0))
+                    self._g_noise.normal_()
+                    graph.replay()
+                    _crt.cudaEventRecord(e1, ctypes.c_void_p(0))
+                    torch.cuda.synchronize()
+                    latencies.append(_elapsed(e0, e1))
+                finally:
+                    _crt.cudaEventDestroy(e0)
+                    _crt.cudaEventDestroy(e1)
 
             latencies.sort()
             p50 = latencies[len(latencies) // 2]
-            logger.info("  Trial %d: %.2f ms", trial, p50)
+            candidates.append((p50, graph, trial))
+            logger.info("  Trial %d/%d: %.2f ms", trial + 1, n_trials, p50)
 
-            # Accept if fast enough (< 38.5ms = within fast regime)
-            if p50 < 38.5:
-                logger.info("Autotune done: Enc+AE = %.2f ms (trial %d)", p50, trial)
-                return
-
-        logger.info("Autotune done: Enc+AE = %.2f ms (best of %d)", p50, n_trials)
+        best_p50, best_graph, best_trial = min(candidates, key=lambda x: x[0])
+        self._enc_ae_graph = best_graph
+        # Release the losing CUDAGraph instances only after selection. Keeping
+        # all candidates alive during tuning prevents a later recapture from
+        # invalidating the graph that was actually fastest.
+        for _, graph, _ in candidates:
+            if graph is not best_graph:
+                del graph
+        logger.info(
+            "Autotune done: kept Enc+AE %.2f ms from trial %d/%d",
+            best_p50, best_trial + 1, n_trials)
 
     # -----------------------------------------------------------------------
     # Inference
