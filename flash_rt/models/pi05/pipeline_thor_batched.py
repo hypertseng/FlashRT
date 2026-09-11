@@ -36,7 +36,7 @@ Functions:
 
 import math
 
-from .pipeline_thor import Pi05ThorPipeline, _action_update_fp16
+from .pipeline_thor import Pi05ThorPipeline, _action_update_fp16, _gpu_copy
 
 
 def decoder_forward_b2(ctx, fvk, bufs, weights, dims, stream=0, *,
@@ -129,6 +129,11 @@ def decoder_forward_b2(ctx, fvk, bufs, weights, dims, stream=0, *,
     xn_fp8 = bufs['xn_fp8']
     hid_fp8 = bufs['hid_fp8']
     ctx_fp8 = bufs['ctx_fp8']
+    rtc_prefix_len = int(dims.get('rtc_prefix_len', 0) or 0)
+    rtc_prev_b2 = bufs.get('rtc_prev_action_chunk_b2')
+    if rtc_prefix_len > 0 and not rtc_prev_b2:
+        raise ValueError(
+            "rtc_prev_action_chunk_b2 is required when rtc_prefix_len > 0")
 
     ain_w = weights['ain_w']
     ain_b = weights['ain_b']
@@ -158,6 +163,16 @@ def decoder_forward_b2(ctx, fvk, bufs, weights, dims, stream=0, *,
     attn_q_stride_bytes = S * Q_dim * 2
 
     for s in range(steps):
+        if rtc_prefix_len > 0:
+            nbytes = rtc_prefix_len * 32 * 2
+            slot_bytes = S * 32 * 2
+            for b in range(B):
+                _gpu_copy(
+                    noise + b * slot_bytes,
+                    rtc_prev_b2 + b * slot_bytes,
+                    nbytes,
+                    stream,
+                )
         step_scale_base = s * layers * 4
         # ── Action input: noise → x (M = B*S) ──
         fvk.gmm_fp16(ctx, noise, ain_w, x, BS, D, 32, 0.0, stream)
@@ -263,6 +278,16 @@ def decoder_forward_b2(ctx, fvk, bufs, weights, dims, stream=0, *,
             #   noise[i, :] = noise[i, :] + xn[i, :] @ aow + aob
             _action_update_fp16(ctx, fvk, xn, aow, aob, noise, BS, 32, D,
                                 stream, dt, action_f32, aob_dt)
+            if rtc_prefix_len > 0:
+                nbytes = rtc_prefix_len * 32 * 2
+                slot_bytes = S * 32 * 2
+                for b in range(B):
+                    _gpu_copy(
+                        noise + b * slot_bytes,
+                        rtc_prev_b2 + b * slot_bytes,
+                        nbytes,
+                        stream,
+                    )
         else:
             # Per-step CFG (paper-correct, arXiv:2511.14759 App. E;
             # mirrors RTX
@@ -304,6 +329,16 @@ def decoder_forward_b2(ctx, fvk, bufs, weights, dims, stream=0, *,
             # and per-step CFG degrades to per-chunk over 10 steps.
             fvk.gpu_copy(noise_uncond_ptr, noise_cond_ptr,
                          per_slot_bytes, stream)
+            if rtc_prefix_len > 0:
+                nbytes = rtc_prefix_len * 32 * 2
+                slot_bytes = S * 32 * 2
+                for b in range(B):
+                    _gpu_copy(
+                        noise + b * slot_bytes,
+                        rtc_prev_b2 + b * slot_bytes,
+                        nbytes,
+                        stream,
+                    )
 
 
 class Pi05ThorBatchedPipeline(Pi05ThorPipeline):

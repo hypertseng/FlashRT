@@ -146,7 +146,7 @@ class Pi05TorchFrontendThor:
         "_ae_logits_b2", "_ae_attn_b2", "_ae_fg_b2",
         "_ae_action_f32_b2", "_ae_xn_fp8_b2", "_ae_hid_fp8_b2",
         "_ae_ctx_fp8_b2",
-        "_g_noise_b2", "_v_b2", "_v_b2_f32",
+        "_g_noise_b2", "_rtc_prev_action_chunk_b2", "_v_b2", "_v_b2_f32",
         "_sa_all_b2", "_sf_all_b2", "_fs_all_b2",
         "_siglip_batched_graph", "_siglip_batched_B",
         "_enc_ae_graph_b2", "_cfg_b2_outer_graph",
@@ -161,7 +161,7 @@ class Pi05TorchFrontendThor:
                  use_cuda_graph: bool = True, autotune: int = 3,
                  use_fp8: bool = True, state_prompt_mode: str = "exact",
                  state_prompt_fixed_max_len: Optional[int] = None,
-                 use_fa4: bool = False):
+                 use_fa4: bool = False, rtc_prefix_len: int = 0):
         """
         Args:
             autotune: CUDA Graph autotune trials per set_prompt().
@@ -173,6 +173,13 @@ class Pi05TorchFrontendThor:
         self.use_cuda_graph = use_cuda_graph
         self.use_fp8 = bool(use_fp8)
         self.use_fa4 = bool(use_fa4)
+        self.rtc_prefix_len = max(0, int(rtc_prefix_len))
+        # CUDA graphs bake the prefix length into the decoder call.  Keep
+        # the active value separate so the first request (which has no
+        # previous chunk) can run with prefix_len=0 and the prefix graph is
+        # captured only once a previous chunk exists.
+        self._rtc_active_prefix_len = 0
+        self._rtc_active_prefix_len_b2 = 0
         self.autotune = int(autotune) if autotune is not True else 3
         if autotune is False:
             self.autotune = 0
@@ -547,6 +554,7 @@ class Pi05TorchFrontendThor:
         self._ae_hid_fp8 = torch.zeros(Sa * Ha, dtype=torch.uint8, device='cuda')
         self._ae_ctx_fp8 = torch.zeros(Sa * 8 * 256, dtype=torch.uint8, device='cuda')
         self._g_noise = torch.zeros(Sa, 32, dtype=fp16, device='cuda')
+        self._rtc_prev_action_chunk = torch.zeros_like(self._g_noise)
 
         # Calibration scale buffers
         self._enc_calib_scales = torch.zeros(Le * 4, dtype=torch.float32, device='cuda')
@@ -581,6 +589,7 @@ class Pi05TorchFrontendThor:
         self._ae_hid_fp8_b2 = None
         self._ae_ctx_fp8_b2 = None
         self._g_noise_b2 = None
+        self._rtc_prev_action_chunk_b2 = None
         self._v_b2 = None
         self._img_stack_host_b2 = None
         self._img_stack_host_torch_b2 = None
@@ -717,6 +726,7 @@ class Pi05TorchFrontendThor:
         self._ae_hid_fp8_b2 = torch.zeros(B * Sa * Ha, dtype=torch.uint8, device='cuda')
         self._ae_ctx_fp8_b2 = torch.zeros(B * Sa * 8 * 256, dtype=torch.uint8, device='cuda')
         self._g_noise_b2 = torch.zeros(B * Sa, 32, dtype=fp16, device='cuda')
+        self._rtc_prev_action_chunk_b2 = torch.zeros_like(self._g_noise_b2)
         # Per-step velocity scratch for the CFG-batched graph: each step
         # writes (v_cond, v_uncond) here before the in-graph cfg_combine
         # mixes them into ``_g_noise_b2`` slot 0. Always allocated; the
@@ -757,6 +767,7 @@ class Pi05TorchFrontendThor:
             int(Se),
             int(getattr(self, "_S_lang", 0) or 0),
             self._enc_ae_graph_b2_cfg_beta,
+            int(getattr(self, "_rtc_active_prefix_len_b2", 0)),
         )
 
     def _save_active_batch_graph_bank_entry(self) -> None:
@@ -2134,6 +2145,7 @@ class Pi05TorchFrontendThor:
             'S': Sa, 'D': Da, 'H': Ha, 'NH': 8, 'HD': 256,
             'steps': 10, 'layers': La, 'enc_seq': Se,
             'total_keys': total_keys,
+            'rtc_prefix_len': int(self._rtc_active_prefix_len),
         }
 
         # Warmup
@@ -2144,7 +2156,8 @@ class Pi05TorchFrontendThor:
                             use_fp8=enc_use_fp8)
             decoder_forward(self._ctx, fvk, ae_bufs, ae_weights,
                             ae_dims, stream=0, attn=self._attn,
-                            use_fp8=dec_use_fp8)
+                            use_fp8=dec_use_fp8,
+                            rtc_prefix_len=int(self._rtc_active_prefix_len))
         torch.cuda.synchronize()
 
         # Capture
@@ -2159,7 +2172,8 @@ class Pi05TorchFrontendThor:
                             use_fp8=enc_use_fp8)
             decoder_forward(self._ctx, fvk, ae_bufs, ae_weights,
                             ae_dims, stream=s_int, attn=self._attn,
-                            use_fp8=dec_use_fp8)
+                            use_fp8=dec_use_fp8,
+                            rtc_prefix_len=int(self._rtc_active_prefix_len))
             self._enc_ae_graph.capture_end()
         torch.cuda.synchronize()
         logger.info("Enc+AE CUDA graph captured (Se=%d)", Se)
@@ -2212,6 +2226,7 @@ class Pi05TorchFrontendThor:
 
         ae_bufs = {
             'noise':   self._g_noise.data_ptr(),
+            'rtc_prev_action_chunk': self._rtc_prev_action_chunk.data_ptr(),
             'x':       self._ae_x.data_ptr(),
             'xn':      self._ae_xn.data_ptr(),
             'gate':    self._ae_gate.data_ptr(),
@@ -2249,6 +2264,7 @@ class Pi05TorchFrontendThor:
             'S': Sa, 'D': Da, 'H': Ha, 'NH': 8, 'HD': 256,
             'steps': 10, 'layers': La, 'enc_seq': Se,
             'total_keys': total_keys,
+            'rtc_prefix_len': int(self._rtc_active_prefix_len),
         }
 
         self._Kc.zero_(); self._Vc.zero_()
@@ -2257,7 +2273,8 @@ class Pi05TorchFrontendThor:
                         use_fp8=enc_use_fp8)
         decoder_forward(self._ctx, fvk, ae_bufs, ae_weights,
                         ae_dims, stream=stream, attn=self._attn,
-                        use_fp8=dec_use_fp8)
+                        use_fp8=dec_use_fp8,
+                        rtc_prefix_len=int(self._rtc_active_prefix_len))
 
     def _bad_enc_ae_graph_replay(self, raw_actions, graph_ms):
         """Detect stale/no-op B=1 graph replay using conservative signals."""
@@ -2342,6 +2359,7 @@ class Pi05TorchFrontendThor:
 
         ae_bufs_b2 = {
             'noise':   self._g_noise_b2.data_ptr(),
+            'rtc_prev_action_chunk_b2': self._rtc_prev_action_chunk_b2.data_ptr(),
             'x':       self._ae_x_b2.data_ptr(),
             'xn':      self._ae_xn_b2.data_ptr(),
             'gate':    self._ae_gate_b2.data_ptr(),
@@ -2388,6 +2406,7 @@ class Pi05TorchFrontendThor:
             'S': Sa, 'D': Da, 'H': Ha, 'NH': 8, 'HD': 256,
             'steps': 10, 'layers': La, 'enc_seq': Se,
             'total_keys': total_keys,
+            'rtc_prefix_len': int(self._rtc_active_prefix_len_b2),
         }
 
         # When the CFG-batched pipeline is active, bake the per-step
@@ -2915,18 +2934,33 @@ class Pi05TorchFrontendThor:
                 {"actions": unnorm[:, :LIBERO_ACTION_DIM]})
         return results
 
-    def _run_serial_batch(self, obs_list, prompts):
+    def _run_serial_batch(self, obs_list, prompts, states=None,
+                          rtc_prev_chunks=None, rtc_prefix_lens=None):
         """Internal: Run serial inference for each item in the list.
 
         Used as fallback when B=1 or when batching is not beneficial.
-        Optimized to skip set_prompt when prompt matches current state.
+        State-conditioned prompts are updated in place when their shape is
+        unchanged, which is the FlashRT VLASh fast path.
         """
         results = []
         current_prompt = getattr(self, '_current_prompt', None)
-        for obs, prompt in zip(obs_list, prompts):
-            if prompt != current_prompt:
-                self.set_prompt(prompt)
+        current_state_key = None
+        for index, (obs, prompt) in enumerate(zip(obs_list, prompts)):
+            state = states[index] if states is not None else None
+            prev_chunk = (
+                rtc_prev_chunks[index]
+                if rtc_prev_chunks is not None else None)
+            prefix_len = (
+                rtc_prefix_lens[index]
+                if rtc_prefix_lens is not None else None)
+            state_key = None
+            if state is not None:
+                arr = np.asarray(state)
+                state_key = (arr.shape, str(arr.dtype), arr.tobytes())
+            if prompt != current_prompt or state_key != current_state_key:
+                self.set_prompt(prompt, state=state)
                 current_prompt = prompt
+                current_state_key = state_key
             if isinstance(obs, dict):
                 if 'images' in obs:
                     obs_input = obs.copy()
@@ -2936,7 +2970,12 @@ class Pi05TorchFrontendThor:
                     obs_input = obs
             else:
                 obs_input = obs
-            result = self.infer(obs_input)
+            result = self.infer(
+                obs_input,
+                rtc_prev_action_chunk=prev_chunk,
+                rtc_prefix_len=prefix_len,
+                state=state,
+            )
             results.append(result)
         return results
 
@@ -2966,15 +3005,34 @@ class Pi05TorchFrontendThor:
         S_sig = self.sig_S
         De = self.De
 
+        # The batched decoder graph uses one fixed copy mask for all slots.
+        # The adapter groups requests by prefix length before reaching here;
+        # keep a direct-call guard so mixed masks can never silently run as a
+        # non-RTC batch.
+        rtc_prefix_lens = [int(item.get('rtc_prefix_len', 0) or 0)
+                           for item in batch_data]
+        if len(set(rtc_prefix_lens)) > 1:
+            raise ValueError(
+                "infer_multi_prompt_batch requires one rtc_prefix_len per batch; "
+                "group requests by prefix length in the serving layer")
+        batch_rtc_prefix_len = rtc_prefix_lens[0] if rtc_prefix_lens else 0
+        rtc_prev_chunks = [item.get('rtc_prev_action_chunk') for item in batch_data]
+        if batch_rtc_prefix_len > 0 and any(chunk is None for chunk in rtc_prev_chunks):
+            raise ValueError(
+                "Prefix RTC batch requires rtc_prev_action_chunk for every slot")
+
         # Step 1: Parse observations and compute lang embeddings
         samples = []
         max_S_lang = 0
+        has_state = any(item.get('state') is not None for item in batch_data)
+        prompt_max_len = 200 if has_state else 48
         for item in batch_data:
             obs = item['observation']
             prompt_text = item['prompt']
+            state = item.get('state')
 
             embeds, S_lang = self._get_prompt_bank_entry(
-                prompt_text, max_len=48)
+                prompt_text, max_len=prompt_max_len, state=state)
 
             if 'images' in obs:
                 img_list = obs['images']
@@ -2988,6 +3046,7 @@ class Pi05TorchFrontendThor:
             samples.append({
                 'obs': obs,
                 'prompt': prompt_text,
+                'state': state,
                 'images': img_list,
                 'embeds': embeds,
                 'S_lang': S_lang,
@@ -3008,7 +3067,10 @@ class Pi05TorchFrontendThor:
         # production use).
         if not hasattr(self, '_lang_emb') or self._lang_emb is None:
             longest_sample = max(samples, key=lambda s: s['S_lang'])
-            self.set_prompt(longest_sample['prompt'])
+            self.set_prompt(
+                longest_sample['prompt'],
+                state=longest_sample.get('state'),
+            )
 
         if int(getattr(self, "_S_lang", 0) or 0) != int(batch_S_lang):
             self._S_lang = int(batch_S_lang)
@@ -3055,7 +3117,11 @@ class Pi05TorchFrontendThor:
                 self._save_active_batch_graph_bank_entry()
             obs_list = [item['observation'] for item in batch_data]
             prompts = [item['prompt'] for item in batch_data]
-            return self._run_serial_batch(obs_list, prompts)
+            states = [item.get('state') for item in batch_data]
+            rtc_prev_chunks = [item.get('rtc_prev_action_chunk') for item in batch_data]
+            rtc_prefix_lens = [int(item.get('rtc_prefix_len', 0) or 0) for item in batch_data]
+            return self._run_serial_batch(
+                obs_list, prompts, states, rtc_prev_chunks, rtc_prefix_lens)
 
         restored_from_graph_bank = False
         if self.batch_graph_bank_enabled:
@@ -3081,7 +3147,7 @@ class Pi05TorchFrontendThor:
             self._ae_qkv_b2 = self._ae_logits_b2 = self._ae_attn_b2 = None
             self._ae_fg_b2 = None
             self._ae_xn_fp8_b2 = self._ae_hid_fp8_b2 = self._ae_ctx_fp8_b2 = None
-            self._g_noise_b2 = self._v_b2 = None
+            self._g_noise_b2 = self._rtc_prev_action_chunk_b2 = self._v_b2 = None
             self._sa_all_b2 = self._sf_all_b2 = self._fs_all_b2 = None
             self._alloc_b2_buffers(B=B, Se_dynamic=Se_max)  # pass correct Se_max NOW
             self._enc_ae_graph_b2 = None  # force graph re-capture
@@ -3270,6 +3336,26 @@ class Pi05TorchFrontendThor:
         else:
             self._fill_seed_noise_batched(samples, seed)
 
+        if batch_rtc_prefix_len > int(self.Sa):
+            raise ValueError(
+                f"rtc_prefix_len {batch_rtc_prefix_len} exceeds action chunk {self.Sa}")
+        if batch_rtc_prefix_len > 0:
+            for b, previous in enumerate(rtc_prev_chunks):
+                raw = np.asarray(previous, dtype=np.float16)
+                if raw.shape != (int(self.Sa), 32) or not np.isfinite(raw).all():
+                    raise ValueError(
+                        "rtc_prev_action_chunk must be finite raw shape "
+                        f"({self.Sa}, 32) for every batched slot")
+                self._rtc_prev_action_chunk_b2[b * self.Sa:(b + 1) * self.Sa].copy_(
+                    torch.from_numpy(np.ascontiguousarray(raw)).to(
+                        device="cuda", dtype=fp16, non_blocking=True))
+        else:
+            self._rtc_prev_action_chunk_b2.zero_()
+
+        if batch_rtc_prefix_len != int(self._rtc_active_prefix_len_b2):
+            self._rtc_active_prefix_len_b2 = int(batch_rtc_prefix_len)
+            self._enc_ae_graph_b2 = None
+
         # Replay encoder+decoder as a single CUDA Graph (b2 path).
         # By default the graph skips full KV zero because encoder_forward_b2
         # overwrites the KV ranges read by decoder_forward_b2.
@@ -3291,7 +3377,10 @@ class Pi05TorchFrontendThor:
         for b in range(B):
             raw = raw_all[b * self.Sa:(b + 1) * self.Sa]
             unnorm = unnormalize_actions(raw, self.norm_stats)
-            results.append({"actions": unnorm[:, :LIBERO_ACTION_DIM]})
+            result = {"actions": unnorm[:, :LIBERO_ACTION_DIM]}
+            if batch_rtc_prefix_len > 0:
+                result["rtc_raw_actions"] = raw.copy()
+            results.append(result)
 
         # Step 8: Restore attention slots to serial defaults
         # Batch modified _attn._slots['encoder'] to point to _Kc_b2/_Vc_b2.
@@ -3365,7 +3454,48 @@ class Pi05TorchFrontendThor:
     # Inference
     # -----------------------------------------------------------------------
 
-    def infer(self, observation, debug=False, seed=None):
+    def _prepare_rtc_prefix(self, previous_chunk, prefix_len=None):
+        """Stage one raw action chunk and select the matching CUDA graph.
+
+        FlashRT's prefix implementation copies the first ``prefix_len`` rows
+        of the *raw 32-D diffusion chunk* before every denoising step.  The
+        graph therefore has a fixed prefix length.  A request without a
+        previous chunk always uses the ordinary graph (prefix length zero),
+        avoiding the common but incorrect practice of locking the first
+        request to an all-zero prefix.
+        """
+        requested = self.rtc_prefix_len if prefix_len is None else int(prefix_len)
+        requested = max(0, requested)
+        if requested > int(self.Sa):
+            raise ValueError(
+                f"rtc_prefix_len {requested} exceeds action chunk {self.Sa}")
+
+        if previous_chunk is None:
+            effective = 0
+            self._rtc_prev_action_chunk.zero_()
+        else:
+            raw = np.asarray(previous_chunk, dtype=np.float16)
+            if raw.shape != (int(self.Sa), 32):
+                raise ValueError(
+                    "rtc_prev_action_chunk must have raw shape "
+                    f"({self.Sa}, 32), got {raw.shape}")
+            if not np.isfinite(raw).all():
+                raise ValueError("rtc_prev_action_chunk contains non-finite values")
+            self._rtc_prev_action_chunk.copy_(
+                torch.from_numpy(np.ascontiguousarray(raw)).to(
+                    device="cuda", dtype=fp16, non_blocking=True))
+            effective = requested
+
+        if effective != int(self._rtc_active_prefix_len):
+            self._rtc_active_prefix_len = int(effective)
+            # The decoder graph bakes rtc_prefix_len into its call sequence.
+            # Recapture only on a 0<->prefix transition; steady-state
+            # requests reuse the captured graph.
+            self._capture_enc_ae_graph()
+        return effective
+
+    def infer(self, observation, debug=False, seed=None,
+              rtc_prev_action_chunk=None, rtc_prefix_len=None, state=None):
         """Run inference: images -> CUDA graph replay -> actions.
 
         Args:
@@ -3442,6 +3572,11 @@ class Pi05TorchFrontendThor:
             _mark("image_prepare")
             self._img_buf.upload(self._infer_images_np)
         _mark("image_upload")
+
+        # Stage RTC input before the diffusion graph replay.  ``state`` is
+        # accepted for adapter compatibility; state-conditioned prompts are
+        # still materialized by set_prompt(), not injected into the decoder.
+        self._prepare_rtc_prefix(rtc_prev_action_chunk, rtc_prefix_len)
 
         # ---- Graph 1: SigLIP + PostLN ----
         if use_uint8_graph:
@@ -3582,6 +3717,11 @@ class Pi05TorchFrontendThor:
             logger.info("Latency: %.1f ms", latency_ms)
 
         result = {"actions": robot_actions}
+        if int(self._rtc_active_prefix_len) > 0:
+            # Lingshu must feed the raw diffusion chunk back to FlashRT on
+            # the next request; the 7-D robot actions are not sufficient to
+            # reproduce the RTC prefix in latent space.
+            result["rtc_raw_actions"] = raw_actions.copy()
         if debug_timing:
             stage_ms["enc_ae_exec_ms"] = enc_ae_exec_ms
             stage_ms["enc_ae_mode"] = {
