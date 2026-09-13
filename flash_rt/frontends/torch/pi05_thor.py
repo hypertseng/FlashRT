@@ -38,7 +38,7 @@ import torch.nn.functional as F
 
 import flash_rt.flash_rt_kernels as fvk
 from flash_rt.core.cuda_buffer import CudaBuffer
-from flash_rt.core.utils.actions import unnormalize_actions, LIBERO_ACTION_DIM
+from flash_rt.core.utils.actions import normalize_state, unnormalize_actions
 from flash_rt.core.utils.pi05_prompt import PI05_STATE_PROMPT_MAX_LEN
 from flash_rt.core.quant.calibrator import load_calibration, save_calibration
 
@@ -161,7 +161,9 @@ class Pi05TorchFrontendThor:
                  use_cuda_graph: bool = True, autotune: int = 3,
                  use_fp8: bool = True, state_prompt_mode: str = "exact",
                  state_prompt_fixed_max_len: Optional[int] = None,
-                 use_fa4: bool = False, rtc_prefix_len: int = 0):
+                 use_fa4: bool = False, rtc_prefix_len: int = 0,
+                 action_dim: Optional[int] = None,
+                 action_horizon: Optional[int] = None):
         """
         Args:
             autotune: CUDA Graph autotune trials per set_prompt().
@@ -170,12 +172,58 @@ class Pi05TorchFrontendThor:
         """
         checkpoint_dir = pathlib.Path(checkpoint_dir)
         self.num_views = num_views
+        config = {}
+        config_path = checkpoint_dir / "config.json"
+        if config_path.exists():
+            with config_path.open(encoding="utf-8") as stream:
+                config = json.load(stream)
+        output_shape = (
+            config.get("output_features", {}).get("action", {}).get("shape", [])
+        )
+        configured_dim = int(output_shape[0]) if output_shape else 7
+        configured_horizon = int(
+            config.get("n_action_steps")
+            or config.get("chunk_size")
+            or config.get("n_action_steps", 10)
+        )
+        self.action_dim = int(action_dim or configured_dim)
+        self.action_horizon = int(action_horizon or configured_horizon)
+        normalization_mapping = config.get("normalization_mapping", {})
+        self._action_norm_mode = normalization_mapping.get("ACTION", "QUANTILES")
+        self._state_norm_mode = normalization_mapping.get("STATE", "QUANTILES")
+        if self.action_dim <= 0 or self.action_horizon <= 0:
+            raise ValueError("action_dim and action_horizon must be positive")
         self.use_cuda_graph = use_cuda_graph
         self.use_fp8 = bool(use_fp8)
         self.use_fa4 = bool(use_fa4)
+        # State is rendered into the Pi0.5 language prefix. Its
+        # SentencePiece length can change between control ticks.
+        mode = os.environ.get("FLASHRT_PI05_STATE_PROMPT_MODE",
+                              state_prompt_mode)
+        if mode not in ("exact", "fixed"):
+            raise ValueError(
+                "state_prompt_mode must be 'exact' or 'fixed', "
+                f"got {mode!r}")
+        self._state_prompt_mode = mode
+        fixed_cap = PI05_STATE_PROMPT_MAX_LEN
+        if mode == "fixed":
+            fixed_cap = os.environ.get(
+                "FLASHRT_PI05_STATE_PROMPT_FIXED_MAX_LEN",
+                state_prompt_fixed_max_len)
+            if fixed_cap is None:
+                fixed_cap = PI05_STATE_PROMPT_MAX_LEN
+            fixed_cap = int(fixed_cap)
+            if fixed_cap <= 0:
+                raise ValueError(
+                    "state_prompt_fixed_max_len must be a positive integer, "
+                    f"got {fixed_cap}")
+        self._state_prompt_fixed_max_len = int(fixed_cap)
+        self._fixed_shape_active = False
         self._rtc_prefix_len = max(0, int(rtc_prefix_len))
-        if self._rtc_prefix_len > 10:
-            raise ValueError("rtc_prefix_len must be <= action horizon 10")
+        if self._rtc_prefix_len > self.action_horizon:
+            raise ValueError(
+                f"rtc_prefix_len must be <= action horizon {self.action_horizon}"
+            )
         self._rtc_prev_action_chunk = None
         self.autotune = int(autotune) if autotune is not True else 3
         if autotune is False:
@@ -282,14 +330,26 @@ class Pi05TorchFrontendThor:
         from flash_rt.core.utils.norm_stats import (
             load_norm_stats, lerobot_candidates,
         )
-        candidates = [
-            checkpoint_dir / "assets" / "physical-intelligence" / "libero" / "norm_stats.json",
-            checkpoint_dir.parent / "pi05_libero" / "assets" / "physical-intelligence" / "libero" / "norm_stats.json",
-            checkpoint_dir / "norm_stats.json",
-            pathlib.Path("/root/.cache/openpi/openpi-assets/checkpoints/pi05_libero/"
-                         "assets/physical-intelligence/libero/norm_stats.json"),
-            *lerobot_candidates(checkpoint_dir),
-        ]
+        # A LeRobot policy pair belongs to this exact checkpoint and must win
+        # over any sibling pi05_libero fallback. load_norm_stats scans the
+        # pair after its explicit JSON candidates, so pass no candidates in
+        # this case rather than allowing an unrelated JSON file to win first.
+        has_lerobot_policy_stats = bool(list(checkpoint_dir.glob(
+            "policy_preprocessor_step_*_normalizer_processor.safetensors"
+        ))) and bool(list(checkpoint_dir.glob(
+            "policy_postprocessor_step_*_unnormalizer_processor.safetensors"
+        )))
+        if has_lerobot_policy_stats:
+            candidates = []
+        else:
+            candidates = [
+                checkpoint_dir / "assets" / "physical-intelligence" / "libero" / "norm_stats.json",
+                checkpoint_dir / "norm_stats.json",
+                *lerobot_candidates(checkpoint_dir),
+                checkpoint_dir.parent / "pi05_libero" / "assets" / "physical-intelligence" / "libero" / "norm_stats.json",
+                pathlib.Path("/root/.cache/openpi/openpi-assets/checkpoints/pi05_libero/"
+                             "assets/physical-intelligence/libero/norm_stats.json"),
+            ]
         self.norm_stats = load_norm_stats(
             candidates, checkpoint_dir=checkpoint_dir)
 
@@ -476,7 +536,7 @@ class Pi05TorchFrontendThor:
         self._enc_rope = torch.empty(Se_max, 256, dtype=fp16, device='cuda')
 
         # KV cache
-        Sa, Da, Ha, La = 10, 1024, 4096, 18
+        Sa, Da, Ha, La = self.action_horizon, 1024, 4096, 18
         self.Sa = Sa; self.Da = Da; self.Ha = Ha; self.La = La
         total_keys_max = Se_max + Sa
         self._Kc = torch.zeros(Le, total_keys_max, HDe, dtype=fp16, device='cuda')
@@ -1406,8 +1466,9 @@ class Pi05TorchFrontendThor:
         latency_ms = (time.perf_counter() - t0) * 1000
         self.latency_records.append(latency_ms)
 
-        unnorm = unnormalize_actions(raw_actions, self.norm_stats)
-        robot_actions = unnorm[:, :LIBERO_ACTION_DIM]
+        unnorm = unnormalize_actions(
+            raw_actions, self.norm_stats, self._action_norm_mode)
+        robot_actions = unnorm[:, :self.action_dim]
         if debug:
             logger.info(
                 "CFG raw[0,:5]: %s, latency: %.1f ms (beta=%.2f)",
@@ -1439,10 +1500,18 @@ class Pi05TorchFrontendThor:
                 self._in_rl_set_prompt = False
             return
 
+        if state is not None:
+            state = normalize_state(state, self.norm_stats, self._state_norm_mode)
+
         S_sig = self.sig_S
         nv = self.num_views
 
         # ---- Tokenize ----
+        fixed_shape = (
+            self._state_prompt_mode == "fixed"
+            and state is not None
+            and self._rl_config is None
+        )
         if isinstance(prompt_text, (np.ndarray, list)):
             token_ids = np.asarray(prompt_text, dtype=np.int64)
             prompt_len = len(token_ids)
@@ -1450,30 +1519,68 @@ class Pi05TorchFrontendThor:
                 torch.from_numpy(token_ids).long().cuda(), self.embedding_weight)
             embeds = embeds * float(embeds.shape[-1] ** 0.5)
         else:
-            max_len = PI05_STATE_PROMPT_MAX_LEN if state is not None else 48
+            max_len = (self._state_prompt_fixed_max_len if fixed_shape
+                       else PI05_STATE_PROMPT_MAX_LEN)
+            max_len = max_len if state is not None else 48
             embeds, prompt_len = embed_prompt(
                 prompt_text, self.embedding_weight, max_len=max_len,
                 state=state)
 
-        # Se must be EVEN for cuBLASLt FP8
-        Se = S_sig + prompt_len
-        if Se % 2 != 0:
-            Se += 1
-        actual_lang = Se - S_sig
-        if actual_lang > prompt_len:
-            embeds = torch.cat([embeds, embeds[-1:]], dim=0)
+        if fixed_shape:
+            # Pad to a stable graph shape, but mask the unused tail in
+            # attention; padding must not become meaningful language tokens.
+            Se = S_sig + self._state_prompt_fixed_max_len
+            if Se % 2 != 0:
+                Se += 1
+            actual_lang = Se - S_sig
+            valid_lang = prompt_len
+            if (S_sig + valid_lang) % 2 != 0:
+                valid_lang += 1
+            if valid_lang > actual_lang:
+                raise ValueError(
+                    f"prompt_len {prompt_len} exceeds fixed state prompt "
+                    f"capacity {actual_lang}")
+            padded = torch.zeros(
+                (actual_lang, embeds.shape[-1]), dtype=embeds.dtype,
+                device=embeds.device)
+            padded[:prompt_len].copy_(embeds[:prompt_len])
+            if valid_lang > prompt_len:
+                padded[prompt_len:valid_lang].copy_(embeds[-1:])
+            embeds = padded
+            valid_prefix = S_sig + valid_lang
+        else:
+            # Se must be EVEN for cuBLASLt FP8
+            Se = S_sig + prompt_len
+            if Se % 2 != 0:
+                Se += 1
+            actual_lang = Se - S_sig
+            if actual_lang > prompt_len:
+                embeds = torch.cat([embeds, embeds[-1:]], dim=0)
+            valid_prefix = Se
 
         if (self.graph_captured and self._lang_emb is not None
-                and self._S_lang == actual_lang and self.Se == Se):
+                and self._S_lang == actual_lang and self.Se == Se
+                and self._fixed_shape_active == fixed_shape):
             self._lang_emb.copy_(embeds)
+            dec_start = valid_prefix if fixed_shape else Se
+            self._dec_rope.copy_(
+                torch.cat([
+                    self._kc_t[dec_start:dec_start + self.Sa, :, None],
+                    self._ks_t[dec_start:dec_start + self.Sa, :, None],
+                ], dim=2).reshape(self.Sa, 256))
+            self._attn.set_fixed_shape(fixed_shape)
+            if fixed_shape:
+                self._attn.set_fixed_valid_len(valid_prefix)
             logger.info(
                 "Updated Pi0.5 Thor prompt in place: '%s' "
-                "(%d tokens, Se=%d, state=%s)",
-                prompt_text, prompt_len, Se, state is not None)
+                "(%d tokens, Se=%d, state=%s, mode=%s)",
+                prompt_text, prompt_len, Se, state is not None,
+                "fixed" if fixed_shape else "exact")
             return
 
         self.Se = Se
         self.total_keys = Se + self.Sa
+        self._fixed_shape_active = fixed_shape
 
         # Stage 1.4 — build AttentionBackend. total_keys must be set first
         # because the encoder/decoder KV cache layer_stride is computed from
@@ -1515,6 +1622,9 @@ class Pi05TorchFrontendThor:
             },
             use_fa4=self.use_fa4,
         )
+        self._attn.set_fixed_shape(fixed_shape)
+        if fixed_shape:
+            self._attn.set_fixed_valid_len(valid_prefix)
 
         self._lang_emb = embeds
         self._S_lang = actual_lang
@@ -1529,7 +1639,7 @@ class Pi05TorchFrontendThor:
         self._enc_rope[:Se].copy_(
             torch.cat([self._kc_t[:Se, :, None],
                        self._ks_t[:Se, :, None]], dim=2).reshape(Se, 256))
-        dec_start = Se
+        dec_start = valid_prefix if fixed_shape else Se
         self._dec_rope.copy_(
             torch.cat([self._kc_t[dec_start:dec_start + self.Sa, :, None],
                        self._ks_t[dec_start:dec_start + self.Sa, :, None]], dim=2)
@@ -1614,7 +1724,9 @@ class Pi05TorchFrontendThor:
         self.graph_captured = True
         self.calibrated = True
         self._current_prompt = prompt_text
-        logger.info("set_prompt done: '%s' (%d tokens, Se=%d)", prompt_text, prompt_len, Se)
+        logger.info("set_prompt done: '%s' (%d tokens, Se=%d, mode=%s)",
+                    prompt_text, prompt_len, Se,
+                    "fixed" if fixed_shape else "exact")
 
     # -----------------------------------------------------------------------
     # Calibration
@@ -2125,6 +2237,7 @@ class Pi05TorchFrontendThor:
             'qw':         self._dec_qkv_flat.data_ptr(),
             'Kc':         self._Kc.reshape(-1).data_ptr(),
             'Vc':         self._Vc.reshape(-1).data_ptr(),
+            'dec_devpos': self._attn.dec_devpos.data_ptr(),
             'ow':         self._dec_o_flat.data_ptr(),
             'sf':         self._sf_all.data_ptr(),
             'gw':         self._dec_gu_flat.data_ptr(),
@@ -2142,6 +2255,7 @@ class Pi05TorchFrontendThor:
             'S': Sa, 'D': Da, 'H': Ha, 'NH': 8, 'HD': 256,
             'steps': 10, 'layers': La, 'enc_seq': Se,
             'total_keys': total_keys,
+            'fixed_shape': self._fixed_shape_active,
         }
 
         # Warmup
@@ -2921,9 +3035,9 @@ class Pi05TorchFrontendThor:
         for b in range(self.B):
             raw = self._g_noise_b2[b * self.Sa : (b + 1) * self.Sa
                                     ].float().cpu().numpy()
-            unnorm = unnormalize_actions(raw, self.norm_stats)
+            unnorm = unnormalize_actions(raw, self.norm_stats, self._action_norm_mode)
             results.append(
-                {"actions": unnorm[:, :LIBERO_ACTION_DIM]})
+                {"actions": unnorm[:, :self.action_dim]})
         return results
 
     def _run_serial_batch(self, obs_list, prompts):
@@ -2983,9 +3097,13 @@ class Pi05TorchFrontendThor:
         for item in batch_data:
             obs = item['observation']
             prompt_text = item['prompt']
+            state = obs.get('state')
 
             embeds, S_lang = self._get_prompt_bank_entry(
-                prompt_text, max_len=48)
+                prompt_text,
+                max_len=PI05_STATE_PROMPT_MAX_LEN if state is not None else 48,
+                state=state,
+            )
 
             if 'images' in obs:
                 img_list = obs['images']
@@ -2999,6 +3117,7 @@ class Pi05TorchFrontendThor:
             samples.append({
                 'obs': obs,
                 'prompt': prompt_text,
+                'state': state,
                 'images': img_list,
                 'embeds': embeds,
                 'S_lang': S_lang,
@@ -3019,7 +3138,9 @@ class Pi05TorchFrontendThor:
         # production use).
         if not hasattr(self, '_lang_emb') or self._lang_emb is None:
             longest_sample = max(samples, key=lambda s: s['S_lang'])
-            self.set_prompt(longest_sample['prompt'])
+            self.set_prompt(
+                longest_sample['prompt'], state=longest_sample.get('state')
+            )
 
         if int(getattr(self, "_S_lang", 0) or 0) != int(batch_S_lang):
             self._S_lang = int(batch_S_lang)
@@ -3301,8 +3422,8 @@ class Pi05TorchFrontendThor:
         results = []
         for b in range(B):
             raw = raw_all[b * self.Sa:(b + 1) * self.Sa]
-            unnorm = unnormalize_actions(raw, self.norm_stats)
-            results.append({"actions": unnorm[:, :LIBERO_ACTION_DIM]})
+            unnorm = unnormalize_actions(raw, self.norm_stats, self._action_norm_mode)
+            results.append({"actions": unnorm[:, :self.action_dim]})
 
         # Step 8: Restore attention slots to serial defaults
         # Batch modified _attn._slots['encoder'] to point to _Kc_b2/_Vc_b2.
@@ -3422,7 +3543,7 @@ class Pi05TorchFrontendThor:
             observation: dict with 'image' and 'wrist_image' (or 'images' list).
                          Each image is (224,224,3) uint8 or float16 numpy.
         Returns:
-            {"actions": np.ndarray}  shape (Sa, LIBERO_ACTION_DIM)
+            {"actions": np.ndarray}  shape (Sa, action_dim)
         """
         if self._rl_config is not None:
             return self._infer_cfg(observation, debug, seed)
@@ -3611,8 +3732,9 @@ class Pi05TorchFrontendThor:
 
         # ---- Post-process ----
         raw_actions = self._g_noise.float().cpu().numpy()
-        unnorm = unnormalize_actions(raw_actions, self.norm_stats)
-        robot_actions = unnorm[:, :LIBERO_ACTION_DIM]
+        unnorm = unnormalize_actions(
+            raw_actions, self.norm_stats, self._action_norm_mode)
+        robot_actions = unnorm[:, :self.action_dim]
         _mark("postprocess")
 
         if debug_timing:
@@ -3722,7 +3844,7 @@ class Pi05TorchFrontendThor:
             seed: optional numpy seed for deterministic noise.
 
         Returns:
-            {"actions": np.ndarray} shape (Sa, LIBERO_ACTION_DIM)
+            {"actions": np.ndarray} shape (Sa, action_dim)
             On the first call, returns actions for frame 0.
             On subsequent calls, returns actions for the PREVIOUS frame
             (the one whose decoder just completed).
@@ -3778,8 +3900,9 @@ class Pi05TorchFrontendThor:
             self.latency_records.append(latency_ms)
 
             raw_actions = self._g_noise.float().cpu().numpy()
-            unnorm = unnormalize_actions(raw_actions, self.norm_stats)
-            return {"actions": unnorm[:, :LIBERO_ACTION_DIM]}
+            unnorm = unnormalize_actions(
+                raw_actions, self.norm_stats, self._action_norm_mode)
+            return {"actions": unnorm[:, :self.action_dim]}
 
         # ---- Subsequent frames: pipelined execution ----
 
@@ -3872,8 +3995,9 @@ class Pi05TorchFrontendThor:
 
         # Return actions from the PREVIOUS frame's decoder
         raw_actions = self._g_noise.float().cpu().numpy()
-        unnorm = unnormalize_actions(raw_actions, self.norm_stats)
-        return {"actions": unnorm[:, :LIBERO_ACTION_DIM]}
+        unnorm = unnormalize_actions(
+            raw_actions, self.norm_stats, self._action_norm_mode)
+        return {"actions": unnorm[:, :self.action_dim]}
 
     # -----------------------------------------------------------------------
     # Real-data recalibration (called once after first real image)
