@@ -543,9 +543,10 @@ def encoder_forward(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None,
             down_gemm(hid_fp8, weights['down_w'][l], x,
                       Se, D, H, alpha_host[l * 4 + 3], 1.0, stream)
 
-            # ── 11. Residual writeback. The next layer recomputes C1
-            # RMSNorm→FP8, so no FP8 output is consumed here.
-            fvk.residual_add_fp16(x, fg, Se * D, stream)
+            # The down GEMM above writes directly to ``x`` with beta=1.0,
+            # therefore the FFN residual is already complete.  Do not add
+            # ``fg`` again here: it still contains the attention O projection
+            # and doing so double-counts the attention residual once per layer.
 
     # x[Se, D] now contains final encoder output
 

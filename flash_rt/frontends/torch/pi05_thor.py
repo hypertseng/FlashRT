@@ -38,7 +38,7 @@ import torch.nn.functional as F
 
 import flash_rt.flash_rt_kernels as fvk
 from flash_rt.core.cuda_buffer import CudaBuffer
-from flash_rt.core.utils.actions import normalize_state, unnormalize_actions
+from flash_rt.core.utils.actions import unnormalize_actions
 from flash_rt.core.utils.pi05_prompt import PI05_STATE_PROMPT_MAX_LEN
 from flash_rt.core.quant.calibrator import load_calibration, save_calibration
 
@@ -49,7 +49,24 @@ fp8 = torch.float8_e4m3fn
 
 _CALIBRATION_CACHE_METADATA = {
     "pi05_thor_action_update": "fp32_bias_unscaled_v1",
+    # Invalidate caches produced before force/recompute semantics and
+    # non-finite/zero scale sanitisation were enforced.
+    "pi05_thor_fp8_calibration": "realdata_safe_v2",
 }
+
+
+def _sanitize_fp8_scales(scales, *, minimum=1.0e-12):
+    """Return finite, strictly-positive FP8 dequantisation scales.
+
+    A zero/NaN scale is never meaningful to the static quantisation kernels
+    and can poison all following layers.  Some structurally-unused slots
+    (for example the final encoder layer's skipped projections) are left at
+    zero by calibration; replacing those slots is harmless and keeps the
+    scale buffer safe to reuse across graph variants.
+    """
+    return torch.nan_to_num(
+        scales, nan=minimum, posinf=minimum, neginf=minimum
+    ).clamp_min(minimum)
 
 
 def _tensor_debug_stats(name, tensor):
@@ -195,6 +212,12 @@ class Pi05TorchFrontendThor:
             raise ValueError("action_dim and action_horizon must be positive")
         self.use_cuda_graph = use_cuda_graph
         self.use_fp8 = bool(use_fp8)
+        def _component_fp8(force_var: str) -> bool:
+            forced = os.environ.get(force_var, "0").lower()
+            return self.use_fp8 and forced not in ("1", "true", "yes", "on")
+        self._siglip_use_fp8 = _component_fp8("FLASHRT_FORCE_SIGLIP_FP16")
+        self._encoder_use_fp8 = _component_fp8("FLASHRT_FORCE_ENCODER_FP16")
+        self._decoder_use_fp8 = _component_fp8("FLASHRT_FORCE_DECODER_FP16")
         self.use_fa4 = bool(use_fa4)
         # State is rendered into the Pi0.5 language prefix. Its
         # SentencePiece length can change between control ticks.
@@ -263,7 +286,20 @@ class Pi05TorchFrontendThor:
         self.latency_records = []
         self.calibrated = False
         self.graph_captured = False
-        self._real_data_calibrated = False
+        # Encoder/decoder activation calibration is component-specific.  The
+        # vision tower does not consume these scale buffers, so a mixed path
+        # with FP8 SigLIP and FP16 encoder/decoder must not pay calibration or
+        # graph-recapture costs at every state-conditioned prompt update.
+        self._needs_activation_calibration = (
+            self._encoder_use_fp8 or self._decoder_use_fp8
+        )
+        self._skip_realdata_recalibration = os.environ.get(
+            "FLASHRT_SKIP_REALDATA_RECALIB", "0"
+        ).strip().lower() in ("1", "true", "yes", "on")
+        self._real_data_calibrated = (
+            not self._needs_activation_calibration
+            or self._skip_realdata_recalibration
+        )
 
         # ---- RL CFG state (set via set_rl_mode) ----
         # When ``_rl_config`` is non-None, ``set_prompt`` builds an
@@ -330,28 +366,74 @@ class Pi05TorchFrontendThor:
         from flash_rt.core.utils.norm_stats import (
             load_norm_stats, lerobot_candidates,
         )
-        # A LeRobot policy pair belongs to this exact checkpoint and must win
-        # over any sibling pi05_libero fallback. load_norm_stats scans the
-        # pair after its explicit JSON candidates, so pass no candidates in
-        # this case rather than allowing an unrelated JSON file to win first.
-        has_lerobot_policy_stats = bool(list(checkpoint_dir.glob(
-            "policy_preprocessor_step_*_normalizer_processor.safetensors"
-        ))) and bool(list(checkpoint_dir.glob(
-            "policy_postprocessor_step_*_unnormalizer_processor.safetensors"
-        )))
-        if has_lerobot_policy_stats:
-            candidates = []
-        else:
-            candidates = [
-                checkpoint_dir / "assets" / "physical-intelligence" / "libero" / "norm_stats.json",
-                checkpoint_dir / "norm_stats.json",
-                *lerobot_candidates(checkpoint_dir),
-                checkpoint_dir.parent / "pi05_libero" / "assets" / "physical-intelligence" / "libero" / "norm_stats.json",
-                pathlib.Path("/root/.cache/openpi/openpi-assets/checkpoints/pi05_libero/"
-                             "assets/physical-intelligence/libero/norm_stats.json"),
-            ]
+        # Prefer statistics shipped with this exact LeRobot checkpoint.  This
+        # ordering is required for RoboTwin, where a neighbouring LIBERO model
+        # may expose a compatible-looking but semantically wrong 14-D schema.
+        self._action_norm_mode = "quantile"
+        self._state_norm_mode = "quantile"
+        own_stats = load_norm_stats(
+            [], checkpoint_dir=checkpoint_dir, strict=False)
+        if own_stats is not None:
+            self.norm_stats = own_stats
+            processor_path = checkpoint_dir / "policy_preprocessor.json"
+            if processor_path.exists():
+                with processor_path.open(encoding="utf-8") as stream:
+                    processor = json.load(stream)
+                for step in processor.get("steps", []):
+                    if step.get("registry_name") == "normalizer_processor":
+                        norm_map = step.get("config", {}).get("norm_map", {})
+                        self._action_norm_mode = str(
+                            norm_map.get("ACTION", "quantile")
+                        ).lower()
+                        self._state_norm_mode = str(
+                            norm_map.get("STATE", "quantile")
+                        ).lower()
+                        break
+            logger.info(
+                "Using checkpoint normalization modes: action=%s state=%s",
+                self._action_norm_mode, self._state_norm_mode,
+            )
+            return
+        candidates = [
+            checkpoint_dir / "assets" / "physical-intelligence" / "libero" / "norm_stats.json",
+            checkpoint_dir.parent / "pi05_libero" / "assets" / "physical-intelligence" / "libero" / "norm_stats.json",
+            checkpoint_dir / "norm_stats.json",
+            pathlib.Path("/root/.cache/openpi/openpi-assets/checkpoints/pi05_libero/"
+                         "assets/physical-intelligence/libero/norm_stats.json"),
+            *lerobot_candidates(checkpoint_dir),
+        ]
         self.norm_stats = load_norm_stats(
             candidates, checkpoint_dir=checkpoint_dir)
+
+    def _normalize_state(self, state):
+        if state is None:
+            return None
+        value = np.asarray(state, dtype=np.float32).copy()
+        stats = self.norm_stats.get("state", {})
+        dim = value.shape[-1]
+        if self._state_norm_mode == "mean_std":
+            mean = np.asarray(stats["mean"], dtype=np.float32)[:dim]
+            std = np.asarray(stats["std"], dtype=np.float32)[:dim]
+            return (value - mean) / (std + 1e-8)
+        q01 = np.asarray(stats.get("q01", []), dtype=np.float32)[:dim]
+        q99 = np.asarray(stats.get("q99", []), dtype=np.float32)[:dim]
+        if len(q01) == dim and len(q99) == dim:
+            return np.clip(
+                2.0 * (value - q01) / (q99 - q01 + 1e-6) - 1.0,
+                -1.0, 1.0,
+            )
+        return value
+
+    def _unnormalize_actions(self, actions):
+        if self._action_norm_mode == "mean_std":
+            stats = self.norm_stats["actions"]
+            mean = np.asarray(stats["mean"], dtype=np.float32)
+            std = np.asarray(stats["std"], dtype=np.float32)
+            dim = min(actions.shape[-1], len(mean))
+            result = np.asarray(actions, dtype=np.float32).copy()
+            result[..., :dim] = result[..., :dim] * std[:dim] + mean[:dim]
+            return result
+        return unnormalize_actions(actions, self.norm_stats)
 
     # -----------------------------------------------------------------------
     # Weight loading
@@ -385,20 +467,27 @@ class Pi05TorchFrontendThor:
         #   self._ae_w_scales                                 (72 fp32 scales)
         #   self._{attn,ffn}_mod_{w,b}                        (18-layer lists)
         _src = SafetensorsSource(str(safetensors_path), device='cuda')
-        WeightLoader(source=_src, target=self,
-                     spec=build_spec(use_fp8=self.use_fp8)).run()
+        WeightLoader(
+            source=_src,
+            target=self,
+            spec=build_spec(
+                use_fp8=self.use_fp8,
+                siglip_use_fp8=self._siglip_use_fp8,
+                encoder_use_fp8=self._encoder_use_fp8,
+                decoder_use_fp8=self._decoder_use_fp8,
+            ),
+        ).run()
         # FP16 path: spec drops Quant() / scale_into, so _sig_alpha,
         # _enc_w_scales, _ae_w_scales never get populated. Provide
         # empty placeholders so downstream pointer-dict construction
         # (which still reads these attrs) stays happy — the FP16
         # forward branches ignore them.
-        if not self.use_fp8:
-            if not hasattr(self, '_sig_alpha'):
-                self._sig_alpha = []
-            if not hasattr(self, '_enc_w_scales'):
-                self._enc_w_scales = []
-            if not hasattr(self, '_ae_w_scales'):
-                self._ae_w_scales = []
+        if not hasattr(self, '_sig_alpha'):
+            self._sig_alpha = []
+        if not hasattr(self, '_enc_w_scales'):
+            self._enc_w_scales = []
+        if not hasattr(self, '_ae_w_scales'):
+            self._ae_w_scales = []
 
         self.embedding_weight = g('paligemma_with_expert.paligemma.lm_head.weight')
 
@@ -451,7 +540,7 @@ class Pi05TorchFrontendThor:
         # aliases ``_sig_attn`` since the LN output is consumed by the
         # QKV GEMM before attention overwrites the buffer.
         self._sig_fg = (torch.empty(S_sig, D_sig, dtype=fp16, device='cuda')
-                        if not self.use_fp8 else None)
+                        if not self._siglip_use_fp8 else None)
 
         self._sig_bufs = {
             'x':       self._sig_x.data_ptr(),
@@ -521,6 +610,11 @@ class Pi05TorchFrontendThor:
         # arithmetic still works (the FP16 path never reads it).
         _enc_w_scales = getattr(self, '_enc_w_scales', []) or [0.0] * (Le * 4)
         self._enc_w_dev = torch.tensor(_enc_w_scales, dtype=torch.float32, device='cuda')
+        # Graph construction builds one common encoder weight dictionary for
+        # both precision branches.  Decoder-only FP8 calibration deliberately
+        # skips encoder scale reduction, so initialise this otherwise-unused
+        # host list here; an FP8 encoder calibration overwrites it later.
+        self._enc_alpha_host = [1.0] * (Le * 4)
 
         # RoPE table.  The reference model stores ``inv_freq`` in bfloat16
         # (checkpoint dtype), so the cos/sin phase must be derived from a
@@ -557,7 +651,7 @@ class Pi05TorchFrontendThor:
         # ``rms_norm_fp8_noweight_fp16`` in the FP8 path; ``rms_norm_fp16``
         # takes a weight pointer, so we feed it ones for parity).
         self._enc_ones_fp16 = (torch.ones(De, dtype=fp16, device='cuda')
-                               if not self.use_fp8 else None)
+                               if not self._encoder_use_fp8 else None)
 
         # ===============================================================
         # Decoder / AE  (18 layers, 10 steps)
@@ -715,6 +809,10 @@ class Pi05TorchFrontendThor:
         self._sig_attn_b2 = torch.empty(B * S_sig, D_sig, dtype=fp16, device='cuda')
         self._sig_hidden_b2 = torch.empty(B * S_sig, H_sig, dtype=fp16, device='cuda')
         self._sig_hid_fp8_b2 = torch.zeros(B * S_sig * H_sig, dtype=torch.uint8, device='cuda')
+        self._sig_fg_b2 = (
+            torch.empty(B * S_sig, D_sig, dtype=fp16, device='cuda')
+            if not self._siglip_use_fp8 else None
+        )
         self._postln_scratch_b2 = torch.empty(B * S_sig, D_sig, dtype=fp16, device='cuda')
         self._postln_proj_b2 = (
             torch.empty(B * S_sig, self.De, dtype=fp16, device='cuda')
@@ -920,14 +1018,31 @@ class Pi05TorchFrontendThor:
     def _get_prompt_bank_entry(self, prompt_text, *,
                                max_len: int = 48, state=None):
         """Return even-padded CUDA prompt embeddings for batch inference."""
+        state = self._normalize_state(state)
+
+        def _stable_shape(embeds):
+            if self._state_prompt_mode == "fixed" and state is not None:
+                target = int(self._state_prompt_fixed_max_len)
+                if embeds.shape[0] > target:
+                    raise ValueError(
+                        f"state prompt length {embeds.shape[0]} exceeds fixed "
+                        f"capacity {target}"
+                    )
+                padded = torch.zeros(
+                    (target, embeds.shape[-1]), dtype=embeds.dtype,
+                    device=embeds.device,
+                )
+                padded[:embeds.shape[0]].copy_(embeds)
+                return padded, target
+            if embeds.shape[0] % 2 != 0:
+                embeds = torch.cat([embeds, embeds[-1:]], dim=0)
+            return embeds, int(embeds.shape[0])
+
         if not self.prompt_bank_enabled or not isinstance(prompt_text, str):
             embeds, _ = embed_prompt(
                 prompt_text, self.embedding_weight, max_len=max_len,
                 state=state)
-            S_lang = embeds.shape[0]
-            if S_lang % 2 != 0:
-                embeds = torch.cat([embeds, embeds[-1:]], dim=0)
-                S_lang = embeds.shape[0]
+            embeds, S_lang = _stable_shape(embeds)
             return embeds, S_lang
 
         key = self._prompt_bank_key(prompt_text, max_len, state=state)
@@ -939,10 +1054,7 @@ class Pi05TorchFrontendThor:
         self._prompt_bank_misses += 1
         embeds, prompt_len = embed_prompt(
             prompt_text, self.embedding_weight, max_len=max_len, state=state)
-        S_lang = embeds.shape[0]
-        if S_lang % 2 != 0:
-            embeds = torch.cat([embeds, embeds[-1:]], dim=0)
-            S_lang = embeds.shape[0]
+        embeds, S_lang = _stable_shape(embeds)
         entry = {
             "embeds": embeds.contiguous(),
             "S_lang": int(S_lang),
@@ -1466,8 +1578,7 @@ class Pi05TorchFrontendThor:
         latency_ms = (time.perf_counter() - t0) * 1000
         self.latency_records.append(latency_ms)
 
-        unnorm = unnormalize_actions(
-            raw_actions, self.norm_stats, self._action_norm_mode)
+        unnorm = self._unnormalize_actions(raw_actions)
         robot_actions = unnorm[:, :self.action_dim]
         if debug:
             logger.info(
@@ -1500,8 +1611,7 @@ class Pi05TorchFrontendThor:
                 self._in_rl_set_prompt = False
             return
 
-        if state is not None:
-            state = normalize_state(state, self.norm_stats, self._state_norm_mode)
+        state = self._normalize_state(state)
 
         S_sig = self.sig_S
         nv = self.num_views
@@ -1562,6 +1672,11 @@ class Pi05TorchFrontendThor:
                 and self._S_lang == actual_lang and self.Se == Se
                 and self._fixed_shape_active == fixed_shape):
             self._lang_emb.copy_(embeds)
+            if (self._batched and getattr(self, "_lang_emb_b2", None)
+                    is not None):
+                for batch_index in range(self.B):
+                    self._lang_emb_b2[batch_index, :actual_lang].copy_(
+                        embeds[:actual_lang])
             dec_start = valid_prefix if fixed_shape else Se
             self._dec_rope.copy_(
                 torch.cat([
@@ -1703,17 +1818,25 @@ class Pi05TorchFrontendThor:
         # ---- Capture SigLIP graph first (warmup writes enc_x with real PostLN output) ----
         self._capture_siglip_graph()
 
-        # ---- Calibrate FP8 scales (using SigLIP warmup output in enc_x) ----
-        if self.use_fp8:
-            self._calibrate(Se)
+        # ---- Calibrate only the components that actually execute in FP8 ----
+        if self._needs_activation_calibration:
+            self._calibrate(
+                Se,
+                compute_enc=self._encoder_use_fp8,
+                compute_ae=self._decoder_use_fp8,
+            )
         else:
-            # FP16 path: no calibration needed; populate dummy scales /
-            # alpha so the enc/ae forward dicts stay shape-compatible
-            # (the FP16 branches never read them).
+            # The FP16 branches never read activation scales. Keep stable
+            # placeholder tensors because graph/pointer dictionaries are
+            # shared with FP8 configurations.
             self._enc_calib_scales = torch.zeros(self.Le * 4, dtype=torch.float32, device='cuda')
             self._enc_alpha_host = [1.0] * (self.Le * 4)
             self._ae_calib_scales = torch.zeros(self.steps * self.La * 4, dtype=torch.float32, device='cuda')
-            logger.info("use_fp8=False — skipping FP8 calibration (FP16 baseline)")
+            logger.info(
+                "Skipping encoder/decoder activation calibration "
+                "(encoder_fp8=%s, decoder_fp8=%s)",
+                self._encoder_use_fp8, self._decoder_use_fp8,
+            )
 
         # ---- Capture encoder+decoder graph ----
         if self.autotune > 0:
@@ -1733,7 +1856,7 @@ class Pi05TorchFrontendThor:
     # -----------------------------------------------------------------------
 
     def _calibrate(self, Se, force_recalibrate=False, recompute_enc=False,
-                   compute_ae=True):
+                   compute_enc=True, compute_ae=True):
         """Calibrate encoder + decoder FP8 activation scales.
 
         Args:
@@ -1743,6 +1866,9 @@ class Pi05TorchFrontendThor:
                 data (with flash attention), even if cache hits. This is needed
                 for batch inference where cached scales may have been computed
                 with DIFFERENT images than the current batch.
+            compute_enc: if True, compute encoder FP8 activation scales. If
+                False, run the FP16 encoder only when decoder calibration needs
+                its KV context; no encoder scale reduction is performed.
             compute_ae: if True, also compute decoder (AE) FP8 scales. If False,
                 skip AE calibration (decoder scales must be provided by caller).
                 Skipping AE calibration saves ~20ms per call — critical for
@@ -1754,25 +1880,31 @@ class Pi05TorchFrontendThor:
 
         # Try cache first
         cached = load_calibration(self._checkpoint_path, Se)
-        if (cached is not None
+        if (not force_recalibrate
+                and not recompute_enc
+                and cached is not None
                 and cached.get("metadata") == _CALIBRATION_CACHE_METADATA
                 and len(cached.get("enc_scales", [])) == Le * 4
                 and len(cached.get("ae_scales", [])) == ae_scale_count):
-            self._enc_calib_scales = torch.tensor(
-                cached["enc_scales"], dtype=torch.float32, device='cuda')
-            enc_ws = self._enc_w_dev.cpu().tolist()
-            self._enc_alpha_host = [
-                float(np.float32(self._enc_calib_scales[i].item()) * np.float32(enc_ws[i]))
-                for i in range(Le * 4)]
+            if compute_enc:
+                self._enc_calib_scales.copy_(torch.tensor(
+                    cached["enc_scales"], dtype=torch.float32, device='cuda'))
+                enc_ws = self._enc_w_dev.cpu().tolist()
+                self._enc_alpha_host = [
+                    float(np.float32(self._enc_calib_scales[i].item()) * np.float32(enc_ws[i]))
+                    for i in range(Le * 4)]
             if compute_ae:
-                self._ae_calib_scales = torch.tensor(
-                    cached["ae_scales"], dtype=torch.float32, device='cuda')
-            logger.info("Calibration loaded from cache (enc=%d, ae=%d scales)",
-                        Le * 4, ae_scale_count)
+                self._ae_calib_scales.copy_(torch.tensor(
+                    cached["ae_scales"], dtype=torch.float32, device='cuda'))
             logger.info(
-                "Calibration cache enc stats: %s",
-                _tensor_debug_stats("enc_scale", self._enc_calib_scales),
+                "Calibration loaded from cache (encoder=%s, decoder=%s)",
+                compute_enc, compute_ae,
             )
+            if compute_enc:
+                logger.info(
+                    "Calibration cache enc stats: %s",
+                    _tensor_debug_stats("enc_scale", self._enc_calib_scales),
+                )
             if compute_ae:
                 logger.info(
                     "Calibration cache ae stats: %s",
@@ -1828,30 +1960,31 @@ class Pi05TorchFrontendThor:
         enc_bufs['fp8_scratch'] = _fp8_scratch.data_ptr()
         enc_bufs['ones'] = _ones.data_ptr()
 
-        # Always recompute encoder scales in this path
+        # Populate encoder KV context. Only the FP8 encoder path performs amax
+        # reduction; decoder-only FP8 uses the ordinary FP16 encoder.
         self._Kc.zero_(); self._Vc.zero_()
-        enc_max = torch.zeros(Le * 4, dtype=torch.float32, device='cuda')
-        encoder_forward_calibrate(
-            self._gemm, fvk, enc_bufs, enc_weights, enc_dims,
-            enc_max.data_ptr(), stream=0, attn=self._attn)
+        enc_ws = self._enc_w_dev.cpu().tolist() if compute_enc else []
+        if compute_enc:
+            enc_max = torch.zeros(Le * 4, dtype=torch.float32, device='cuda')
+            encoder_forward_calibrate(
+                self._gemm, fvk, enc_bufs, enc_weights, enc_dims,
+                enc_max.data_ptr(), stream=0, attn=self._attn)
 
-        # In-place copy: REPLACES values but keeps SAME tensor address.
-        # This is critical: any CUDA graphs reading _enc_calib_scales.data_ptr()
-        # will continue reading the same (now-updated) tensor.
-        self._enc_calib_scales.copy_(enc_max)
-        enc_ws = self._enc_w_dev.cpu().tolist()
-        self._enc_alpha_host = [
-            float(np.float32(self._enc_calib_scales[i].item()) * np.float32(enc_ws[i]))
-            for i in range(Le * 4)]
-        logger.info(
-            "Real-data encoder calibration stats: %s",
-            _tensor_debug_stats("enc_scale", self._enc_calib_scales),
-        )
-        logger.info("Encoder calibrated: %d scales", Le * 4)
-        logger.info(
-            "Encoder calibration stats: %s",
-            _tensor_debug_stats("enc_scale", self._enc_calib_scales),
-        )
+            # Preserve the tensor address captured by CUDA graphs.
+            self._enc_calib_scales.copy_(_sanitize_fp8_scales(enc_max))
+            self._enc_alpha_host = [
+                float(np.float32(self._enc_calib_scales[i].item()) * np.float32(enc_ws[i]))
+                for i in range(Le * 4)]
+            logger.info("Encoder calibrated: %d scales", Le * 4)
+            logger.info(
+                "Encoder calibration stats: %s",
+                _tensor_debug_stats("enc_scale", self._enc_calib_scales),
+            )
+        elif compute_ae:
+            encoder_forward(
+                self._gemm, fvk, enc_bufs, enc_weights, enc_dims,
+                stream=0, attn=self._attn, use_fp8=False)
+            logger.info("Encoder FP16 context prepared without FP8 calibration")
 
         # Decoder calibration
         Sa, Da, Ha = self.Sa, self.Da, self.Ha
@@ -1915,7 +2048,7 @@ class Pi05TorchFrontendThor:
             decoder_forward_calibrate(
                 self._ctx, fvk, ae_bufs, ae_weights, ae_dims,
                 ae_max.data_ptr(), stream=0, attn=self._attn)
-            self._ae_calib_scales = ae_max
+            self._ae_calib_scales = _sanitize_fp8_scales(ae_max)
             logger.info("Decoder calibrated: %d scales", ae_scale_count)
             logger.info(
                 "Decoder calibration stats: %s",
@@ -2004,9 +2137,7 @@ class Pi05TorchFrontendThor:
 
     def _capture_siglip_graph(self):
         """Capture patch_embed + SigLIP + PostLN as CUDA graph."""
-        siglip_use_fp8 = self.use_fp8 and os.environ.get(
-            "FLASHRT_FORCE_SIGLIP_FP16", "0"
-        ).lower() not in ("1", "true", "yes", "on")
+        siglip_use_fp8 = self._siglip_use_fp8
         logger.info("SigLIP capture mode: siglip_fp8=%s", siglip_use_fp8)
         # Warmup: zero SigLIP input to match production (g_xs = zeros).
         # patch_embed runs but its output is zeroed before SigLIP to avoid
@@ -2044,7 +2175,7 @@ class Pi05TorchFrontendThor:
             self._sig_x.zero_()
             siglip_forward(self._gemm, fvk, self._sig_bufs, self._sig_weights,
                            self._sig_dims, stream=0, attn=self._attn,
-                           use_fp8=self.use_fp8)
+                           use_fp8=siglip_use_fp8)
             self._postln_project_ops(0)
         torch.cuda.synchronize()
 
@@ -2057,7 +2188,7 @@ class Pi05TorchFrontendThor:
             siglip_forward(
                 self._gemm, fvk, self._sig_bufs, self._sig_weights,
                 self._sig_dims, stream=uint8_stream_int, attn=self._attn,
-                use_fp8=self.use_fp8)
+                use_fp8=siglip_use_fp8)
             self._postln_project_ops(uint8_stream_int)
             self._siglip_u8_graph.capture_end()
         torch.cuda.synchronize()
@@ -2095,7 +2226,8 @@ class Pi05TorchFrontendThor:
             'hidden':  sig_hidden.data_ptr(),
             'hid_fp8': sig_hid_fp8.data_ptr(),
             'x_norm':  sig_attn.data_ptr(),
-            'fg':      0,
+            'fg':      (self._sig_fg_b2.data_ptr()
+                        if self._sig_fg_b2 is not None else 0),
         }
 
         dims = {
@@ -2137,7 +2269,7 @@ class Pi05TorchFrontendThor:
         for _ in range(3):
             siglip_forward_batched(self._gemm, fvk, bufs, self._sig_weights,
                                    dims, stream=0, attn=self._attn,
-                                   use_fp8=self.use_fp8)
+                                   use_fp8=self._siglip_use_fp8)
             postln_project_batched(self._gemm, fvk, postln_bufs,
                                    postln_weights, postln_dims, stream=0)
         torch.cuda.synchronize()
@@ -2152,7 +2284,7 @@ class Pi05TorchFrontendThor:
             self._siglip_batched_graph.capture_begin()
             siglip_forward_batched(self._gemm, fvk, bufs, self._sig_weights,
                                    dims, stream=s_int, attn=self._attn,
-                                   use_fp8=self.use_fp8)
+                                   use_fp8=self._siglip_use_fp8)
             postln_project_batched(self._gemm, fvk, postln_bufs,
                                    postln_weights, postln_dims, stream=s_int)
             self._siglip_batched_graph.capture_end()
@@ -2169,12 +2301,8 @@ class Pi05TorchFrontendThor:
         Le = self.Le; La = self.La; De = self.De; He = self.He
         NHe = self.NHe; HDe = self.HDe
         Sa = self.Sa; Da = self.Da; Ha = self.Ha
-        enc_use_fp8 = self.use_fp8 and os.environ.get(
-            "FLASHRT_FORCE_ENCODER_FP16", "0"
-        ).lower() not in ("1", "true", "yes", "on")
-        dec_use_fp8 = self.use_fp8 and os.environ.get(
-            "FLASHRT_FORCE_DECODER_FP16", "0"
-        ).lower() not in ("1", "true", "yes", "on")
+        enc_use_fp8 = self._encoder_use_fp8
+        dec_use_fp8 = self._decoder_use_fp8
         logger.info("Enc+AE capture modes: encoder_fp8=%s decoder_fp8=%s",
                     enc_use_fp8, dec_use_fp8)
 
@@ -2295,12 +2423,8 @@ class Pi05TorchFrontendThor:
         Le = self.Le; La = self.La; De = self.De; He = self.He
         NHe = self.NHe; HDe = self.HDe
         Sa = self.Sa; Da = self.Da; Ha = self.Ha
-        enc_use_fp8 = self.use_fp8 and os.environ.get(
-            "FLASHRT_FORCE_ENCODER_FP16", "0"
-        ).lower() not in ("1", "true", "yes", "on")
-        dec_use_fp8 = self.use_fp8 and os.environ.get(
-            "FLASHRT_FORCE_DECODER_FP16", "0"
-        ).lower() not in ("1", "true", "yes", "on")
+        enc_use_fp8 = self._encoder_use_fp8
+        dec_use_fp8 = self._decoder_use_fp8
 
         enc_bufs = {
             'x':       self._enc_x.data_ptr(),
@@ -2689,7 +2813,8 @@ class Pi05TorchFrontendThor:
             self._patch_embed_ops(stream_int)
             siglip_forward(self._gemm, fvk, self._sig_bufs,
                            self._sig_weights, self._sig_dims,
-                           stream=stream_int, attn=self._attn)
+                           stream=stream_int, attn=self._attn,
+                           use_fp8=self._siglip_use_fp8)
             self._postln_project_ops(stream_int)
             fvk.gpu_copy(
                 self._enc_x_b2.data_ptr(),
@@ -2704,7 +2829,8 @@ class Pi05TorchFrontendThor:
             self._patch_embed_ops(stream_int)
             siglip_forward(self._gemm, fvk, self._sig_bufs,
                            self._sig_weights, self._sig_dims,
-                           stream=stream_int, attn=self._attn)
+                           stream=stream_int, attn=self._attn,
+                           use_fp8=self._siglip_use_fp8)
             self._postln_project_ops(stream_int)
             fvk.gpu_copy(
                 self._enc_x_b2.data_ptr() + enc_x_slot_bytes,
@@ -3035,7 +3161,7 @@ class Pi05TorchFrontendThor:
         for b in range(self.B):
             raw = self._g_noise_b2[b * self.Sa : (b + 1) * self.Sa
                                     ].float().cpu().numpy()
-            unnorm = unnormalize_actions(raw, self.norm_stats, self._action_norm_mode)
+            unnorm = self._unnormalize_actions(raw)
             results.append(
                 {"actions": unnorm[:, :self.action_dim]})
         return results
@@ -3356,7 +3482,8 @@ class Pi05TorchFrontendThor:
                 'hidden':  self._sig_hidden_b2.data_ptr(),
                 'hid_fp8': self._sig_hid_fp8_b2.data_ptr(),
                 'x_norm':  sig_attn.data_ptr(),
-                'fg':      0,
+                'fg':      (self._sig_fg_b2.data_ptr()
+                            if self._sig_fg_b2 is not None else 0),
             }
             dims_b2 = {
                 'S': S_sig, 'D': self.sig_D, 'H': self.sig_H,
@@ -3366,7 +3493,7 @@ class Pi05TorchFrontendThor:
             siglip_forward_batched(self._gemm, fvk, bufs_b2,
                                    self._sig_weights, dims_b2,
                                    stream=0, attn=self._attn,
-                                   use_fp8=self.use_fp8)
+                                   use_fp8=self._siglip_use_fp8)
             postln_bufs_b2 = {
                 'x_sig':    self._sig_x_b2.data_ptr(),
                 'enc_x_b2': self._enc_x_b2.data_ptr(),
@@ -3422,7 +3549,7 @@ class Pi05TorchFrontendThor:
         results = []
         for b in range(B):
             raw = raw_all[b * self.Sa:(b + 1) * self.Sa]
-            unnorm = unnormalize_actions(raw, self.norm_stats, self._action_norm_mode)
+            unnorm = self._unnormalize_actions(raw)
             results.append({"actions": unnorm[:, :self.action_dim]})
 
         # Step 8: Restore attention slots to serial defaults
@@ -3628,7 +3755,7 @@ class Pi05TorchFrontendThor:
         # scales to refresh, and ``_recalibrate_with_real_data`` reads
         # FP8-specific attrs.
         recalib_executed = False
-        if self.use_fp8 and not self._real_data_calibrated:
+        if self._needs_activation_calibration and not self._real_data_calibrated:
             torch.cuda.synchronize()
             recalib_mode = os.environ.get(
                 "FLASHRT_REALDATA_RECALIB_MODE", "full"
@@ -3732,8 +3859,7 @@ class Pi05TorchFrontendThor:
 
         # ---- Post-process ----
         raw_actions = self._g_noise.float().cpu().numpy()
-        unnorm = unnormalize_actions(
-            raw_actions, self.norm_stats, self._action_norm_mode)
+        unnorm = self._unnormalize_actions(raw_actions)
         robot_actions = unnorm[:, :self.action_dim]
         _mark("postprocess")
 
@@ -3900,8 +4026,7 @@ class Pi05TorchFrontendThor:
             self.latency_records.append(latency_ms)
 
             raw_actions = self._g_noise.float().cpu().numpy()
-            unnorm = unnormalize_actions(
-                raw_actions, self.norm_stats, self._action_norm_mode)
+            unnorm = self._unnormalize_actions(raw_actions)
             return {"actions": unnorm[:, :self.action_dim]}
 
         # ---- Subsequent frames: pipelined execution ----
@@ -3942,13 +4067,13 @@ class Pi05TorchFrontendThor:
                 'Se': self.Se, 'D': self.De, 'H': self.He, 'NH': self.NHe,
                 'HD': self.HDe, 'L': self.Le, 'total_keys': self.total_keys,
             }
-            if self.use_fp8:
+            if self._encoder_use_fp8:
                 enc_weights['act_scales'] = self._enc_calib_scales.data_ptr()
                 enc_weights['alpha_host'] = self._enc_alpha_host
             s_enc = self._enc_stream.cuda_stream
             encoder_forward(self._gemm, fvk, enc_bufs, enc_weights,
                            enc_dims, stream=s_enc, attn=self._attn,
-                           use_fp8=self.use_fp8)
+                           use_fp8=self._encoder_use_fp8)
 
         # 3. Decoder for PREVIOUS frame on dec_stream (reads from dec_Kc/dec_Vc)
         with torch.cuda.stream(self._dec_stream):
@@ -3982,7 +4107,7 @@ class Pi05TorchFrontendThor:
             s_dec = self._dec_stream.cuda_stream
             decoder_forward(self._ctx, fvk, ae_bufs, ae_weights,
                            ae_dims, stream=s_dec, attn=self._attn,
-                           use_fp8=self.use_fp8)
+                           use_fp8=self._decoder_use_fp8)
 
         # 4. Wait for both streams
         torch.cuda.synchronize()
@@ -3995,8 +4120,7 @@ class Pi05TorchFrontendThor:
 
         # Return actions from the PREVIOUS frame's decoder
         raw_actions = self._g_noise.float().cpu().numpy()
-        unnorm = unnormalize_actions(
-            raw_actions, self.norm_stats, self._action_norm_mode)
+        unnorm = self._unnormalize_actions(raw_actions)
         return {"actions": unnorm[:, :self.action_dim]}
 
     # -----------------------------------------------------------------------
@@ -4117,6 +4241,9 @@ class Pi05TorchFrontendThor:
             self._gemm, fvk, enc_bufs, enc_weights, enc_dims,
             self._enc_calib_scales.data_ptr(), stream=0, attn=self._attn)
         torch.cuda.synchronize()
+        self._enc_calib_scales.copy_(
+            _sanitize_fp8_scales(self._enc_calib_scales)
+        )
 
         enc_ws = self._enc_w_dev.cpu().tolist()
         self._enc_alpha_host = [
@@ -4180,6 +4307,9 @@ class Pi05TorchFrontendThor:
             self._ctx, fvk, ae_bufs, ae_weights, ae_dims,
             self._ae_calib_scales.data_ptr(), stream=0, attn=self._attn)
         torch.cuda.synchronize()
+        self._ae_calib_scales.copy_(
+            _sanitize_fp8_scales(self._ae_calib_scales)
+        )
         logger.info(
             "Real-data decoder calibration stats: %s",
             _tensor_debug_stats("ae_scale", self._ae_calib_scales),
