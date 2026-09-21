@@ -27,6 +27,7 @@ import math
 import os
 import pathlib
 import time
+from collections import OrderedDict
 from typing import Optional, Union
 
 import numpy as np
@@ -638,7 +639,7 @@ class Pi05TorchFrontendRtx:
         self._cudart = _cudart
 
         # Keep the B=1 runtime isolated from exact-B serving runtimes.  Each
-        # batch size owns its attention buffers; each (B, prompt length) owns
+        # batch size owns its attention buffers; each (B, prompt bucket) owns
         # its pipeline/CUDA graph.  Switching B therefore restores resident
         # graphs instead of destructively rebuilding the previous shape.
         self._single_attn_backend = self.attn_backend
@@ -650,10 +651,62 @@ class Pi05TorchFrontendRtx:
         self._batch_staging_cache: dict[int, tuple] = {}
         self._batch_graph_cache_size = max(
             1, int(os.environ.get("FLASHRT_RTX_BATCH_GRAPH_CACHE_SIZE", "1")))
+        bucket_text = os.environ.get(
+            "FLASHRT_RTX_PROMPT_BUCKETS", "64,128,200")
+        self._batch_prompt_buckets = tuple(sorted({
+            int(value.strip()) for value in bucket_text.split(",")
+            if value.strip() and int(value.strip()) > 0
+        }))
+        if not self._batch_prompt_buckets:
+            raise ValueError("FLASHRT_RTX_PROMPT_BUCKETS must not be empty")
+        self._prompt_embedding_cache_size = max(
+            0, int(os.environ.get("FLASHRT_RTX_PROMPT_CACHE_SIZE", "64")))
+        self._prompt_embedding_cache: OrderedDict[tuple, tuple[np.ndarray, int]] = (
+            OrderedDict())
+        self._prompt_cache_hits = 0
+        self._prompt_cache_misses = 0
 
         logger.info(
             "Pi05TorchFrontendRtx initialised (num_views=%d, chunk=%d, fp8_layout=%s)",
             self.num_views, self.chunk_size, self.fp8_layout)
+
+    @staticmethod
+    def _prompt_state_cache_key(state):
+        if state is None:
+            return None
+        arr = np.ascontiguousarray(np.asarray(state))
+        return (arr.shape, str(arr.dtype), arr.tobytes())
+
+    def _embed_prompt_cached(self, prompt_text: str, *, max_len: int,
+                             state=None) -> tuple[np.ndarray, int]:
+        """Return CPU BF16-bit embeddings from a bounded request cache."""
+        key = (str(prompt_text), int(max_len),
+               self._prompt_state_cache_key(state))
+        cached = self._prompt_embedding_cache.get(key)
+        if cached is not None:
+            self._prompt_embedding_cache.move_to_end(key)
+            self._prompt_cache_hits += 1
+            return cached
+        embeds, prompt_len = _embed_prompt(
+            prompt_text, self.embedding_weight, max_len=max_len, state=state)
+        embeds_np = np.ascontiguousarray(
+            embeds.contiguous().view(torch.uint16).cpu().numpy())
+        self._prompt_cache_misses += 1
+        if self._prompt_embedding_cache_size > 0:
+            self._prompt_embedding_cache[key] = (embeds_np, prompt_len)
+            self._prompt_embedding_cache.move_to_end(key)
+            while (len(self._prompt_embedding_cache)
+                   > self._prompt_embedding_cache_size):
+                self._prompt_embedding_cache.popitem(last=False)
+        return embeds_np, prompt_len
+
+    def _prompt_bucket_for(self, prompt_len: int) -> int:
+        for bucket in self._batch_prompt_buckets:
+            if prompt_len <= bucket:
+                return bucket
+        raise ValueError(
+            f"prompt length {prompt_len} exceeds configured RTX buckets "
+            f"{self._batch_prompt_buckets}")
 
     def _ensure_prompt_capacity(self, required_prompt_len: int) -> None:
         """Grow RTX attention buffers before building longer prompt pipelines."""
@@ -1040,8 +1093,8 @@ class Pi05TorchFrontendRtx:
 
         max_len = (PI05_STATE_PROMPT_MAX_LEN if state is not None
                    else MAX_PROMPT_LEN_DEFAULT)
-        embeds, prompt_len = _embed_prompt(
-            prompt_text, self.embedding_weight, max_len=max_len, state=state)
+        embeds_np, prompt_len = self._embed_prompt_cached(
+            prompt_text, max_len=max_len, state=state)
 
         if self._state_prompt_mode == "fixed" and state is not None:
             self._set_prompt_fixed(prompt_len)
@@ -1058,7 +1111,6 @@ class Pi05TorchFrontendRtx:
 
         # Upload language embeds into pipeline's encoder_x slot. In fixed mode
         # set_language_embeds pads to max + updates the seqused/devpos buffers.
-        embeds_np = embeds.contiguous().view(torch.uint16).cpu().numpy()
         self.pipeline.set_language_embeds(embeds_np)
         self._frame_count = 0
         logger.info("Set prompt: '%s' (%d tokens, state=%s, mode=%s)",
@@ -1731,7 +1783,7 @@ class Pi05TorchFrontendRtx:
         """Select an exact-B batched runtime (B=2..8).
 
         Attention buffers are cached per B and CUDA graphs are cached per
-        ``(B, prompt_len)``.  B=2 remains the mandatory shape for the CFG
+        ``(B, prompt_bucket)``.  B=2 remains the mandatory shape for the CFG
         pipeline, while ordinary multi-request serving may use any B in the
         supported range.
         """
@@ -1794,9 +1846,9 @@ class Pi05TorchFrontendRtx:
             prompts: exactly B task descriptions.
             states: optional exactly-B robot state vectors.
 
-        RTX's flat batched encoder currently has no per-slot padding mask, so
-        token lengths must match.  Refusing incompatible batches preserves B1
-        numerical semantics instead of silently attending to zero padding.
+        Prompts are padded to a configured graph bucket.  The batched
+        attention backend receives one valid length per slot, so padded rows
+        never participate in encoder or decoder attention.
         """
         if not getattr(self, "_batched_active", False):
             raise RuntimeError(
@@ -1812,20 +1864,23 @@ class Pi05TorchFrontendRtx:
         if len(states) != B:
             raise ValueError(f"set_prompt_batch expects {B} states, got {len(states)}")
 
-        embeds_list = []
+        embeds_np_list = []
         prompt_lens = []
         for p, state in zip(prompts, states):
             max_len = (PI05_STATE_PROMPT_MAX_LEN if state is not None
                        else MAX_PROMPT_LEN_DEFAULT)
-            e, plen = _embed_prompt(p, self.embedding_weight,
-                                    max_len=max_len, state=state)
-            embeds_list.append(e)
+            e_np, plen = self._embed_prompt_cached(
+                p, max_len=max_len, state=state)
+            embeds_np_list.append(e_np)
             prompt_lens.append(plen)
-        if len(set(prompt_lens)) != 1:
-            raise ValueError(
-                "incompatible_prompt_lengths: RTX batched encoder requires "
-                f"equal token lengths, got {prompt_lens}")
-        target_len = prompt_lens[0]
+        if self.attn_backend.per_slot_mask_enabled:
+            target_len = self._prompt_bucket_for(max(prompt_lens))
+        else:
+            if len(set(prompt_lens)) != 1:
+                raise ValueError(
+                    "incompatible_prompt_lengths: per-slot mask disabled; "
+                    f"got {prompt_lens}")
+            target_len = prompt_lens[0]
 
         if target_len > self.max_prompt_len:
             self._ensure_prompt_capacity(target_len)
@@ -1847,7 +1902,7 @@ class Pi05TorchFrontendRtx:
             gc.collect()
             torch.cuda.empty_cache()
             logger.info(
-                "Building Pi05BatchedPipeline (B=%d) for prompt_len=%d...",
+                "Building Pi05BatchedPipeline (B=%d) for prompt_bucket=%d...",
                 B, target_len)
             pipeline_weights = self._build_pipeline_weights()
             cached = Pi05BatchedPipeline(
@@ -1868,27 +1923,35 @@ class Pi05TorchFrontendRtx:
         if stream is not None:
             self._graph_torch_stream = stream
 
-        embeds_np_list = [
-            np.ascontiguousarray(
-                e.contiguous().view(torch.uint16).cpu().numpy())
-            for e in embeds_list
-        ]
+        padded_embeds = []
+        for embeds_np, prompt_len in zip(embeds_np_list, prompt_lens):
+            padded = np.zeros((target_len, ENC_D), dtype=embeds_np.dtype)
+            padded[:prompt_len] = embeds_np[:prompt_len]
+            padded_embeds.append(padded)
         # B=1 pipeline path is what calibrate_fp8 uses for FP8 scale collection.
         self.pipeline.set_language_embeds(embeds_np_list[0])
-        self.pipeline.set_language_embeds_batch(embeds_np_list)
+        self.pipeline.set_language_embeds_batch(
+            padded_embeds, valid_prompt_lens=prompt_lens)
         self._frame_count = 0
         logger.info(
-            "Set batch prompt (B=%d, prompt_len=%d): %s",
-            B, target_len,
+            "Set batch prompt (B=%d, bucket=%d, valid_lens=%s): %s",
+            B, target_len, prompt_lens,
             [p[:30] + ("…" if len(p) > 30 else "") for p in prompts])
 
     def batch_compatibility_key(self, prompt: str, state=None) -> tuple:
-        """Return the exact RTX encoder-shape key for one request."""
+        """Return non-padding compatibility dimensions for one request."""
         max_len = (PI05_STATE_PROMPT_MAX_LEN if state is not None
                    else MAX_PROMPT_LEN_DEFAULT)
-        _, prompt_len = _embed_prompt(
-            prompt, self.embedding_weight, max_len=max_len, state=state)
-        return (int(prompt_len), self.num_views, self.chunk_size)
+        _, prompt_len = self._embed_prompt_cached(
+            prompt, max_len=max_len, state=state)
+        self._prompt_bucket_for(prompt_len)
+        state_schema = None
+        if state is not None:
+            state_arr = np.asarray(state)
+            state_schema = (state_arr.shape, str(state_arr.dtype))
+        # Different token lengths and even adjacent buckets may share the
+        # largest bucket selected for the batch.  State schemas remain strict.
+        return (state_schema, self.num_views, self.chunk_size)
 
     def _infer_incompatible_serial(self, batch_data: list, seed=None) -> list:
         """Correctness fallback for requests without one encoder shape."""
@@ -2043,7 +2106,11 @@ class Pi05TorchFrontendRtx:
 
     def get_latency_stats(self) -> dict:
         if not self.latency_records:
-            return {}
+            return {
+                "prompt_cache_hits": self._prompt_cache_hits,
+                "prompt_cache_misses": self._prompt_cache_misses,
+                "prompt_cache_entries": len(self._prompt_embedding_cache),
+            }
         lat = np.array(self.latency_records)
         return {
             "count": len(lat),
@@ -2054,6 +2121,9 @@ class Pi05TorchFrontendRtx:
             "p50_ms": float(np.percentile(lat, 50)),
             "p95_ms": float(np.percentile(lat, 95)),
             "hz": float(1000 / np.mean(lat)),
+            "prompt_cache_hits": self._prompt_cache_hits,
+            "prompt_cache_misses": self._prompt_cache_misses,
+            "prompt_cache_entries": len(self._prompt_embedding_cache),
         }
 
     # -----------------------------------------------------------------

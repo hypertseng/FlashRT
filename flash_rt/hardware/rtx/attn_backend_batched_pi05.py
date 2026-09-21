@@ -21,6 +21,7 @@ default for CFG compatibility.
 from __future__ import annotations
 
 import logging
+import os
 
 from .attn_backend import RtxFlashAttnBackend
 
@@ -54,6 +55,8 @@ class RtxFlashAttnBatchedBackendPi05(RtxFlashAttnBackend):
         if batch_size > 8:
             raise ValueError(f"batch_size must be <= 8, got {batch_size}")
         super().__init__(*args, **kwargs)
+        self._per_slot_mask_enabled = (
+            os.environ.get("FLASHRT_RTX_PER_SLOT_MASK", "1") != "0")
         self._batch_size = batch_size
         torch = self._torch
         # Pull the same dtype as the parent's vision Q so we stay
@@ -145,6 +148,17 @@ class RtxFlashAttnBatchedBackendPi05(RtxFlashAttnBackend):
         self._dec_o_accum_b2 = torch.empty(_dec_splits, B, 8, ds, 256,
                                             dtype=torch.float32, device=d)
 
+        # Runtime valid-prefix metadata for bucketed prompt execution.  FA2's
+        # seqused_k argument is one int32 per batch slot, so requests with
+        # different prompt lengths can share a fixed-shape CUDA graph without
+        # allowing padded language rows to participate in attention.
+        self.enc_seqused_b2 = torch.full(
+            (B,), es_max, dtype=torch.int32, device=d)
+        self.dec_seqused_b2 = torch.full(
+            (B,), es_max + ds, dtype=torch.int32, device=d)
+        self.dec_devpos_b2 = torch.full(
+            (B,), es_max, dtype=torch.int32, device=d)
+
     # ──────────────────────────────────────────────────────────────
     # Pointer helpers (additive — parent's ``get_ptrs`` is untouched)
     # ──────────────────────────────────────────────────────────────
@@ -170,6 +184,31 @@ class RtxFlashAttnBatchedBackendPi05(RtxFlashAttnBackend):
     def batch_size(self) -> int:
         """Exact sample batch dimension backed by these buffers."""
         return self._batch_size
+
+    @property
+    def per_slot_mask_enabled(self) -> bool:
+        return self._per_slot_mask_enabled
+
+    def set_batched_valid_prefix_lens(self, valid_prefix_lens) -> None:
+        """Update per-slot encoder/decoder valid lengths without recapture."""
+        torch = self._torch
+        values = torch.as_tensor(
+            valid_prefix_lens, dtype=torch.int32, device="cuda")
+        if values.numel() != self._batch_size:
+            raise ValueError(
+                "valid_prefix_lens must contain one value per batch slot "
+                f"(expected {self._batch_size}, got {values.numel()})")
+        if bool(torch.any(values <= 0)) or bool(
+                torch.any(values > self._encoder_seq_max)):
+            raise ValueError(
+                "valid prefix lengths must be in "
+                f"[1, {self._encoder_seq_max}], got {values.tolist()}")
+        self.enc_seqused_b2.copy_(values)
+        self.dec_seqused_b2.copy_(values + self._chunk_size)
+        self.dec_devpos_b2.copy_(values)
+        # Metadata may be updated on the caller's current stream while replay
+        # happens on the graph stream.  This is a cold request-setup operation.
+        torch.cuda.synchronize()
 
     # ──────────────────────────────────────────────────────────────
     # Batched attention dispatch (additive — parent methods untouched)
@@ -237,10 +276,18 @@ class RtxFlashAttnBatchedBackendPi05(RtxFlashAttnBackend):
         q_c = q.contiguous()
         k_c = k.contiguous()
         v_c = v.contiguous()
-        self._call_fvk_fa2(q_c, k_c, v_c,
-                           o, self._enc_lse_b2, stream=stream,
-                           lse_accum=self._enc_lse_accum_b2,
-                           o_accum=self._enc_o_accum_b2)
+        if self._per_slot_mask_enabled:
+            self._call_fvk_fa2_seqused_splitkv(
+                q_c, k_c, v_c, o, self._enc_lse_b2,
+                self.enc_seqused_b2,
+                lse_accum=self._enc_lse_accum_b2,
+                o_accum=self._enc_o_accum_b2,
+                stream=stream)
+        else:
+            self._call_fvk_fa2(
+                q_c, k_c, v_c, o, self._enc_lse_b2, stream=stream,
+                lse_accum=self._enc_lse_accum_b2,
+                o_accum=self._enc_o_accum_b2)
         if not hasattr(self, "_enc_qkv_o_refs_b2"):
             self._enc_qkv_o_refs_b2 = {}
         self._enc_qkv_o_refs_b2[layer_idx] = (q_c, k_c, v_c, o)
@@ -260,10 +307,18 @@ class RtxFlashAttnBatchedBackendPi05(RtxFlashAttnBackend):
         q_c = q.contiguous()
         k_c = k.contiguous()
         v_c = v.contiguous()
-        self._call_fvk_fa2(q_c, k_c, v_c,
-                           o, self._dec_lse_b2, stream=stream,
-                           lse_accum=self._dec_lse_accum_b2,
-                           o_accum=self._dec_o_accum_b2)
+        if self._per_slot_mask_enabled:
+            self._call_fvk_fa2_seqused_splitkv(
+                q_c, k_c, v_c, o, self._dec_lse_b2,
+                self.dec_seqused_b2,
+                lse_accum=self._dec_lse_accum_b2,
+                o_accum=self._dec_o_accum_b2,
+                stream=stream)
+        else:
+            self._call_fvk_fa2(
+                q_c, k_c, v_c, o, self._dec_lse_b2, stream=stream,
+                lse_accum=self._dec_lse_accum_b2,
+                o_accum=self._dec_o_accum_b2)
         if not hasattr(self, "_dec_qkv_o_refs_b2"):
             self._dec_qkv_o_refs_b2 = []
         self._dec_qkv_o_refs_b2.append((q_c, k_c, v_c, o))
