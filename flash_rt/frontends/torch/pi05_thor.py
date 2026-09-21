@@ -3072,8 +3072,13 @@ class Pi05TorchFrontendThor:
             batch_size, len(self._stream_attn_b2),
             " from graph bank" if restored else "")
 
-    def infer_batch(self, observations):
-        """Run B=N batched inference on a list of observations.
+    def infer_batch(self, observations, seed=None):
+        """Run B=N batched inference.
+
+        The public serving contract accepts either the legacy list of
+        observations (all slots share the active prompt) or a list of
+        ``{"observation", "prompt", "state"}`` request dictionaries.  The
+        latter is the canonical Lingshu multi-robot API.
 
         Stage 2 of the Thor batched-CFG port. Each observation must
         be a dict with the same keys as :meth:`infer`'s ``observation``
@@ -3090,6 +3095,13 @@ class Pi05TorchFrontendThor:
         Pi05ThorCFGBatchedPipeline (which manages cond/uncond
         explicitly).
         """
+        if (
+            observations
+            and isinstance(observations[0], dict)
+            and "observation" in observations[0]
+        ):
+            return self.infer_multi_prompt_batch(observations, seed=seed)
+
         if not self._batched:
             raise RuntimeError(
                 "set_batched_mode(enable=True) must be called first")

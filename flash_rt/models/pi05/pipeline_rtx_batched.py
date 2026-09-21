@@ -1,4 +1,4 @@
-"""FlashRT — Pi0.5 RTX inference pipeline with hardcoded B=2 batched forward.
+"""FlashRT — Pi0.5 RTX inference pipeline with B=N batched forward.
 
 Subclass of :class:`flash_rt.models.pi05.pipeline_rtx.Pi05Pipeline` that
 runs vision + Gemma-2B encoder + Gemma-300M decoder for two independent
@@ -6,9 +6,9 @@ samples in a single forward pass. Sample-batched activation buffers and
 attention buffers live alongside the parent's B=1 buffers; the parent's
 methods are not modified.
 
-Hardcoded B=2 for v0.1.0 — chosen specifically as the foundation for
-:class:`Pi05CFGBatchedPipeline`, which fuses CFG's conditioned and
-unconditioned forwards into a single batched pass.
+The original B=2 implementation remains the foundation for
+:class:`Pi05CFGBatchedPipeline`, but all storage and dispatch dimensions are
+derived from the attention backend's exact batch size.
 
 Calibration: the parent's :meth:`Pi05Pipeline.calibrate_fp8` runs the
 B=1 pipeline once and writes per-tensor activation scales into
@@ -26,7 +26,6 @@ import logging
 
 from flash_rt.core.cuda_buffer import CudaBuffer
 from flash_rt.hardware.rtx.attn_backend_batched_pi05 import (
-    PI05_BATCH_SIZE,
     RtxFlashAttnBatchedBackendPi05,
 )
 
@@ -57,7 +56,7 @@ logger = logging.getLogger(__name__)
 
 
 class Pi05BatchedPipeline(Pi05Pipeline):
-    """Pi0.5 RTX pipeline running B=2 samples in a single forward pass.
+    """Pi0.5 RTX pipeline running B=N samples in a single forward pass.
 
     The constructor requires ``attn_backend`` to be a
     :class:`RtxFlashAttnBatchedBackendPi05` so the batched attention
@@ -72,10 +71,9 @@ class Pi05BatchedPipeline(Pi05Pipeline):
                 "RtxFlashAttnBatchedBackendPi05; got "
                 f"{type(self.attn).__name__}")
         self.B = self.attn.batch_size
-        if self.B != PI05_BATCH_SIZE:
+        if self.B < 2:
             raise ValueError(
-                f"Pi05BatchedPipeline expects B={PI05_BATCH_SIZE}, "
-                f"backend reports {self.B}")
+                f"Pi05BatchedPipeline expects B>=2, backend reports {self.B}")
         self._attn_ptrs_b2 = self.attn.get_ptrs_b2()
         self._allocate_b2_buffers()
 

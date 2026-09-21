@@ -1,4 +1,4 @@
-"""Batched (B=2) Pi0.5 RTX attention backend.
+"""Batched Pi0.5 RTX attention backend.
 
 Subclass of :class:`flash_rt.hardware.rtx.attn_backend.RtxFlashAttnBackend`
 that adds B=2 sample-batched Q/K/V/output buffers for use by
@@ -12,11 +12,10 @@ through the new ``*_batched`` methods added here, which read from the
 new B=2 buffers (suffixed ``_b2``) and dispatch to the same FA2 wrapper
 the parent uses.
 
-Hardcoded B=2 for v0.1.0 — chosen specifically to fuse the cond + uncond
-forwards of classifier-free guidance into a single batched pass
-(arXiv:2511.14759 Appendix E). Wider batch sizes are not exposed today;
-multi-robot RL rollout style B=N use cases are tracked separately as a
-future workstream.
+The historical implementation was fixed at B=2 for classifier-free
+guidance.  The backend is now parameterised by ``batch_size`` so the same
+attention kernels can serve multi-request batches while B=2 remains the
+default for CFG compatibility.
 """
 
 from __future__ import annotations
@@ -27,14 +26,12 @@ from .attn_backend import RtxFlashAttnBackend
 
 logger = logging.getLogger(__name__)
 
-# Hardcoded sample-batch size. The buffers here are sized for exactly
-# this many samples; the pipeline subclass that uses this backend asserts
-# the same value at construction time so the two stay locked.
+# Backwards-compatible default used by the B=2 CFG path.
 PI05_BATCH_SIZE = 2
 
 
 class RtxFlashAttnBatchedBackendPi05(RtxFlashAttnBackend):
-    """Pi0.5-specific RTX attention backend with B=2 sample batching.
+    """Pi0.5-specific RTX attention backend with B=N sample batching.
 
     Adds these slots on top of the parent (all bf16/fp16 per the
     backend's selected dtype):
@@ -50,14 +47,20 @@ class RtxFlashAttnBatchedBackendPi05(RtxFlashAttnBackend):
     same kernel call with a larger leading dim covers two samples.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, batch_size: int = PI05_BATCH_SIZE, **kwargs):
+        batch_size = int(batch_size)
+        if batch_size < 2:
+            raise ValueError(f"batch_size must be >= 2, got {batch_size}")
+        if batch_size > 8:
+            raise ValueError(f"batch_size must be <= 8, got {batch_size}")
         super().__init__(*args, **kwargs)
+        self._batch_size = batch_size
         torch = self._torch
         # Pull the same dtype as the parent's vision Q so we stay
         # consistent across the whole stack.
         bf16 = self.vis_Q.dtype
         d = "cuda"
-        B = PI05_BATCH_SIZE
+        B = self._batch_size
         nv = self._num_views
         es_max = self._encoder_seq_max
         ds = self._chunk_size
@@ -165,8 +168,8 @@ class RtxFlashAttnBatchedBackendPi05(RtxFlashAttnBackend):
 
     @property
     def batch_size(self) -> int:
-        """Hardcoded sample batch dimension (B=2 for the v0.1.0 CFG path)."""
-        return PI05_BATCH_SIZE
+        """Exact sample batch dimension backed by these buffers."""
+        return self._batch_size
 
     # ──────────────────────────────────────────────────────────────
     # Batched attention dispatch (additive — parent methods untouched)

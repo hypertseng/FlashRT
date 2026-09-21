@@ -20,6 +20,7 @@ Usage::
 from __future__ import annotations
 
 import ctypes
+import gc
 import json
 import logging
 import math
@@ -636,6 +637,20 @@ class Pi05TorchFrontendRtx:
         from flash_rt.core.cuda_buffer import _cudart
         self._cudart = _cudart
 
+        # Keep the B=1 runtime isolated from exact-B serving runtimes.  Each
+        # batch size owns its attention buffers; each (B, prompt length) owns
+        # its pipeline/CUDA graph.  Switching B therefore restores resident
+        # graphs instead of destructively rebuilding the previous shape.
+        self._single_attn_backend = self.attn_backend
+        self._batched_active = False
+        self._batch_size = 1
+        self._batch_backend_cache: dict[int, RtxFlashAttnBatchedBackendPi05] = {}
+        self._batch_pipeline_cache: dict[tuple[int, int], Pi05BatchedPipeline] = {}
+        self._batch_stream_cache: dict[tuple[int, int], torch.cuda.Stream] = {}
+        self._batch_staging_cache: dict[int, tuple] = {}
+        self._batch_graph_cache_size = max(
+            1, int(os.environ.get("FLASHRT_RTX_BATCH_GRAPH_CACHE_SIZE", "1")))
+
         logger.info(
             "Pi05TorchFrontendRtx initialised (num_views=%d, chunk=%d, fp8_layout=%s)",
             self.num_views, self.chunk_size, self.fp8_layout)
@@ -651,8 +666,13 @@ class Pi05TorchFrontendRtx:
             encoder_seq_max=enc_seq_max,
             chunk_size=self.chunk_size,
             num_encoder_layers=ENC_L)
+        self._single_attn_backend = self.attn_backend
         self._prompt_pipeline_cache.clear()
         self._fixed_pipeline = None
+        self._batch_backend_cache.clear()
+        self._batch_pipeline_cache.clear()
+        self._batch_stream_cache.clear()
+        self._batch_staging_cache.clear()
         self.pipeline = None
         self.current_prompt_len = 0
         self.graph_recorded = False
@@ -1544,7 +1564,8 @@ class Pi05TorchFrontendRtx:
         """:class:`ModelPrecisionSpec` captured at calibration time."""
         return getattr(self, "_precision_spec", None)
 
-    def infer(self, observation: dict, debug: bool = False) -> dict:
+    def infer(self, observation: dict, debug: bool = False,
+              seed: int | None = None) -> dict:
         """Run inference on a single observation.
 
         All GPU work happens on ``self._graph_torch_stream`` — the same
@@ -1563,7 +1584,7 @@ class Pi05TorchFrontendRtx:
             raise RuntimeError("set_prompt must be called before infer")
 
         if isinstance(self.pipeline, Pi05CFGBatchedPipeline):
-            return self._infer_cfg_batched(observation, debug=debug)
+            return self._infer_cfg_batched(observation, debug=debug, seed=seed)
 
         t0 = time.perf_counter()
 
@@ -1578,7 +1599,12 @@ class Pi05TorchFrontendRtx:
         with torch.cuda.stream(self._graph_torch_stream):
             stream_int = self._graph_torch_stream.cuda_stream
 
-            self._noise_buf.normal_()
+            if seed is None:
+                self._noise_buf.normal_()
+            else:
+                generator = torch.Generator(device="cuda")
+                generator.manual_seed(int(seed) & 0xFFFFFFFF)
+                self._noise_buf.normal_(generator=generator)
             self._copy_tensor_to_pipeline_buf_stream(
                 self._noise_buf, self.pipeline.input_noise_buf, stream_int)
 
@@ -1614,7 +1640,8 @@ class Pi05TorchFrontendRtx:
         return {"actions": robot_actions}
 
     def _infer_cfg_batched(self, observation: dict,
-                           debug: bool = False) -> dict:
+                           debug: bool = False,
+                           seed: int | None = None) -> dict:
         """Batched CFG inference: single obs replicated across cond + uncond slots."""
         t0 = time.perf_counter()
 
@@ -1630,7 +1657,12 @@ class Pi05TorchFrontendRtx:
             # once and copying into both slots ensures the uncond slot
             # starts at the same noise the cond does, which matches
             # the paper-faithful CFG contract.
-            self._noise_buf.normal_()
+            if seed is None:
+                self._noise_buf.normal_()
+            else:
+                generator = torch.Generator(device="cuda")
+                generator.manual_seed(int(seed) & 0xFFFFFFFF)
+                self._noise_buf.normal_(generator=generator)
             for b in range(PI05_BATCH_SIZE):
                 self._noise_buf_b2[b].copy_(self._noise_buf)
 
@@ -1666,134 +1698,222 @@ class Pi05TorchFrontendRtx:
         return {"actions": robot_actions}
 
     # -----------------------------------------------------------------
-    # Batched (B=2) inference path — additive, default API unchanged
+    # Batched B=N inference path — B=1 API remains unchanged
     # -----------------------------------------------------------------
 
-    def set_batched_mode(self, *, enable: bool = True) -> None:
-        """Enable / disable the B=2 batched inference path (opt-in).
+    def _evict_batch_runtimes_for(self, batch_size: int) -> None:
+        """Bound resident exact-B runtimes before allocating a new shape."""
+        if batch_size in self._batch_backend_cache:
+            return
+        while len(self._batch_backend_cache) >= self._batch_graph_cache_size:
+            victim = next(iter(self._batch_backend_cache))
+            victim_backend = self._batch_backend_cache.pop(victim, None)
+            self._batch_staging_cache.pop(victim, None)
+            for key in [key for key in self._batch_pipeline_cache
+                        if key[0] == victim]:
+                pipeline = self._batch_pipeline_cache.pop(key)
+                if self.pipeline is pipeline:
+                    self.pipeline = None
+                self._batch_stream_cache.pop(key, None)
+                del pipeline
+            if self.attn_backend is victim_backend:
+                self.attn_backend = self._single_attn_backend
+            self._img_buf_b2 = None
+            self._noise_buf_b2 = None
+            self._noise_out_b2 = None
+            del victim_backend
+            logger.info("Evicted RTX batch graph runtime B=%d", victim)
+        gc.collect()
+        torch.cuda.empty_cache()
 
-        Once enabled, the next :meth:`set_prompt_batch` call builds a
-        :class:`Pi05BatchedPipeline` (with a
-        :class:`RtxFlashAttnBatchedBackendPi05` attention backend) and
-        :meth:`infer_batch` becomes available. The single-sample
-        :meth:`infer` API path remains untouched.
+    def set_batched_mode(self, *, enable: bool = True,
+                         batch_size: int = PI05_BATCH_SIZE) -> None:
+        """Select an exact-B batched runtime (B=2..8).
 
-        Disabling rebuilds the standard single-sample pipeline on the
-        next :meth:`set_prompt`.
+        Attention buffers are cached per B and CUDA graphs are cached per
+        ``(B, prompt_len)``.  B=2 remains the mandatory shape for the CFG
+        pipeline, while ordinary multi-request serving may use any B in the
+        supported range.
         """
         if not enable:
-            if isinstance(self.pipeline, Pi05BatchedPipeline):
-                self.pipeline = None
-                self.current_prompt_len = 0
-                self.graph_recorded = False
-                self.calibrated = False
-                self._batched_active = False
-            return
-        # Switch to a batched-capable attention backend if not already.
-        if not isinstance(self.attn_backend, RtxFlashAttnBatchedBackendPi05):
-            enc_seq_max = self.num_views * 256 + self.max_prompt_len
-            self.attn_backend = RtxFlashAttnBatchedBackendPi05(
-                num_views=self.num_views,
-                encoder_seq_max=enc_seq_max,
-                chunk_size=self.chunk_size,
-                num_encoder_layers=ENC_L)
-            # Replacing the backend orphans any single-sample pipelines that were
-            # bound to the old one; drop the caches so they are rebuilt on the
-            # new backend (mirrors _ensure_prompt_capacity()).
-            self._prompt_pipeline_cache.clear()
-            self._fixed_pipeline = None
-        self._batched_active = True
-        # Force pipeline rebuild so set_prompt_batch picks the batched class.
-        if not isinstance(self.pipeline, Pi05BatchedPipeline):
+            if self._batch_graph_cache_size == 1:
+                self._evict_batch_runtimes_for(-1)
+            self._batched_active = False
+            self._batch_size = 1
+            self.attn_backend = self._single_attn_backend
             self.pipeline = None
             self.current_prompt_len = 0
             self.graph_recorded = False
             self.calibrated = False
-        # Pre-allocate batched input/output staging tensors.
-        self._img_buf_b2 = torch.empty(
-            PI05_BATCH_SIZE, self.num_views, IMG_HW, IMG_HW, 3,
-            dtype=bf16, device="cuda")
-        self._noise_buf_b2 = torch.empty(
-            PI05_BATCH_SIZE, self.chunk_size, ACTION_DIM,
-            dtype=bf16, device="cuda")
-        self._noise_out_b2 = torch.empty(
-            PI05_BATCH_SIZE, self.chunk_size, ACTION_DIM,
-            dtype=bf16, device="cuda")
-        logger.info(
-            "Pi05TorchFrontendRtx: batched mode enabled (B=%d)",
-            PI05_BATCH_SIZE)
+            return
 
-    def set_prompt_batch(self, prompts: list) -> None:
-        """Set per-sample prompts for the batched pipeline.
+        B = int(batch_size)
+        if not 2 <= B <= 8:
+            raise ValueError(f"batch_size must be in [2, 8], got {B}")
+        if self._rl_config is not None and B != PI05_BATCH_SIZE:
+            raise ValueError("RTX CFG requires its fixed cond/uncond B=2 runtime")
+
+        self._evict_batch_runtimes_for(B)
+        backend = self._batch_backend_cache.get(B)
+        if backend is None:
+            enc_seq_max = self.num_views * 256 + self.max_prompt_len
+            backend = RtxFlashAttnBatchedBackendPi05(
+                num_views=self.num_views,
+                encoder_seq_max=enc_seq_max,
+                chunk_size=self.chunk_size,
+                num_encoder_layers=ENC_L,
+                batch_size=B)
+            self._batch_backend_cache[B] = backend
+
+        staging = self._batch_staging_cache.get(B)
+        if staging is None:
+            staging = (
+                torch.empty(B, self.num_views, IMG_HW, IMG_HW, 3,
+                            dtype=bf16, device="cuda"),
+                torch.empty(B, self.chunk_size, ACTION_DIM,
+                            dtype=bf16, device="cuda"),
+                torch.empty(B, self.chunk_size, ACTION_DIM,
+                            dtype=bf16, device="cuda"),
+            )
+            self._batch_staging_cache[B] = staging
+
+        self.attn_backend = backend
+        self._img_buf_b2, self._noise_buf_b2, self._noise_out_b2 = staging
+        self._batched_active = True
+        self._batch_size = B
+        self.pipeline = None
+        self.current_prompt_len = 0
+        self.graph_recorded = False
+        self.calibrated = False
+        logger.info("Pi05TorchFrontendRtx: batched mode enabled (B=%d)", B)
+
+    def set_prompt_batch(self, prompts: list, states=None) -> None:
+        """Set compatible per-sample prompt/state pairs.
 
         Args:
-            prompts: list of length B (currently 2). Each entry is a
-                task description string. Prompts are individually
-                tokenised, then padded to a common length so the
-                encoder sees a fixed-shape buffer.
+            prompts: exactly B task descriptions.
+            states: optional exactly-B robot state vectors.
+
+        RTX's flat batched encoder currently has no per-slot padding mask, so
+        token lengths must match.  Refusing incompatible batches preserves B1
+        numerical semantics instead of silently attending to zero padding.
         """
         if not getattr(self, "_batched_active", False):
             raise RuntimeError(
                 "set_batched_mode(enable=True) must be called before "
                 "set_prompt_batch")
-        if len(prompts) != PI05_BATCH_SIZE:
+        B = self._batch_size
+        if len(prompts) != B:
             raise ValueError(
-                f"set_prompt_batch expects {PI05_BATCH_SIZE} prompts, "
+                f"set_prompt_batch expects {B} prompts, "
                 f"got {len(prompts)}")
+        if states is None:
+            states = [None] * B
+        if len(states) != B:
+            raise ValueError(f"set_prompt_batch expects {B} states, got {len(states)}")
+
         embeds_list = []
         prompt_lens = []
-        for p in prompts:
+        for p, state in zip(prompts, states):
+            max_len = (PI05_STATE_PROMPT_MAX_LEN if state is not None
+                       else MAX_PROMPT_LEN_DEFAULT)
             e, plen = _embed_prompt(p, self.embedding_weight,
-                                    max_len=MAX_PROMPT_LEN_DEFAULT)
+                                    max_len=max_len, state=state)
             embeds_list.append(e)
             prompt_lens.append(plen)
-        target_len = max(prompt_lens)
+        if len(set(prompt_lens)) != 1:
+            raise ValueError(
+                "incompatible_prompt_lengths: RTX batched encoder requires "
+                f"equal token lengths, got {prompt_lens}")
+        target_len = prompt_lens[0]
 
-        # Pad each embed to target_len (BF16 zeros are valid pad tokens).
-        padded_np_list = []
-        for e, plen in zip(embeds_list, prompt_lens):
-            arr = e.contiguous().view(torch.uint16).cpu().numpy()
-            if plen < target_len:
-                pad = np.zeros(
-                    (target_len - plen, arr.shape[1]), dtype=arr.dtype)
-                arr = np.concatenate([arr, pad], axis=0)
-            padded_np_list.append(np.ascontiguousarray(arr))
+        if target_len > self.max_prompt_len:
+            self._ensure_prompt_capacity(target_len)
+            self.set_batched_mode(enable=True, batch_size=B)
 
-        rebuild = (
-            self.pipeline is None
-            or not isinstance(self.pipeline, Pi05BatchedPipeline)
-            or target_len != self.current_prompt_len)
-
-        if rebuild:
+        key = (B, target_len)
+        cached = self._batch_pipeline_cache.get(key)
+        if cached is None:
+            while len(self._batch_pipeline_cache) >= self._batch_graph_cache_size:
+                victim_key = next(iter(self._batch_pipeline_cache))
+                victim_pipeline = self._batch_pipeline_cache.pop(victim_key)
+                if self.pipeline is victim_pipeline:
+                    self.pipeline = None
+                self._batch_stream_cache.pop(victim_key, None)
+                logger.info(
+                    "Evicted RTX batch graph key B=%d prompt_len=%d",
+                    victim_key[0], victim_key[1])
+                del victim_pipeline
+            gc.collect()
+            torch.cuda.empty_cache()
             logger.info(
                 "Building Pi05BatchedPipeline (B=%d) for prompt_len=%d...",
-                PI05_BATCH_SIZE, target_len)
-            self.current_prompt_len = target_len
-            self.graph_recorded = False
-            self.calibrated = False
+                B, target_len)
             pipeline_weights = self._build_pipeline_weights()
-            self.pipeline = Pi05BatchedPipeline(
+            cached = Pi05BatchedPipeline(
                 gemm=self.gemm, fvk=self.fvk, attn_backend=self.attn_backend,
                 weights=pipeline_weights,
                 num_views=self.num_views,
                 max_prompt_len=target_len,
                 chunk_size=self.chunk_size,
                 **self._pipeline_precision_kwargs())
+            self._batch_pipeline_cache[key] = cached
+        self.pipeline = cached
+        self.current_prompt_len = target_len
+        self.graph_recorded = getattr(cached, "_graph", None) is not None
+        self.calibrated = (
+            self.graph_recorded
+            or bool(getattr(cached, "fp8_calibrated", False)))
+        stream = self._batch_stream_cache.get(key)
+        if stream is not None:
+            self._graph_torch_stream = stream
+
+        embeds_np_list = [
+            np.ascontiguousarray(
+                e.contiguous().view(torch.uint16).cpu().numpy())
+            for e in embeds_list
+        ]
         # B=1 pipeline path is what calibrate_fp8 uses for FP8 scale collection.
-        self.pipeline.set_language_embeds(padded_np_list[0])
-        self.pipeline.set_language_embeds_batch(padded_np_list)
+        self.pipeline.set_language_embeds(embeds_np_list[0])
+        self.pipeline.set_language_embeds_batch(embeds_np_list)
         self._frame_count = 0
         logger.info(
-            "Set batch prompt (B=%d, padded_len=%d): %s",
-            PI05_BATCH_SIZE, target_len,
+            "Set batch prompt (B=%d, prompt_len=%d): %s",
+            B, target_len,
             [p[:30] + ("…" if len(p) > 30 else "") for p in prompts])
+
+    def batch_compatibility_key(self, prompt: str, state=None) -> tuple:
+        """Return the exact RTX encoder-shape key for one request."""
+        max_len = (PI05_STATE_PROMPT_MAX_LEN if state is not None
+                   else MAX_PROMPT_LEN_DEFAULT)
+        _, prompt_len = _embed_prompt(
+            prompt, self.embedding_weight, max_len=max_len, state=state)
+        return (int(prompt_len), self.num_views, self.chunk_size)
+
+    def _infer_incompatible_serial(self, batch_data: list, seed=None) -> list:
+        """Correctness fallback for requests without one encoder shape."""
+        logger.info(
+            "RTX batch contains incompatible prompt/state shapes; "
+            "falling back to independent B=1 graphs")
+        self.set_batched_mode(enable=False)
+        results = []
+        for index, item in enumerate(batch_data):
+            observation = item["observation"]
+            state = item.get("state")
+            if state is None:
+                state = observation.get("state")
+            self.set_prompt(item["prompt"], state=state)
+            if not self.calibrated:
+                self.calibrate(observation)
+            item_seed = None if seed is None else (int(seed) + index) & 0xFFFFFFFF
+            results.append(self.infer(observation, seed=item_seed))
+        return results
 
     def calibrate_batch(self, sample_observations) -> None:
         """Calibrate FP8 scales for the batched pipeline.
 
-        Uses the parent B=1 calibration pass (per-tensor scales are
-        sample-invariant) on the first observation; the batched B=2
-        forward then reuses those scales.
+        Uses the parent B=1 calibration pass on the first observation; the
+        exact-B forward then reuses those scales.
         """
         if not isinstance(self.pipeline, Pi05BatchedPipeline):
             raise RuntimeError(
@@ -1822,30 +1942,77 @@ class Pi05TorchFrontendRtx:
             self.pipeline.record_infer_graph(external_stream_int=stream_int)
         self.calibrated = True
         self.graph_recorded = True
+        self._batch_stream_cache[(
+            self._batch_size, self.current_prompt_len
+        )] = self._graph_torch_stream
 
-    def infer_batch(self, observations: list) -> list:
-        """Run B=2 inference on two independent observations.
+    def infer_batch(self, batch_data: list, seed=None) -> list:
+        """Run exact-B inference using the unified Lingshu contract.
 
         Args:
-            observations: list of length B (currently 2) of obs dicts
-                matching :meth:`infer`'s contract (``image``,
-                ``wrist_image`` if ``num_views >= 2``, ``state``).
+            batch_data: canonical request dictionaries containing
+                ``observation``, ``prompt`` and optional ``state``; the legacy
+                observation-only form remains supported after callers have
+                explicitly configured prompt/batch mode.
+            seed: optional deterministic batch noise seed.
 
         Returns:
             List of length B; each entry is ``{"actions": (action_horizon, action_dim)}``.
         """
+        if not batch_data:
+            return []
+
+        canonical = (
+            isinstance(batch_data[0], dict)
+            and "observation" in batch_data[0]
+        )
+        if canonical:
+            B = len(batch_data)
+            if not self._batched_active or self._batch_size != B:
+                self.set_batched_mode(enable=True, batch_size=B)
+            prompts = [item["prompt"] for item in batch_data]
+            states = [
+                (item.get("state")
+                 if item.get("state") is not None
+                 else item["observation"].get("state"))
+                for item in batch_data
+            ]
+            keys = [
+                self.batch_compatibility_key(prompt, state)
+                for prompt, state in zip(prompts, states)
+            ]
+            if len(set(keys)) != 1:
+                return self._infer_incompatible_serial(batch_data, seed=seed)
+            self.set_prompt_batch(prompts, states=states)
+            observations = [item["observation"] for item in batch_data]
+            if not self.calibrated:
+                # Use the frontend's canonical calibration path so batch and
+                # B1 share capture hooks, precision snapshots and scale checks.
+                self.calibrate([observations[0]])
+                self._batch_stream_cache[(
+                    self._batch_size, self.current_prompt_len
+                )] = self._graph_torch_stream
+        else:
+            observations = batch_data
+
         if not isinstance(self.pipeline, Pi05BatchedPipeline):
             raise RuntimeError("set_batched_mode + set_prompt_batch required")
-        if len(observations) != PI05_BATCH_SIZE:
+        B = self._batch_size
+        if len(observations) != B:
             raise ValueError(
-                f"infer_batch expects {PI05_BATCH_SIZE} observations, "
+                f"infer_batch expects {B} observations, "
                 f"got {len(observations)}")
         t0 = time.perf_counter()
 
-        # Stage per-sample inputs into the B=2 staging tensors, then D2D.
+        # Stage per-sample inputs into exact-B tensors, then D2D.
         for b, obs in enumerate(observations):
             self._img_buf_b2[b].copy_(self._stack_images(obs))
-        self._noise_buf_b2.normal_()
+        if seed is None:
+            self._noise_buf_b2.normal_()
+        else:
+            generator = torch.Generator(device="cuda")
+            generator.manual_seed(int(seed) & 0xFFFFFFFF)
+            self._noise_buf_b2.normal_(generator=generator)
 
         with torch.cuda.stream(self._graph_torch_stream):
             stream_int = self._graph_torch_stream.cuda_stream
@@ -1868,7 +2035,7 @@ class Pi05TorchFrontendRtx:
         self.latency_records.append(latency_ms)
 
         results = []
-        for b in range(PI05_BATCH_SIZE):
+        for b in range(B):
             raw = self._noise_out_b2[b].float().cpu().numpy()
             unnorm = unnormalize_actions(raw, self.norm_stats)
             results.append({"actions": unnorm[:, :LIBERO_ACTION_DIM]})
