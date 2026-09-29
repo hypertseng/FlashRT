@@ -9,6 +9,7 @@
 #include <string>
 #include <unordered_map>
 #include <functional>
+#include <vector>
 
 // Check cuBLAS status
 #define CUBLAS_CHECK(expr)                                              \
@@ -35,6 +36,11 @@
 
 class GemmRunner {
 public:
+    struct GemmAlgoRecord {
+        int type, M, N, K;
+        std::string algo_blob;
+    };
+
     GemmRunner();
     ~GemmRunner();
 
@@ -197,6 +203,14 @@ public:
                              int M, int N, int K,
                              float* d_scale_a, float* d_scale_b,
                              int num_algos = 16);
+
+    // Persist only algorithms that completed autotuning (or were imported
+    // from a compatible cache).  cuBLASLt's algorithm object is opaque, so
+    // callers must validate the cache ABI before importing it.
+    std::vector<GemmAlgoRecord> export_algo_cache() const;
+    int import_algo_cache(const std::vector<GemmAlgoRecord>& records);
+    size_t cublaslt_version() const;
+    size_t algo_blob_size() const;
 #ifdef ENABLE_NVFP4
     void autotune_fp4_nn_dev(void* A_fp4, void* SFA, void* B_fp4, void* SFB,
                               void* D, int M, int N, int K,
@@ -241,6 +255,7 @@ private:
         cublasLtMatrixLayout_t A_desc, B_desc, C_desc, D_desc;
         cublasLtMatmulAlgo_t algo;
         bool has_C_desc = false;  // FP4 needs separate C descriptor (BF16 != FP4)
+        bool autotuned = false;
     };
 
     std::unordered_map<GemmKey, CachedGemm, GemmKeyHash> gemm_cache_;

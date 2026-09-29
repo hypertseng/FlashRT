@@ -618,6 +618,34 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     // ── GemmRunner ──
     py::class_<GemmRunner>(m, "GemmRunner")
         .def(py::init<>())
+        .def("export_algo_cache", [](const GemmRunner& self) {
+            py::list out;
+            for (const auto& record : self.export_algo_cache()) {
+                py::dict item;
+                item["type"] = record.type;
+                item["M"] = record.M;
+                item["N"] = record.N;
+                item["K"] = record.K;
+                item["algo"] = py::bytes(record.algo_blob);
+                out.append(item);
+            }
+            return out;
+        })
+        .def("import_algo_cache", [](GemmRunner& self, const py::list& items) {
+            std::vector<GemmRunner::GemmAlgoRecord> records;
+            records.reserve(py::len(items));
+            for (const auto& value : items) {
+                py::dict item = py::cast<py::dict>(value);
+                records.push_back({
+                    py::cast<int>(item["type"]), py::cast<int>(item["M"]),
+                    py::cast<int>(item["N"]), py::cast<int>(item["K"]),
+                    py::cast<std::string>(item["algo"])
+                });
+            }
+            return self.import_algo_cache(records);
+        }, py::arg("records"))
+        .def_property_readonly("cublaslt_version", &GemmRunner::cublaslt_version)
+        .def_property_readonly("algo_blob_size", &GemmRunner::algo_blob_size)
         .def("bf16_gemm", [](GemmRunner& self,
                               uintptr_t A, uintptr_t B, uintptr_t D,
                               int M, int N, int K,

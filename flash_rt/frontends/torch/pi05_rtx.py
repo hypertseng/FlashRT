@@ -20,7 +20,9 @@ Usage::
 from __future__ import annotations
 
 import ctypes
+import base64
 import gc
+import hashlib
 import json
 import logging
 import math
@@ -34,7 +36,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from flash_rt.core.utils.actions import unnormalize_actions, LIBERO_ACTION_DIM
+from flash_rt.core.utils.actions import (
+    normalize_state,
+    unnormalize_actions,
+    LIBERO_ACTION_DIM,
+)
 from flash_rt.frontends._fp8_layout import select_fp8_layout
 from flash_rt.hardware.rtx.attn_backend import RtxFlashAttnBackend
 from flash_rt.models.pi05.pipeline_rtx import (
@@ -466,7 +472,7 @@ class Pi05TorchFrontendRtx:
     def __init__(self,
                  checkpoint_dir: Union[str, pathlib.Path],
                  num_views: int = 2,
-                 chunk_size: int = CHUNK_SIZE,
+                 chunk_size: Optional[int] = None,
                  max_prompt_len: int = MAX_PROMPT_LEN_DEFAULT,
                  num_steps: int = NUM_STEPS_DEFAULT,
                  vision_pool_factor: int = 1,
@@ -477,6 +483,41 @@ class Pi05TorchFrontendRtx:
                  fp8_layout: Optional[str] = None,
                  state_prompt_mode: str = "exact"):
         checkpoint_dir = pathlib.Path(checkpoint_dir)
+        # The action expert stays 32-wide internally, while the public robot
+        # action width and state normalisation are checkpoint-specific.  Do
+        # not silently assume LIBERO's 7 DoF for LeRobot/RoboTwin models.
+        config = {}
+        config_path = checkpoint_dir / "config.json"
+        if config_path.exists():
+            with config_path.open(encoding="utf-8") as stream:
+                config = json.load(stream)
+        output_shape = (
+            config.get("output_features", {}).get("action", {}).get("shape", [])
+        )
+        input_state_shape = (
+            config.get("input_features", {}).get("observation.state", {})
+            .get("shape", [])
+        )
+        self.action_dim = int(output_shape[0]) if output_shape else LIBERO_ACTION_DIM
+        self.state_dim = int(input_state_shape[0]) if input_state_shape else None
+        # ``n_action_steps`` is the public action horizon returned to the
+        # controller.  Some LeRobot checkpoints (notably pi05 LIBERO) retain
+        # the training ``chunk_size=50`` while serving only 10 actions.  Use
+        # the serving horizon first so frontend buffers and Worker metadata
+        # describe the same output contract.
+        configured_chunk = int(
+            config.get("n_action_steps") or config.get("chunk_size") or CHUNK_SIZE
+        )
+        self.action_horizon = int(
+            config.get("n_action_steps") or configured_chunk
+        )
+        normalization_mapping = config.get("normalization_mapping", {})
+        self._action_norm_mode = normalization_mapping.get("ACTION", "QUANTILES")
+        self._state_norm_mode = normalization_mapping.get("STATE", "QUANTILES")
+        if self.action_dim <= 0:
+            raise ValueError(
+                f"checkpoint action dimension must be positive, got {self.action_dim}"
+            )
         # State-in-prompt graph strategy (Pi0.5 renders robot state into the
         # prompt, so its token length drifts with the state values):
         #   "exact" (default): a separate pipeline captured per exact length,
@@ -493,7 +534,12 @@ class Pi05TorchFrontendRtx:
                 f"state_prompt_mode must be 'fixed' or 'exact', got {_spm!r}")
         self._state_prompt_mode = _spm
         self.num_views = int(num_views)
+        if chunk_size is None:
+            chunk_size = int(os.environ.get(
+                "FLASHRT_PI05_CHUNK_SIZE", configured_chunk))
         self.chunk_size = int(chunk_size)
+        if self.chunk_size <= 0:
+            raise ValueError(f"chunk_size must be positive, got {self.chunk_size}")
         self.max_prompt_len = int(max_prompt_len)
         self._num_steps = int(num_steps)
         self._vision_pool_factor = int(vision_pool_factor)
@@ -627,6 +673,23 @@ class Pi05TorchFrontendRtx:
         from flash_rt import flash_rt_kernels as fvk
         self.fvk = fvk
         self.gemm = fvk.GemmRunner()
+        self._gemm_cache_path = pathlib.Path(os.environ.get(
+            "FLASHRT_GEMM_AUTOTUNE_CACHE",
+            "~/.cache/flashrt/gemm/rtx-cublaslt.json")).expanduser()
+        self._gemm_cache_loaded = self._load_gemm_autotune_cache()
+        calibration_override = os.environ.get(
+            "FLASHRT_FP8_CALIBRATION_CACHE")
+        if calibration_override:
+            self._fp8_calibration_cache_path = pathlib.Path(
+                calibration_override).expanduser()
+        else:
+            calibration_key = hashlib.sha256(json.dumps(
+                self._fp8_calibration_identity(), sort_keys=True
+            ).encode("utf-8")).hexdigest()[:20]
+            self._fp8_calibration_cache_path = (
+                pathlib.Path("~/.cache/flashrt/calibration").expanduser()
+                / f"pi05-rtx-fp8-{calibration_key}.json")
+        self._fp8_calibration_cache_hit = False
 
         # ── Reusable pre-allocated input buffers (match Thor style) ──
         self._img_buf = torch.empty(
@@ -667,8 +730,229 @@ class Pi05TorchFrontendRtx:
         self._prompt_cache_misses = 0
 
         logger.info(
-            "Pi05TorchFrontendRtx initialised (num_views=%d, chunk=%d, fp8_layout=%s)",
-            self.num_views, self.chunk_size, self.fp8_layout)
+            "Pi05TorchFrontendRtx initialised (num_views=%d, chunk=%d, "
+            "fp8_layout=%s, gemm_cache_loaded=%d)",
+            self.num_views, self.chunk_size, self.fp8_layout,
+            self._gemm_cache_loaded)
+
+    def _gemm_cache_metadata(self) -> dict:
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        return {
+            "schema": 1,
+            "device_name": props.name,
+            "compute_capability": [props.major, props.minor],
+            "torch_cuda": str(torch.version.cuda),
+            "cublaslt_version": int(self.gemm.cublaslt_version),
+            "algo_blob_size": int(self.gemm.algo_blob_size),
+        }
+
+    def _checkpoint_fingerprint(self) -> dict:
+        """Cheap content-sensitive checkpoint identity for cache validation."""
+        path = pathlib.Path(self._checkpoint_path)
+        stat = path.stat()
+        digest = hashlib.sha256()
+        sample_bytes = 1024 * 1024
+        with path.open("rb") as handle:
+            digest.update(handle.read(sample_bytes))
+            if stat.st_size > sample_bytes:
+                handle.seek(max(0, stat.st_size - sample_bytes))
+                digest.update(handle.read(sample_bytes))
+        return {
+            "size": stat.st_size,
+            "edge_sha256": digest.hexdigest(),
+        }
+
+    def _fp8_calibration_identity(self) -> dict:
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        return {
+            "schema": 1,
+            "checkpoint": self._checkpoint_fingerprint(),
+            "device_name": props.name,
+            "compute_capability": [props.major, props.minor],
+            "torch_cuda": str(torch.version.cuda),
+            "fp8_layout": self.fp8_layout,
+            "num_views": self.num_views,
+            "chunk_size": self.chunk_size,
+            "num_steps": self._num_steps,
+            "vision_pool_factor": self._vision_pool_factor,
+            "vision_num_layers": self._vision_num_layers,
+        }
+
+    def _can_cache_fp8_calibration(self) -> bool:
+        return bool(
+            self.use_fp8
+            and not self._force_bf16
+            and not self._force_int8_decoder
+            and not self._use_int8_encoder
+            and not self._use_int8_vision_static
+            and hasattr(self.pipeline, "fp8_act_scales")
+        )
+
+    def _load_fp8_calibration_cache(self) -> bool:
+        if not self._can_cache_fp8_calibration():
+            return False
+        path = self._fp8_calibration_cache_path
+        if not path.exists():
+            return False
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if payload.get("identity") != self._fp8_calibration_identity():
+                logger.warning("Ignoring incompatible FP8 calibration cache %s", path)
+                return False
+            scales = payload.get("scales", {})
+            if not isinstance(scales, dict) or not 1 <= len(scales) <= 2048:
+                raise ValueError("invalid FP8 calibration scale table size")
+            # Pi0.5 creates these four-byte device buffers lazily during its
+            # first dynamic forward.  A cache hit must recreate them before
+            # that forward; otherwise an empty dict would make persistence a
+            # no-op.  Restrict names before allocating from a local file.
+            for name in scales:
+                if (not isinstance(name, str) or len(name) > 128
+                        or any(ch not in "abcdefghijklmnopqrstuvwxyz0123456789_"
+                               for ch in name)):
+                    raise ValueError(f"invalid FP8 scale name {name!r}")
+                self.pipeline._fp8_scale_buf(name)
+            expected = set(self.pipeline.fp8_act_scales)
+            if set(scales) != expected:
+                logger.warning(
+                    "Ignoring FP8 calibration cache with a different scale set: %s",
+                    path)
+                return False
+            for name in sorted(expected):
+                value = float(scales[name])
+                if not math.isfinite(value) or value <= 0.0:
+                    raise ValueError(f"invalid scale {name}={value}")
+                self.pipeline.fp8_act_scales[name].upload(
+                    np.array([value], dtype=np.float32))
+            self.pipeline.fp8_calibrated = True
+            self._fp8_calibration_cache_hit = True
+            logger.info("Loaded %d FP8 calibration scales from %s",
+                        len(expected), path)
+            return True
+        except Exception as exc:
+            logger.warning("Ignoring unusable FP8 calibration cache %s: %s",
+                           path, exc)
+            return False
+
+    def _save_fp8_calibration_cache(self, *, method: str,
+                                    samples: int,
+                                    percentile: Optional[float]) -> None:
+        if not self._can_cache_fp8_calibration():
+            return
+        path = self._fp8_calibration_cache_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        scales = {
+            name: float(buf.download_new((1,), np.float32)[0])
+            for name, buf in self.pipeline.fp8_act_scales.items()
+        }
+        if not scales or any(not math.isfinite(value) or value <= 0.0
+                             for value in scales.values()):
+            logger.warning("Not saving invalid FP8 calibration scales")
+            return
+        payload = {
+            "identity": self._fp8_calibration_identity(),
+            "calibration": {
+                "method": method,
+                "samples": int(samples),
+                "percentile": percentile,
+                "source": os.environ.get("FLASHRT_FP8_CALIBRATION_SOURCE"),
+            },
+            "scales": scales,
+        }
+        lock_path = path.with_suffix(path.suffix + ".lock")
+        try:
+            import fcntl
+            with lock_path.open("a+") as lock_file:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+                tmp.write_text(json.dumps(payload, indent=2, sort_keys=True),
+                               encoding="utf-8")
+                os.replace(tmp, path)
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            logger.info("Saved %d FP8 calibration scales to %s",
+                        len(scales), path)
+        except Exception as exc:
+            logger.warning("Could not persist FP8 calibration cache %s: %s",
+                           path, exc)
+
+    def _decode_gemm_cache(self, payload: dict) -> list[dict]:
+        if payload.get("metadata") != self._gemm_cache_metadata():
+            return []
+        records = []
+        for item in payload.get("records", []):
+            try:
+                records.append({
+                    "type": int(item["type"]), "M": int(item["M"]),
+                    "N": int(item["N"]), "K": int(item["K"]),
+                    "algo": base64.b64decode(item["algo"], validate=True),
+                })
+            except (KeyError, TypeError, ValueError):
+                logger.warning("Ignoring malformed GEMM autotune cache record")
+        return records
+
+    @staticmethod
+    def _gemm_record_key(item: dict) -> tuple[int, int, int, int]:
+        return (int(item["type"]), int(item["M"]),
+                int(item["N"]), int(item["K"]))
+
+    def _load_gemm_autotune_cache(self) -> int:
+        path = self._gemm_cache_path
+        if not path.exists():
+            return 0
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            records = self._decode_gemm_cache(payload)
+            imported = int(self.gemm.import_algo_cache(records))
+            logger.info("Loaded %d persisted GEMM algorithms from %s",
+                        imported, path)
+            return imported
+        except Exception as exc:
+            logger.warning("Ignoring unusable GEMM autotune cache %s: %s",
+                           path, exc)
+            return 0
+
+    def _save_gemm_autotune_cache(self) -> None:
+        """Atomically merge this process's tuned algorithms into the cache."""
+        path = self._gemm_cache_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        current = list(self.gemm.export_algo_cache())
+        if not current:
+            return
+        lock_path = path.with_suffix(path.suffix + ".lock")
+        try:
+            import fcntl
+            with lock_path.open("a+") as lock_file:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                merged = {}
+                if path.exists():
+                    try:
+                        disk_payload = json.loads(path.read_text(encoding="utf-8"))
+                        for item in self._decode_gemm_cache(disk_payload):
+                            merged[self._gemm_record_key(item)] = item
+                    except Exception:
+                        logger.warning("Replacing unreadable GEMM cache %s", path)
+                for item in current:
+                    merged[self._gemm_record_key(item)] = item
+                encoded = []
+                for key in sorted(merged):
+                    item = merged[key]
+                    encoded.append({
+                        "type": item["type"], "M": item["M"],
+                        "N": item["N"], "K": item["K"],
+                        "algo": base64.b64encode(item["algo"]).decode("ascii"),
+                    })
+                payload = {
+                    "metadata": self._gemm_cache_metadata(),
+                    "records": encoded,
+                }
+                tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+                tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+                os.replace(tmp, path)
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            logger.info("Saved %d GEMM algorithms to %s", len(encoded), path)
+        except Exception as exc:
+            logger.warning("Could not persist GEMM autotune cache %s: %s",
+                           path, exc)
 
     @staticmethod
     def _prompt_state_cache_key(state):
@@ -1073,6 +1357,17 @@ class Pi05TorchFrontendRtx:
             "RL mode enabled: cfg_beta=%.2f, advantage_positive=%s",
             new_config["cfg_beta"], new_config["advantage_positive"])
 
+    def _normalize_state_for_prompt(self, state):
+        """Apply the checkpoint's state preprocessing before prompt rendering."""
+        if state is None:
+            return None
+        values = np.asarray(state, dtype=np.float32)
+        if self.state_dim is not None and values.shape[-1] != self.state_dim:
+            raise ValueError(
+                f"checkpoint expects state dim {self.state_dim}, got {values.shape[-1]}"
+            )
+        return normalize_state(values, self.norm_stats, mode=self._state_norm_mode)
+
     def set_prompt(self, prompt_text: str, state=None) -> None:
         """Tokenise prompt + (re)build the pipeline for the exact prompt length.
 
@@ -1091,6 +1386,7 @@ class Pi05TorchFrontendRtx:
                 bool(getattr(self.pipeline, "_fixed_shape", False)))
             return
 
+        state = self._normalize_state_for_prompt(state)
         max_len = (PI05_STATE_PROMPT_MAX_LEN if state is not None
                    else MAX_PROMPT_LEN_DEFAULT)
         embeds_np, prompt_len = self._embed_prompt_cached(
@@ -1353,14 +1649,24 @@ class Pi05TorchFrontendRtx:
                 "calibrate() called a second time; returning without re-running.")
             return
 
+        calibration_requests = None
         if isinstance(observations, dict):
-            obs_list = [observations]
+            raw_items = [observations]
         elif isinstance(observations, list):
-            obs_list = observations
+            raw_items = observations
         else:
-            obs_list = list(observations)
+            raw_items = list(observations)
+        if (raw_items and isinstance(raw_items[0], dict)
+                and "observation" in raw_items[0]
+                and "prompt" in raw_items[0]):
+            calibration_requests = raw_items
+            obs_list = [item["observation"] for item in raw_items]
+        else:
+            obs_list = raw_items
         if max_samples is not None:
             obs_list = obs_list[:max_samples]
+            if calibration_requests is not None:
+                calibration_requests = calibration_requests[:max_samples]
         n = len(obs_list)
         if n == 0:
             raise ValueError("observations must contain at least 1 sample")
@@ -1379,7 +1685,8 @@ class Pi05TorchFrontendRtx:
             self._calibrate_single_frame(obs_list[0])
         else:
             self._calibrate_multi_frame(
-                obs_list, percentile=percentile, verbose=verbose)
+                obs_list, percentile=percentile, verbose=verbose,
+                calibration_requests=calibration_requests)
 
     def calibrate_with_real_data(self, sample_observations) -> None:
         """Legacy alias for :meth:`calibrate`."""
@@ -1404,19 +1711,23 @@ class Pi05TorchFrontendRtx:
             self._copy_tensor_to_pipeline_buf_stream(
                 noise, self.pipeline.input_noise_buf, stream_int)
 
-            # Batched pipelines carry their own calibrate_fp8 that drives
-            # a parent-B=1 forward internally — calling run_pipeline here
-            # would fire the batched path with only the parent's B=1
-            # slots populated. Skip the preemptive run for batched
-            # subclasses and let calibrate_fp8 do the work.
-            if not isinstance(self.pipeline, Pi05BatchedPipeline):
-                self.pipeline.run_pipeline(stream=stream_int)
+            calibration_cache_hit = self._load_fp8_calibration_cache()
+            if not calibration_cache_hit:
+                # Batched pipelines carry their own calibrate_fp8 that drives
+                # a parent-B=1 forward internally — calling run_pipeline here
+                # would fire the batched path with only the parent's B=1
+                # slots populated. Skip the preemptive run for batched
+                # subclasses and let calibrate_fp8 do the work.
+                if not isinstance(self.pipeline, Pi05BatchedPipeline):
+                    self.pipeline.run_pipeline(stream=stream_int)
 
-            self._cudart.cudaStreamSynchronize(
-                ctypes.c_void_p(stream_int))
+                self._cudart.cudaStreamSynchronize(
+                    ctypes.c_void_p(stream_int))
 
-            # FP8 calibration (no-op for INT8 pipelines).
-            self.pipeline.calibrate_fp8()
+                # FP8 calibration (no-op for INT8 pipelines).
+                self.pipeline.calibrate_fp8()
+                self._save_fp8_calibration_cache(
+                    method="single_frame", samples=1, percentile=None)
             # Static INT8 vision: the run_pipeline() call above already ran one
             # vision forward with quantize_int8_device, writing per-site scales
             # into vis_int8_static_scales. Flip the flag to switch to the fast
@@ -1454,6 +1765,7 @@ class Pi05TorchFrontendRtx:
                     "(~0.96 vs dynamic 0.991 on test sequence). Set "
                     "FVK_PI05_RTX_INT8_ENCODER_STATIC=0 to disable.")
             self.pipeline.autotune_gemms()
+            self._save_gemm_autotune_cache()
             from flash_rt.subgraphs.capture import apply_frontend_capture_hooks
             apply_frontend_capture_hooks(self)
             self.pipeline.record_infer_graph(external_stream_int=stream_int)
@@ -1461,12 +1773,14 @@ class Pi05TorchFrontendRtx:
         self.calibrated = True
         self.graph_recorded = True
         self._precision_spec = self._snapshot_precision_spec(
-            method="single_frame", n=1, percentile=None)
+            method=("cache" if calibration_cache_hit else "single_frame"),
+            n=1, percentile=None)
         self._warn_if_scale_ceiling_exceeded()
         logger.info("Calibration + graph capture complete")
 
     def _calibrate_multi_frame(
         self, obs_list, *, percentile: float, verbose: bool,
+        calibration_requests=None,
     ) -> None:
         from flash_rt.core.calibration import (
             accumulate_amax,
@@ -1487,6 +1801,12 @@ class Pi05TorchFrontendRtx:
         with torch.cuda.stream(self._graph_torch_stream):
             stream_int = self._graph_torch_stream.cuda_stream
             for i, obs in enumerate(obs_list):
+                if calibration_requests is not None:
+                    request = calibration_requests[i]
+                    state = request.get("state")
+                    if state is None:
+                        state = obs.get("state")
+                    self.set_prompt(request["prompt"], state=state)
                 images = self._stack_images(obs)
                 noise = torch.randn(
                     self.chunk_size, ACTION_DIM, dtype=bf16, device="cuda")
@@ -1520,7 +1840,10 @@ class Pi05TorchFrontendRtx:
                     np.array([final_amax[idx]], dtype=np.float32))
 
             self.pipeline.fp8_calibrated = True
+            self._save_fp8_calibration_cache(
+                method="percentile", samples=n, percentile=percentile)
             self.pipeline.autotune_gemms()
+            self._save_gemm_autotune_cache()
             from flash_rt.subgraphs.capture import apply_frontend_capture_hooks
             apply_frontend_capture_hooks(self)
             self.pipeline.record_infer_graph(external_stream_int=stream_int)
@@ -1617,7 +1940,7 @@ class Pi05TorchFrontendRtx:
         return getattr(self, "_precision_spec", None)
 
     def infer(self, observation: dict, debug: bool = False,
-              seed: int | None = None) -> dict:
+              seed: int | None = None, noise=None) -> dict:
         """Run inference on a single observation.
 
         All GPU work happens on ``self._graph_torch_stream`` — the same
@@ -1651,7 +1974,14 @@ class Pi05TorchFrontendRtx:
         with torch.cuda.stream(self._graph_torch_stream):
             stream_int = self._graph_torch_stream.cuda_stream
 
-            if seed is None:
+            if noise is not None:
+                noise_t = torch.as_tensor(noise, dtype=bf16, device="cuda")
+                if tuple(noise_t.shape) != tuple(self._noise_buf.shape):
+                    raise ValueError(
+                        f"noise shape must be {tuple(self._noise_buf.shape)}, "
+                        f"got {tuple(noise_t.shape)}")
+                self._noise_buf.copy_(noise_t)
+            elif seed is None:
                 self._noise_buf.normal_()
             else:
                 generator = torch.Generator(device="cuda")
@@ -1682,8 +2012,9 @@ class Pi05TorchFrontendRtx:
         self.latency_records.append(latency_ms)
 
         raw_actions = self._noise_out.float().cpu().numpy()  # (chunk, 32)
-        unnorm = unnormalize_actions(raw_actions, self.norm_stats)
-        robot_actions = unnorm[:, :LIBERO_ACTION_DIM]
+        unnorm = unnormalize_actions(
+            raw_actions, self.norm_stats, mode=self._action_norm_mode)
+        robot_actions = unnorm[:, :self.action_dim]
 
         if debug:
             logger.info("Raw actions[0,:5]: %s", raw_actions[0, :5])
@@ -1739,8 +2070,9 @@ class Pi05TorchFrontendRtx:
         self.latency_records.append(latency_ms)
 
         raw_actions = self._noise_out.float().cpu().numpy()
-        unnorm = unnormalize_actions(raw_actions, self.norm_stats)
-        robot_actions = unnorm[:, :LIBERO_ACTION_DIM]
+        unnorm = unnormalize_actions(
+            raw_actions, self.norm_stats, mode=self._action_norm_mode)
+        robot_actions = unnorm[:, :self.action_dim]
 
         if debug:
             logger.info(
@@ -1866,6 +2198,7 @@ class Pi05TorchFrontendRtx:
 
         embeds_np_list = []
         prompt_lens = []
+        states = [self._normalize_state_for_prompt(state) for state in states]
         for p, state in zip(prompts, states):
             max_len = (PI05_STATE_PROMPT_MAX_LEN if state is not None
                        else MAX_PROMPT_LEN_DEFAULT)
@@ -2000,6 +2333,7 @@ class Pi05TorchFrontendRtx:
                 noise, self.pipeline.input_noise_buf, stream_int)
             self.pipeline.calibrate_fp8()
             self.pipeline.autotune_gemms()
+            self._save_gemm_autotune_cache()
             from flash_rt.subgraphs.capture import apply_frontend_capture_hooks
             apply_frontend_capture_hooks(self)
             self.pipeline.record_infer_graph(external_stream_int=stream_int)
@@ -2009,7 +2343,7 @@ class Pi05TorchFrontendRtx:
             self._batch_size, self.current_prompt_len
         )] = self._graph_torch_stream
 
-    def infer_batch(self, batch_data: list, seed=None) -> list:
+    def infer_batch(self, batch_data: list, seed=None, noise=None) -> list:
         """Run exact-B inference using the unified Lingshu contract.
 
         Args:
@@ -2070,7 +2404,14 @@ class Pi05TorchFrontendRtx:
         # Stage per-sample inputs into exact-B tensors, then D2D.
         for b, obs in enumerate(observations):
             self._img_buf_b2[b].copy_(self._stack_images(obs))
-        if seed is None:
+        if noise is not None:
+            noise_t = torch.as_tensor(noise, dtype=bf16, device="cuda")
+            if tuple(noise_t.shape) != tuple(self._noise_buf_b2.shape):
+                raise ValueError(
+                    f"noise shape must be {tuple(self._noise_buf_b2.shape)}, "
+                    f"got {tuple(noise_t.shape)}")
+            self._noise_buf_b2.copy_(noise_t)
+        elif seed is None:
             self._noise_buf_b2.normal_()
         else:
             generator = torch.Generator(device="cuda")
@@ -2100,8 +2441,9 @@ class Pi05TorchFrontendRtx:
         results = []
         for b in range(B):
             raw = self._noise_out_b2[b].float().cpu().numpy()
-            unnorm = unnormalize_actions(raw, self.norm_stats)
-            results.append({"actions": unnorm[:, :LIBERO_ACTION_DIM]})
+            unnorm = unnormalize_actions(
+                raw, self.norm_stats, mode=self._action_norm_mode)
+            results.append({"actions": unnorm[:, :self.action_dim]})
         return results
 
     def get_latency_stats(self) -> dict:
@@ -2110,6 +2452,8 @@ class Pi05TorchFrontendRtx:
                 "prompt_cache_hits": self._prompt_cache_hits,
                 "prompt_cache_misses": self._prompt_cache_misses,
                 "prompt_cache_entries": len(self._prompt_embedding_cache),
+                "gemm_cache_loaded": self._gemm_cache_loaded,
+                "fp8_calibration_cache_hit": self._fp8_calibration_cache_hit,
             }
         lat = np.array(self.latency_records)
         return {
@@ -2124,6 +2468,8 @@ class Pi05TorchFrontendRtx:
             "prompt_cache_hits": self._prompt_cache_hits,
             "prompt_cache_misses": self._prompt_cache_misses,
             "prompt_cache_entries": len(self._prompt_embedding_cache),
+            "gemm_cache_loaded": self._gemm_cache_loaded,
+            "fp8_calibration_cache_hit": self._fp8_calibration_cache_hit,
         }
 
     # -----------------------------------------------------------------

@@ -1,5 +1,7 @@
 #include "gemm_runner.h"
 #include <iostream>
+#include <algorithm>
+#include <cstring>
 #include <vector>
 
 // ================================================================
@@ -148,6 +150,10 @@ GemmRunner::CachedGemm& GemmRunner::get_or_create_cached(GemmType type, int M, i
 void GemmRunner::autotune_cached(CachedGemm& entry, void* A, void* B, void* D,
                                   float alpha, float beta, int num_algos,
                                   float* d_scale_a, float* d_scale_b) {
+    if (entry.autotuned) {
+        std::cout << "  autotune: cache hit, keeping persisted algorithm" << std::endl;
+        return;
+    }
     // Update scale pointers if FP8
     if (d_scale_a) {
         CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc,
@@ -182,6 +188,7 @@ void GemmRunner::autotune_cached(CachedGemm& entry, void* A, void* B, void* D,
 
     float best_ms = 1e9f;
     int best_idx = 0;
+    bool found_working_algo = false;
     const int warmup_iters = 3;
     const int bench_iters = 10;
 
@@ -215,15 +222,92 @@ void GemmRunner::autotune_cached(CachedGemm& entry, void* A, void* B, void* D,
         if (ms < best_ms) {
             best_ms = ms;
             best_idx = i;
+            found_working_algo = true;
         }
     }
 
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
 
+    if (!found_working_algo) {
+        std::cerr << "  autotune: all candidate algorithms failed, keeping default" << std::endl;
+        return;
+    }
+
     entry.algo = heuristics[best_idx].algo;
+    entry.autotuned = true;
     std::cout << "  autotune: tested " << returned_results << " algos, best="
               << best_idx << " (" << best_ms * 1000.0f << " us)" << std::endl;
+}
+
+std::vector<GemmRunner::GemmAlgoRecord> GemmRunner::export_algo_cache() const {
+    std::vector<GemmAlgoRecord> records;
+    records.reserve(gemm_cache_.size());
+    for (const auto& item : gemm_cache_) {
+        const auto& key = item.first;
+        const auto& entry = item.second;
+        if (!entry.autotuned) continue;
+        records.push_back({
+            key.type, key.M, key.N, key.K,
+            std::string(reinterpret_cast<const char*>(&entry.algo), sizeof(entry.algo))
+        });
+    }
+    std::sort(records.begin(), records.end(), [](const auto& a, const auto& b) {
+        if (a.type != b.type) return a.type < b.type;
+        if (a.M != b.M) return a.M < b.M;
+        if (a.N != b.N) return a.N < b.N;
+        return a.K < b.K;
+    });
+    return records;
+}
+
+int GemmRunner::import_algo_cache(const std::vector<GemmAlgoRecord>& records) {
+    int imported = 0;
+    for (const auto& record : records) {
+        if (record.algo_blob.size() != sizeof(cublasLtMatmulAlgo_t)) continue;
+        if (record.M <= 0 || record.N <= 0 || record.K <= 0) continue;
+        switch (record.type) {
+            case BF16_NN:
+            case BF16_NN_RES:
+            case FP8_NN_DEV:
+            case FP16_NN:
+            case FP8_NT_DEV:
+            case FP8_NN_DEV_FP16:
+                break;
+#ifdef ENABLE_NVFP4
+            case FP4_NN_DEV:
+                break;
+#endif
+            default:
+                continue;
+        }
+
+        auto& entry = get_or_create_cached(
+            static_cast<GemmType>(record.type), record.M, record.N, record.K);
+        cublasLtMatmulAlgo_t candidate;
+        std::memcpy(&candidate, record.algo_blob.data(), sizeof(candidate));
+        auto C_layout = entry.has_C_desc ? entry.C_desc : entry.D_desc;
+        cublasLtMatmulHeuristicResult_t check{};
+        cublasStatus_t status = cublasLtMatmulAlgoCheck(
+            handle_, entry.matmul_desc, entry.A_desc, entry.B_desc,
+            C_layout, entry.D_desc, &candidate, &check);
+        if (status != CUBLAS_STATUS_SUCCESS || check.state != CUBLAS_STATUS_SUCCESS ||
+            check.workspaceSize > workspace_size_) {
+            continue;
+        }
+        entry.algo = candidate;
+        entry.autotuned = true;
+        ++imported;
+    }
+    return imported;
+}
+
+size_t GemmRunner::cublaslt_version() const {
+    return cublasLtGetVersion();
+}
+
+size_t GemmRunner::algo_blob_size() const {
+    return sizeof(cublasLtMatmulAlgo_t);
 }
 
 void GemmRunner::autotune_bf16_nn(void* A, void* B, void* D,

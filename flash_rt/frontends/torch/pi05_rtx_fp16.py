@@ -1415,7 +1415,8 @@ class Pi05TorchFrontendRtxFP16:
         """:class:`ModelPrecisionSpec` captured at calibration time."""
         return getattr(self, "_precision_spec", None)
 
-    def infer(self, observation: dict, debug: bool = False) -> dict:
+    def infer(self, observation: dict, debug: bool = False,
+              seed: int | None = None, noise=None) -> dict:
         """Run inference on a single observation.
 
         All GPU work happens on ``self._graph_torch_stream`` — the same
@@ -1449,7 +1450,15 @@ class Pi05TorchFrontendRtxFP16:
         with torch.cuda.stream(self._graph_torch_stream):
             stream_int = self._graph_torch_stream.cuda_stream
 
-            self._noise_buf.normal_()
+            if noise is None:
+                self._noise_buf.normal_()
+            else:
+                noise_t = torch.as_tensor(noise, dtype=bf16, device="cuda")
+                if tuple(noise_t.shape) != tuple(self._noise_buf.shape):
+                    raise ValueError(
+                        f"noise shape {tuple(noise_t.shape)} != "
+                        f"{tuple(self._noise_buf.shape)}")
+                self._noise_buf.copy_(noise_t)
             self._copy_tensor_to_pipeline_buf_stream(
                 self._noise_buf, self.pipeline.input_noise_buf, stream_int)
 
