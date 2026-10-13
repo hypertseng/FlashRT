@@ -26,11 +26,11 @@ def test_mean_std_actions_are_not_clipped():
     np.testing.assert_allclose(result, [[4.5]])
 
 
-def test_quantile_mode_preserves_legacy_clipping():
+def test_quantile_mode_preserves_out_of_range_model_outputs():
     stats = {
         "actions": {"q01": [-2.0], "q99": [4.0]},
     }
     result = unnormalize_actions(
         np.asarray([[-2.0], [2.0]], dtype=np.float32), stats, "QUANTILES"
     )
-    np.testing.assert_allclose(result, [[-2.0], [4.0]], atol=1e-5)
+    np.testing.assert_allclose(result, [[-5.0], [7.0]], atol=1e-5)

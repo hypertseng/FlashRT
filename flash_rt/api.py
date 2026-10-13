@@ -31,6 +31,12 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+# Precision tiers load_model() accepts. Only the Ascend NPU backend interprets
+# anything but "auto" today; see the resolution in load_model for why a generic
+# selector cannot simply be bolted on ahead of the other backends' routing.
+_PRECISION_TIERS = ("auto", "bf16", "int8", "fp8")
+
+
 class VLAModel:
     """Unified VLA inference model. Wraps ThorPipelineTorch or ThorPipelineJax."""
 
@@ -338,6 +344,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                use_fp8=True,
                state_prompt_mode="exact",
                state_prompt_fixed_max_len=None,
+               precision="auto",
                *,
                mmproj_path=None,
                backend="cpu",
@@ -402,9 +409,16 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
               SM87  (Jetson Orin)  → ``flash_rt.hardware.rtx.*`` (experimental,
                                      Pi0.5 torch only; BF16 default, INT8
                                      via Orin env flags)
+              gfx942 (MI300 series) → ``flash_rt.amd.*`` (CDNA3)
+              gfx950 (MI350 series) → ``flash_rt.amd.*`` (CDNA4)
+              gfx1151 (Radeon 8060S) → ``flash_rt.amd.*`` (RDNA 3.5 BF16)
             Pass ``"thor"`` / ``"rtx_sm120"`` / ``"rtx_sm89"`` /
-            ``"rtx_sm87"`` explicitly to
-            force a specific backend (useful for cross-hardware debugging).
+            ``"rtx_sm87"`` / ``"amd_cdna3"`` / ``"amd_cdna4"`` /
+            ``"amd_rdna35"`` explicitly to force a specific backend (useful
+            for cross-hardware debugging).
+        action_dim: Explicit robot output dimension for the RDNA Pi0.5 and
+            Jetson Pi frontends. RDNA may instead read output_action_dim from
+            checkpoint config.json; normalization statistics are not a schema.
         embodiment_tag: GROOT only. Per-embodiment MLP slot to load. Passing
             ``None`` uses the backend default (``"new_embodiment"`` — unfit
             for the base 3B checkpoint demo; see below). The GR00T-N1.6-3B
@@ -424,6 +438,12 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             Validated on LIBERO Spatial for the torch path: 491/500 = 98.2%
             (matches baseline). JAX FP4 has Thor precision / replay-latency
             validation against a same-origin PyTorch reference.
+            HyVLA torch on RTX SM120/SM121 is also reached through this
+            flag: the RTX default enables NVFP4 for the ViT + VLM prefill
+            tower and keeps the expert denoise tower on FP8 block-128
+            (action cosine 0.99977). Promoting the expert tower to NVFP4 is
+            an opt-in frontend kwarg (``use_fp4_expert=True``), not a
+            ``load_model`` argument.
         use_fp4_decoder: Pi0.5 torch on Thor only. Explicitly enable NVFP4 for
             all four action-expert decoder projections in addition to
             ``use_fp4=True``. Default False. Requires ``use_fp4=True`` and a
@@ -461,6 +481,15 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             (production default ``7``).
         decoder_gate_up_variant: Cutlass NVFP4 decoder Gate+Up GEMM variant
             (production default ``10``).
+        precision: Execution tier, one of ``"auto"``, ``"bf16"``, ``"int8"``
+            or ``"fp8"``. **Interpreted by the Ascend NPU backend only**; on
+            every other arch anything but ``"auto"`` raises, because those
+            backends select their tier through ``use_fp8``/``use_fp4``/
+            ``use_fp16`` while the frontend class is being chosen. On Ascend,
+            ``"fp8"`` raises (910/A2 parts have no FP8 tensor hardware), and
+            ``"int8"`` selects the frozen static INT8 tier whose scales are
+            set at setup: give it real observations through
+            :meth:`VLAModel.calibrate` before the first ``predict()``.
         use_fp8: Enable FP8 execution where the selected frontend supports
             an FP8/BF16 switch. Defaults to True to preserve existing
             performance-oriented behavior.
@@ -478,7 +507,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         vision_num_layers: Pi0.5 torch RTX/Orin only. Number of SigLIP vision
             layers to execute; valid range is 1-27. ``None`` keeps the
             frontend default.
-        cache_frames: Pi0.5 torch RTX/Orin only. Temporal K/V reuse period.
+        cache_frames: Pi0.5 torch RTX/Orin and AMD CDNA4/RDNA 3.5 only.
+            Temporal K/V reuse period.
             1 runs the full vision+encoder+decoder path on every frame; 2
             alternates full and decoder-only frames. ``None`` keeps the
             frontend default.
@@ -562,13 +592,13 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                 "Supported: pi0, pi05, llm, mllm")
     elif config not in ("pi05", "groot", "groot_n17", "pi0", "pi0fast",
                       "motus", "wan22_ti2v_5b", "cosmos3_video",
-                      "cosmos3_edge", "nexn2", "qwen36_moe", "hyvla",
-                      "ltx25"):
+                      "cosmos3_edge", "nexn2", "qwen36_moe", "spark_x25",
+                      "hyvla", "ltx25"):
         raise ValueError(
             f"Unknown config: {config}. "
             f"Supported: pi05, groot, groot_n17, pi0, pi0fast, motus, "
             f"wan22_ti2v_5b, cosmos3_video, cosmos3_edge, nexn2, "
-            f"qwen36_moe, hyvla, ltx25")
+            f"qwen36_moe, spark_x25, hyvla, ltx25")
     if framework not in ("torch", "jax", "jetson_pi"):
         raise ValueError(
             f"Unknown framework: {framework}. Supported: torch, jax, jetson_pi")
@@ -674,16 +704,106 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             "    from flash_rt.frontends.torch.qwen36_moe import "
             "Qwen36MoeTextFrontend\n"
             "See docs/qwen36_moe_usage.md.")
+    if config == "spark_x25":
+        raise NotImplementedError(
+            "config='spark_x25' is a text LLM and is not served through "
+            "load_model's VLA wrapper. Construct it directly:\n"
+            "    from flash_rt.frontends.torch.spark_x25_rtx import "
+            "SparkX25TorchFrontendRtx\n"
+            "See docs/spark_x25_usage.md.")
+
+    from flash_rt.hardware import detect_arch, resolve_pipeline_class
+    arch = detect_arch() if hardware == "auto" else hardware
+
+    # Precision tier, resolved before any backend import so an impossible
+    # request fails the same way on every machine, including one with no
+    # accelerator of that kind installed.
+    #
+    # Scope is deliberately the Ascend backend only. The other backends choose
+    # their tier through use_fp8 / use_fp4 / use_fp16, and those are consulted
+    # while the frontend class is being chosen, well before this point: a
+    # generic tier arriving afterwards could not change the routing it was
+    # supposed to control, so precision="bf16" would still select an FP4 or FP8
+    # frontend. Making precision= the real selector everywhere is a change to
+    # those backends and belongs in its own change, with a routing matrix
+    # behind it.
+    if precision not in _PRECISION_TIERS:
+        raise ValueError(
+            f"precision must be one of {sorted(_PRECISION_TIERS)}, got {precision!r}")
+    if precision != "auto" and arch != "npu":
+        raise ValueError(
+            f"precision={precision!r} is implemented for the Ascend NPU "
+            f"backend only; on arch {arch!r} the tier is selected by "
+            "use_fp8 / use_fp4 / use_fp16. Pass precision='auto'.")
+    if arch == "npu" and precision == "fp8":
+        raise ValueError(
+            "Ascend 910/A2 parts have no FP8 tensor hardware, so "
+            "precision='fp8' cannot be served. Use 'bf16' or 'int8'.")
 
     # Refuse before the frontend import: a frontend that imports the
     # extension at module scope would otherwise fail as a bare
     # ModuleNotFoundError, which reads as a broken install rather than as
-    # a build the user still has to run.
-    from flash_rt import _extensions
-    _extensions.require(config=config)
-
-    from flash_rt.hardware import detect_arch, resolve_pipeline_class
-    arch = detect_arch() if hardware == "auto" else hardware
+    # a build the user still has to run. The AMD backend has its own
+    # self-contained module (the CUDA extensions are neither needed nor
+    # expected on a ROCm box).
+    if arch in ("amd_cdna3", "amd_cdna4"):
+        try:
+            import flash_rt.amd.flash_rt_amd_kernels  # noqa: F401
+        except ImportError as exc:
+            raise ImportError(
+                "flash_rt.amd.flash_rt_amd_kernels is not built (the "
+                "AMD/ROCm backend's core kernels). Build it with:\n"
+                f"    bash scripts/amd/build_amd.sh "
+                f"{'gfx942' if arch == 'amd_cdna3' else 'gfx950'}\n"
+                "or: cmake -B build-amd -S csrc/amd "
+                f"-DGPU_ARCH={'gfx942' if arch == 'amd_cdna3' else 'gfx950'} && "
+                "cmake --build build-amd -j\n"
+                "See docs/deployment_amd.md.") from exc
+    elif arch == "amd_rdna35":
+        try:
+            import flash_rt.amd.flash_rt_amd_kernels  # noqa: F401
+        except ImportError as exc:
+            raise ImportError(
+                "flash_rt.amd.flash_rt_amd_kernels is not built for the "
+                "AMD RDNA 3.5 backend. Build it with:\n"
+                "    bash scripts/amd/build_amd.sh gfx1151\n"
+                "See the RDNA 3.5 section in docs/deployment_amd_pi05.md."
+            ) from exc
+        # The first RDNA 3.5 tier is intentionally BF16. load_model's
+        # historical default is use_fp8=True; coerce that default explicitly
+        # rather than routing to the gfx950 FP8 kernels.
+        if use_fp8:
+            use_fp8 = False
+            logger.warning(
+                "AMD RDNA 3.5 backend currently supports BF16 only; "
+                "disabling use_fp8.")
+    elif arch == "npu":
+        # Ascend NPU backend runs on torch_npu ops (aclnn) plus this repo's own
+        # CCE kernels. No root CMake target and no PyTorch C++ extension is
+        # involved, but the standalone Ascend shared objects do have to be
+        # built first with scripts/npu/build.sh. 910/A2+ parts have no FP8
+        # tensor hardware, so the default use_fp8=True is coerced to the
+        # BF16 tier with a warning rather than silently executing a
+        # precision the part cannot honour.
+        try:
+            import torch_npu  # noqa: F401
+        except ImportError as exc:
+            raise ImportError(
+                "the 'npu' backend requires the CANN/torch_npu runtime "
+                "(import torch_npu failed). Install torch_npu matching "
+                "the installed CANN toolkit before loading a model with "
+                "hardware='npu'.") from exc
+        # precision="fp8" was already refused above. What remains is the
+        # default use_fp8=True, which no caller chose, so it is coerced with a
+        # warning rather than raised on.
+        if use_fp8:
+            use_fp8 = False
+            logger.warning(
+                "Ascend NPU backend: FP8 is not available on 910/A2 parts "
+                "(no FP8 tensor hardware); falling back to the BF16 tier.")
+    else:
+        from flash_rt import _extensions
+        _extensions.require(config=config)
 
     if recalibrate:
         from flash_rt.core.quant.calibrator import clear_calibration
@@ -717,12 +837,15 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             ("groot_n17", "torch", "thor"),
             ("groot_n17", "torch", "rtx_sm120"),
             ("groot_n17", "torch", "rtx_sm89"),
+            ("groot_n17", "torch", "amd_cdna4"),
+            ("groot_n17", "torch", "amd_cdna3"),
         }:
             raise ValueError(
                 "use_fp16=True is currently experimental and only supports "
                 "('pi05', 'torch', 'thor'/'rtx_sm120'/'rtx_sm89'), "
                 "('groot', 'torch', 'thor'/'rtx_sm120'), and "
-                "('groot_n17', 'torch', 'thor'/'rtx_sm120'/'rtx_sm89')")
+                "('groot_n17', 'torch', "
+                "'thor'/'rtx_sm120'/'rtx_sm89'/'amd_cdna3'/'amd_cdna4')")
 
     # FA4 is an attention-backend choice, not part of the NVFP4 tier: both
     # the FP8 Pi0.5 Thor frontend and its NVFP4 subclass accept use_fa4, and
@@ -767,6 +890,20 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                 GrootN17TorchFrontendRtxFP8,
             )
             pipe_cls = GrootN17TorchFrontendRtxFP8
+
+    # GROOT N1.7 on AMD CDNA4 defaults to the FP8-backbone frontend
+    # (bf16 DiT), mirroring the RTX FP8 production tier; _PIPELINE_MAP
+    # already resolves amd_cdna4 to GrootN17TorchFrontendAmd. There is
+    # no BF16-only fallback, and the full-FP16 reference is not yet
+    # ported (use_fp16=True raises NotImplementedError below).
+    if config == "groot_n17" and framework == "torch" \
+            and arch in ("amd_cdna3", "amd_cdna4") \
+            and not use_fp16 and not use_fp8:
+        raise ValueError(
+            f"GROOT N1.7 on {arch} defaults to FP8; there is no "
+            "separate BF16-only fallback. The non-quantized full-FP16 "
+            "reference (use_fp16=True, use_fp8=False) is not yet ported "
+            "to AMD.")
 
     # GROOT N1.7 on Thor (SM110) runs the FP8 backbone (+ bf16 DiT) by
     # default. There is no BF16-only fallback; the non-quantized reference is
@@ -821,6 +958,11 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                 )
                 pipe_cls = GrootTorchFrontendRtxFP16
             else:  # config == "groot_n17"
+                if arch in ("amd_cdna3", "amd_cdna4"):
+                    raise NotImplementedError(
+                        "the GROOT N1.7 full-FP16 reference is not yet "
+                        f"ported to {arch}; use the default FP8 tier "
+                        "(use_fp8=True, use_fp16=False)")
                 if arch == "rtx_sm89":
                     from flash_rt.frontends.torch.groot_n17_rtx_sm89_fp16 import (
                         GrootN17TorchFrontendRtxSm89FP16,
@@ -861,7 +1003,14 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             (config == "pi05" and framework in ("torch", "jax") and arch == "thor")
             or (config == "hyvla" and framework == "torch" and arch == "thor")
         )
-        if not _fp4_ok:
+        # HyVLA on RTX SM120 provides its NVFP4 expert tier through
+        # flash_rt_kernels (tcgen05 NVFP4), not the Thor flash_rt_fp4
+        # extension, so route it explicitly and skip the _fvk_fp4 probe.
+        if config == "hyvla" and framework == "torch" and arch == "rtx_sm120":
+            _hyvla_fp4 = True
+            logger.info("HyVLA RTX SM120 NVFP4 expert tier enabled")
+            use_fp4 = False  # routed; skip the Pi0.5 path below
+        elif not _fp4_ok:
             if config == "hyvla" and arch == "rtx_sm87":
                 logger.warning(
                     "use_fp4=True is not supported for config='hyvla' on "
@@ -908,8 +1057,10 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                 elif framework == "torch":
                     from flash_rt.frontends.torch.pi05_thor_fp4 import (
                         Pi05TorchFrontendThorFP4,
+                        Pi05TorchFrontendThorFP4Optimized,
                     )
-                    pipe_cls = Pi05TorchFrontendThorFP4
+                    pipe_cls = (Pi05TorchFrontendThorFP4Optimized
+                                if use_fp4_decoder else Pi05TorchFrontendThorFP4)
                 else:  # framework == "jax"
                     from flash_rt.frontends.jax.pi05_thor_fp4 import (
                         Pi05JaxFrontendThorFP4,
@@ -925,11 +1076,31 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     # users specify groot/pi0fast knobs.
     import inspect
     sig = inspect.signature(pipe_cls)
+    if config == "groot_n17" and arch == "thor":
+        parameters = dict(sig.parameters)
+        for base in pipe_cls.__mro__[1:]:
+            for name, parameter in inspect.signature(base).parameters.items():
+                parameters.setdefault(name, parameter)
+        from types import SimpleNamespace
+        sig = SimpleNamespace(parameters=parameters)
     kwargs: dict = {"num_views": num_views}
+    if arch == "amd_rdna35" and "action_dim" in sig.parameters and action_dim is not None:
+        kwargs["action_dim"] = action_dim
     if "hardware" in sig.parameters:
         kwargs["hardware"] = arch
     if "use_fp8" in sig.parameters:
         kwargs["use_fp8"] = use_fp8
+    # A named tier reaches here only for the Ascend backend, and only as
+    # "bf16" or "int8"; everything else was refused before the frontend was
+    # chosen. A frontend that cannot take the tier is an error rather than a
+    # silent downgrade, because an INT8 request that quietly ran BF16 would be
+    # measured as a regression and reported as a win.
+    if precision in ("int8", "bf16"):
+        if "use_int8" not in sig.parameters:
+            raise ValueError(
+                f"{pipe_cls.__name__} (config={config}, arch={arch}) has no "
+                f"selectable INT8 tier; pass precision='auto'")
+        kwargs["use_int8"] = precision == "int8"
     if use_fa4 and "use_fa4" in sig.parameters:
         kwargs["use_fa4"] = True
     if config == "pi0fast":
@@ -965,10 +1136,19 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             if value is not None and name in sig.parameters:
                 kwargs[name] = value
     elif config == "hyvla":
-        # The routed FP4 tier must reach the frontend explicitly; the
-        # generic kwarg set never forwards use_fp4.
-        if _hyvla_fp4 and "use_fp4" in sig.parameters:
-            kwargs["use_fp4"] = True
+        # The NVFP4 tier must reach the frontend explicitly; the generic
+        # kwarg set never forwards use_fp4. It is the RTX SM120 default
+        # (NVFP4 ViT + prefill, expert tower on FP8 block-128: cosine
+        # 0.99977, ~55.6 ms) when the caller did not ask for the BF16
+        # reference path, and it is selected by an explicit
+        # load_model(use_fp4=True).
+        if "use_fp4" in sig.parameters:
+            if _hyvla_fp4 or (arch == "rtx_sm120" and use_fp8):
+                kwargs["use_fp4"] = True
+                # The expert denoise tower stays on FP8 unless the caller
+                # opts into use_fp4_expert (frontend default False).
+                if "use_fp4_expert" in sig.parameters:
+                    kwargs["use_fp4_expert"] = False
         # FP8 tier = the validated production config (fp8 + fused
         # megakernels); select it explicitly when the frontend accepts it.
         if use_fp8 and "use_fused" in sig.parameters:

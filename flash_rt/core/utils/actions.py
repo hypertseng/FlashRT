@@ -50,10 +50,10 @@ def unnormalize_actions(actions, norm_stats, mode="quantiles"):
     q01 = np.array(norm_stats["actions"]["q01"], dtype=np.float32)
     q99 = np.array(norm_stats["actions"]["q99"], dtype=np.float32)
     dim = min(values.shape[-1], len(q01))
-    clipped = np.clip(values, -1.0, 1.0)
-    unnorm = clipped.copy()
+    # Match OpenPI quantile unnormalization: preserve model outputs outside [-1, 1].
+    unnorm = values.copy()
     unnorm[..., :dim] = (
-        (clipped[..., :dim] + 1.0) / 2.0 * (q99[:dim] - q01[:dim] + 1e-6)
+        (values[..., :dim] + 1.0) / 2.0 * (q99[:dim] - q01[:dim] + 1e-6)
         + q01[:dim]
     )
     return unnorm

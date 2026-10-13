@@ -35,7 +35,7 @@ def load_model(
     decode_cuda_graph: bool = False,
     decode_graph_steps: int = 80,
     max_decode_steps: int = 256,
-    hardware: str = "auto",         # "auto" | "thor" | "rtx_sm120" | "rtx_sm89" | "rtx_sm87"
+    hardware: str = "auto",         # "auto" | "thor" | "rtx_sm120" | "rtx_sm89" | "rtx_sm87" | "amd_cdna4" | "amd_rdna35"
     # GROOT-specific:
     embodiment_tag: str | None = None,
     action_horizon: int | None = None,
@@ -62,12 +62,19 @@ def load_model(
     use_fp8: bool = True,
     # Pi0.5 torch RTX SM120/SM89 opt-in:
     use_fp16: bool = False,
+    # Robot output schema (RDNA Pi0.5 / Jetson Pi):
+    action_dim: int | None = None,
 ) -> VLAModel
 ```
 
 Returns a `VLAModel` wrapping the appropriate frontend for the detected
 (or explicitly specified) GPU architecture.
 
+- `action_dim` declares the robot output width for RDNA Pi0.5 (1..32).
+  If omitted, this backend requires `output_action_dim` in checkpoint
+  `config.json`; it never infers padding from constant normalization statistics.
+  Constant final action channels are retained. Other existing hardware routes
+  keep their output conventions.
 - `decode_cuda_graph`, `decode_graph_steps`, `max_decode_steps` apply to
   Pi0-FAST.
 - `embodiment_tag` and `action_horizon` apply to GROOT.
@@ -123,6 +130,13 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   roughly a 1 ms normal overhead versus a warmed exact graph, while larger caps
   pay for the extra padded tokens. It can also be set with
   `FLASHRT_PI05_STATE_PROMPT_FIXED_MAX_LEN`.
+- `hardware="amd_cdna4"` (auto-detected on ROCm builds for gfx950 /
+  MI350-series) routes `config="pi05"`, `framework="torch"` to the
+  self-contained AMD backend (`flash_rt/amd/`, HIP module
+  `flash_rt_amd_kernels`). Single-stream surface only: `set_prompt` /
+  `calibrate` / `infer` with both `state_prompt_mode` graphs; the RL and
+  CFG-batched extensions raise `NotImplementedError`. Build and usage:
+  `docs/deployment_amd.md`.
 - `use_fp8=False` disables FP8 where the selected frontend exposes a
   BF16 fallback; unsupported frontends ignore it. GROOT N1.7 on RTX/Thor
   is stricter: the default route is FP8, and `use_fp8=False` alone
@@ -156,12 +170,20 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   validates and benchmarks the optimized denoise boundary. See
   `docs/cosmos3_edge_thor.md`.
 - `config="groot_n17"` is registered for `framework="torch"` on
-  `hardware in {"thor", "rtx_sm120", "rtx_sm89"}`. On RTX,
+  `hardware in {"thor", "rtx_sm120", "rtx_sm89", "amd_cdna4", "npu"}`. On RTX,
   `rtx_sm120` resolves through the historical shared RTX registration and
   `load_model()` refines that default route to the FP8 production
   frontend; `rtx_sm89` resolves directly to its dedicated SM89 frontend.
   `use_fp16=True, use_fp8=False` requests the explicit RTX reference
-  frontend for the selected hardware.
+  frontend for the selected hardware. On `npu` the tier is BF16 and
+  `precision="int8"` is refused rather than downgraded; that backend's
+  native kernels are built per model, so
+  `FLASHRT_ENABLE_NPU_GROOT_N17=ON` is required before this route can
+  load. See `docs/deployment_npu_groot_n17.md`.
+  On every hardware this model takes its observation bundle from the
+  caller, so it is driven through `model.pipeline` —
+  `set_prompt(aux=...)`, `normalize_state`, `infer`,
+  `denormalize_action` — rather than through `VLAModel.predict`.
 - `config="chameleon"` is a chat-style VLM and is not served through
   `load_model`'s VLA wrapper. Calling `load_model(config="chameleon")`
   raises `NotImplementedError` with direct-construction instructions.
@@ -170,9 +192,34 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   `ChameleonTorchFrontendThor` (Jetson Thor SM110).
   See `docs/chameleon_usage.md`.
 - `config="hyvla"` (Hy-Embodied-0.5-VLA) is registered for
-  `framework="torch"` on `hardware="thor"`. Thor uses runtime dynamic
-  FP8 with fused megakernels and optional NVFP4 FFN (`use_fp4=True`).
-  See `docs/hyvla05_thor_sm110.md`.
+  `framework="torch"` on `hardware in {"thor", "rtx_sm87", "rtx_sm120"}`.
+  Thor and Orin SM87 use runtime dynamic FP8 with fused megakernels and
+  optional NVFP4 FFN (`use_fp4=True`). RTX SM120 runs SM120
+  block-128 FP8 and defaults to an NVFP4 ViT + VLM-prefill tier with the
+  expert denoise tower on FP8 (`use_fp4=True, use_fp4_expert=False`);
+  `use_fp4_expert=True` promotes the expert tower to NVFP4 (opt-in,
+  below the 0.999 precision gate). See `docs/hyvla05_thor_sm110.md`,
+  `docs/hyvla05_orin_sm87.md`, and `docs/hyvla05_rtx_sm120.md`.
+
+### Pi0.5 optimized Thor decoder
+
+For the optimized torch/Thor full NVFP4 path, build with
+`-DFLASHRT_ENABLE_PI05_THOR=ON` and call:
+
+```python
+flash_rt.load_model(checkpoint, config="pi05", framework="torch", hardware="thor",
+                    num_views=2, use_fa4=True, use_fp4=True, use_fp4_decoder=True,
+                    awq_alpha=0.5, encoder_p1_combiner="epilogue_hw_nod",
+                    encoder_down_variant=8)
+```
+
+The optimized decoder uses the Pi0.5-owned `flash_rt_pi05_thor` module.
+An absent module raises an error naming the required build flag. Encoder-only,
+JAX and other hardware routes retain their existing frontend. See the
+[Thor guide](thor/pi05.md) for calibration and precision checks.
+
+Pi0.5 state prompts zero-pad shorter normalized states to 32 dimensions before
+discretization, matching OpenPI's tokenizer input. Text-only prompts are unchanged.
 
 ### `flash_rt.VLAModel`
 
@@ -300,7 +347,7 @@ Lazily imports and returns the concrete frontend class for the given
 Motus beta is registered for `(config="motus", framework="torch",
 arch="rtx_sm120")`.
 GROOT N1.7 is registered for `(config="groot_n17", framework="torch",
-arch in {"thor", "rtx_sm120", "rtx_sm89"})`. On RTX, `rtx_sm120`
+arch in {"thor", "rtx_sm120", "rtx_sm89", "amd_cdna4", "npu"})`. On RTX, `rtx_sm120`
 keeps the shared-base registration and `load_model()` refines that
 resolved class to the FP8 default or the explicit RTX reference frontend
 based on `use_fp8` / `use_fp16`; `rtx_sm89` resolves directly to the
@@ -310,7 +357,7 @@ framework="torch", arch="rtx_sm120")`.
 Chameleon-7B is registered for `(config="chameleon", framework="torch",
 arch in {"rtx_sm87", "thor"})`.
 Hy-Embodied-0.5-VLA is registered for `(config="hyvla",
-framework="torch", arch in {"thor", "rtx_sm87"})`.
+framework="torch", arch in {"thor", "rtx_sm87", "rtx_sm120"})`.
 
 ### `_PIPELINE_MAP`
 
@@ -647,6 +694,16 @@ registering an external-plugin model via `_PIPELINE_MAP`.
 ---
 
 ## Adaptation / extension guides
+
+### Pi0.5 RTX Sampling Exports
+
+The Pi0.5 RTX frontend's `infer` and `infer_batch` accept optional
+`noise` or `generator` arguments. They are mutually exclusive for the
+initial noise draw. The default result does not contain a noise host copy.
+Pass `return_noise=True` to export the BF16-rounded initial noise under
+`"noise"`, after inference completes. This also applies to batched CFG.
+The construction-time `denoise_trace` and `prefix_features` exports remain
+opt-in; batch prefix pooling excludes each slot's padded prompt positions.
 
 When adding a new model or kernel, read these in order:
 

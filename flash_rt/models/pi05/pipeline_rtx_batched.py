@@ -1,18 +1,19 @@
-"""FlashRT — Pi0.5 RTX inference pipeline with hardcoded B=2 batched forward.
+"""FlashRT — Pi0.5 RTX inference pipeline with configurable B=N batching.
 
 Subclass of :class:`flash_rt.models.pi05.pipeline_rtx.Pi05Pipeline` that
-runs vision + Gemma-2B encoder + Gemma-300M decoder for two independent
+runs vision + Gemma-2B encoder + Gemma-300M decoder for N independent
 samples in a single forward pass. Sample-batched activation buffers and
 attention buffers live alongside the parent's B=1 buffers; the parent's
 methods are not modified.
 
-Hardcoded B=2 for v0.1.0 — chosen specifically as the foundation for
-:class:`Pi05CFGBatchedPipeline`, which fuses CFG's conditioned and
-unconditioned forwards into a single batched pass.
+The batch width is selected by the attention backend (any N >= 1, default
+2). Internal ``_b2`` names are retained for compatibility, not as a width
+restriction. Only :class:`Pi05CFGBatchedPipeline` requires exactly B=2
+to fuse conditioned and unconditioned forwards.
 
 Calibration: the parent's :meth:`Pi05Pipeline.calibrate_fp8` runs the
 B=1 pipeline once and writes per-tensor activation scales into
-``fp8_act_scales``. Those scales transfer to the B=2 path because
+``fp8_act_scales``. Those scales transfer to the B=N path because
 per-tensor FP8 scales depend on max activation magnitude across the
 ``M*N`` GEMM inputs, which is sample-invariant for the Pi0.5 model
 under typical observation distributions. The batched run therefore
@@ -57,7 +58,7 @@ logger = logging.getLogger(__name__)
 
 
 class Pi05BatchedPipeline(Pi05Pipeline):
-    """Pi0.5 RTX pipeline running B=2 samples in a single forward pass.
+    """Pi0.5 RTX pipeline running B samples (default 2) in a single forward pass.
 
     The constructor requires ``attn_backend`` to be a
     :class:`RtxFlashAttnBatchedBackendPi05` so the batched attention
@@ -71,13 +72,19 @@ class Pi05BatchedPipeline(Pi05Pipeline):
                 "Pi05BatchedPipeline requires attn_backend to be a "
                 "RtxFlashAttnBatchedBackendPi05; got "
                 f"{type(self.attn).__name__}")
-        self.B = self.attn.batch_size
-        if self.B != PI05_BATCH_SIZE:
-            raise ValueError(
-                f"Pi05BatchedPipeline expects B={PI05_BATCH_SIZE}, "
-                f"backend reports {self.B}")
+        self.B = int(self.attn.batch_size)
+        if self.B < 1:
+            raise ValueError(f"batched backend reports B={self.B}")
         self._attn_ptrs_b2 = self.attn.get_ptrs_b2()
         self._allocate_b2_buffers()
+        if self._nvfp4:
+            self._nvfp4_ensure_scratch(self.B * max(self.vision_seq, self.encoder_seq_len))
+        if self._skinny:
+            self._skinny_ensure_partials(self.B * self.chunk_size)
+            if self._skinny_attn:
+                self._skinny_attn = bool(self._attn_ptrs_b2.get("dec_O", 0))
+            if self._skinny_attn:
+                self._skinny_ensure_attn_scratch(self.B)
 
         # Per-sample language-embed CudaBuffers (set by
         # set_language_embeds_batch).
@@ -89,7 +96,7 @@ class Pi05BatchedPipeline(Pi05Pipeline):
     # ══════════════════════════════════════════════════════════════════
 
     def _allocate_b2_buffers(self) -> None:
-        """Allocate B=2-folded versions of every per-sample working buffer.
+        """Allocate B=N-folded versions of every per-sample working buffer.
 
         Naming convention: every parent buffer key ``X`` gets a
         ``X_b2`` sibling here. Per-layer FP8 weights and per-tensor
@@ -107,6 +114,13 @@ class Pi05BatchedPipeline(Pi05Pipeline):
             B * nv * 224 * 224 * 3, BF16)
         self.bufs["diffusion_noise_b2"] = CudaBuffer.device_empty(
             B * ds * ACTION_DIM, BF16)
+        if self.denoise_trace:
+            self._allocate_denoise_trace_buffers(self.bufs, B * ds, suffix="_b2")
+        if self.sde:
+            self._allocate_sde_buffers(self.bufs, B * ds, suffix="_b2")
+        if self.prefix_export:
+            self.bufs["prefix_hidden_b2"] = CudaBuffer.device_empty(
+                B * es * ENC_D, BF16)
 
         # ── Vision ──
         self.bufs["vision_x_b2"] = CudaBuffer.device_empty(B * vs * VIS_D, BF16)
@@ -216,16 +230,32 @@ class Pi05BatchedPipeline(Pi05Pipeline):
         # Override :meth:`_style_slice_ptr` to return b2 slice pointers
         # so all decoder calls automatically pick up the fix without
         # touching call sites.
+        self._upload_b2_styles()
+
+    def _upload_b2_styles(self) -> None:
+        """Tile the per-step styles B times along the row dimension into the
+        ``*_b2`` buffers (allocated on the first call, uploaded in place
+        afterwards so a weight reload never moves them)."""
         import numpy as np
+        B = self.B
         pre = self.weights["precomputed"]
         # style_attn / style_ffn: (num_steps, DEC_L, ds, 3*DEC_D)
         sa = np.ascontiguousarray(np.tile(pre["style_attn"], (1, 1, B, 1)))
         sf = np.ascontiguousarray(np.tile(pre["style_ffn"], (1, 1, B, 1)))
         # style_final: (num_steps, ds, 3*DEC_D)
         sfin = np.ascontiguousarray(np.tile(pre["style_final"], (1, B, 1)))
-        self.bufs["decoder_style_attn_b2"] = CudaBuffer.from_numpy(sa)
-        self.bufs["decoder_style_ffn_b2"] = CudaBuffer.from_numpy(sf)
-        self.bufs["decoder_style_final_b2"] = CudaBuffer.from_numpy(sfin)
+        for key, arr in (("decoder_style_attn_b2", sa), ("decoder_style_ffn_b2", sf),
+                         ("decoder_style_final_b2", sfin)):
+            buf = self.bufs.get(key)
+            if buf is not None and buf.nbytes == arr.nbytes:
+                buf.upload(arr)
+            else:
+                self.bufs[key] = CudaBuffer.from_numpy(arr)
+
+    def _upload_precomputed_styles(self) -> None:
+        super()._upload_precomputed_styles()
+        if getattr(self, "B", 0) and "decoder_style_attn_b2" in self.bufs:
+            self._upload_b2_styles()
 
     def _style_slice_ptr(self, buf_name: str, step: int,
                           layer: int | None = None) -> int:
@@ -274,7 +304,7 @@ class Pi05BatchedPipeline(Pi05Pipeline):
     #   Public API: per-sample language-embed upload
     # ══════════════════════════════════════════════════════════════════
 
-    def set_language_embeds_batch(self, embeds_np_list) -> None:
+    def set_language_embeds_batch(self, embeds_np_list, slots=None) -> None:
         """Store per-sample language embeddings.
 
         Args:
@@ -282,6 +312,10 @@ class Pi05BatchedPipeline(Pi05Pipeline):
                 of shape ``(prompt_len, ENC_D)`` with 2-byte BF16
                 elements. All entries must share the same prompt_len
                 so the encoder can run on a fixed-shape buffer.
+            slots: optional list of sample indices to upload; the other
+                samples keep their stored rows, which must already exist
+                with the same prompt_len (same-size prompt rotation in
+                a fleet). ``None`` uploads every sample.
         """
         if len(embeds_np_list) != self.B:
             raise ValueError(
@@ -301,8 +335,22 @@ class Pi05BatchedPipeline(Pi05Pipeline):
                 f"prompt_len {prompt_len} exceeds max_prompt_len "
                 f"{self.max_prompt_len}")
         import numpy as np
-        for b, e in enumerate(embeds_np_list):
-            arr = np.ascontiguousarray(e)
+        if slots is not None:
+            slots = sorted(set(int(b) for b in slots))
+            if slots and not (0 <= slots[0] and slots[-1] < self.B):
+                raise ValueError(f"slots must lie in [0, {self.B})")
+            for b in range(self.B):
+                if b in slots:
+                    continue
+                kept = self._lang_embeds_buf_b2[b]
+                if kept is None or kept.nbytes != embeds_np_list[b].nbytes:
+                    raise ValueError(
+                        f"sample {b} is not being uploaded but has no stored "
+                        "rows of this size; pass slots=None")
+        else:
+            slots = list(range(self.B))
+        for b in slots:
+            arr = np.ascontiguousarray(embeds_np_list[b])
             old = self._lang_embeds_buf_b2[b]
             if old is not None and old.nbytes == arr.nbytes:
                 old.upload(arr)
@@ -330,12 +378,12 @@ class Pi05BatchedPipeline(Pi05Pipeline):
                 ctypes.c_void_p(dst), src.ptr, src.nbytes, 3, stream)
 
     # ══════════════════════════════════════════════════════════════════
-    #   Helper: B=2 FP8 scratch picker + dynamic-quant GEMM
+    #   Helper: B=N FP8 scratch picker + dynamic-quant GEMM
     # ══════════════════════════════════════════════════════════════════
 
     def _pick_fp8_scratch_b2(self, weight_name: str,
                              act_n: int) -> tuple[int, int]:
-        """B=2 sibling of :meth:`Pi05Pipeline._pick_fp8_scratch`.
+        """B=N sibling of :meth:`Pi05Pipeline._pick_fp8_scratch`.
 
         Returns ``(act_fp8_ptr, scratch_scale_ptr)`` from the b2
         scratch buffers. Used by :meth:`_fp8_gemm_b2`; the parent's
@@ -362,13 +410,16 @@ class Pi05BatchedPipeline(Pi05Pipeline):
     def _fp8_gemm_b2(self, act_bf16_ptr: int, act_n: int, weight_name: str,
                      out_bf16_ptr: int, M: int, N: int, K: int,
                      stream: int) -> None:
-        """B=2 sibling of :meth:`Pi05Pipeline._fp8_gemm`.
+        """B=N sibling of :meth:`Pi05Pipeline._fp8_gemm`.
 
         Identical math, but routes the dynamic-quantization scratch
         write through the b2 scratch buffers so M=B*seq writes do not
         overflow the parent's B=1 scratch slots.
         """
         fvk = self.fvk
+        if weight_name in self._nvfp4:
+            self._nvfp4_gemm(act_bf16_ptr, weight_name, out_bf16_ptr, M, N, K, stream)
+            return
         w_fp8_ptr, w_scale_ptr = self._weight_fp8(weight_name)
         act_fp8_ptr, _scratch_scale_ptr = self._pick_fp8_scratch_b2(
             weight_name, act_n)
@@ -395,7 +446,7 @@ class Pi05BatchedPipeline(Pi05Pipeline):
 
     def _enc_kv_layer_ptrs_b2(self, layer: int,
                               offset_tokens: int = 0) -> tuple[int, int]:
-        """K/V buffer pointers for the given encoder layer in the B=2 cache.
+        """K/V buffer pointers for the given encoder layer in the B=N cache.
 
         Returns the pointer of slot ``[layer, sample=0, offset_tokens]``;
         the per-sample stride is :attr:`_attn_ptrs_b2["enc_k_sample_stride_bytes"]`.
@@ -599,14 +650,14 @@ class Pi05BatchedPipeline(Pi05Pipeline):
                 per_sample_proj_bytes, 3, stream)
 
         # B1-B5: 18 encoder layers
-        fused = use_fp8 and self.fp8_calibrated
+        fused = use_fp8 and self.fp8_calibrated and not self._nvfp4
         for i in range(ENC_L):
             self._encoder_layer_batched(i, m_seq, seq,
                                          fuse_b1=(i > 0 and fused), stream=stream)
 
     def _encoder_layer_batched(self, i: int, m: int, seq: int,
                                 fuse_b1: bool, stream: int) -> None:
-        """One Gemma-2B encoder layer with B=2 sample batching.
+        """One Gemma-2B encoder layer with B=N sample batching.
 
         ``m = B * seq`` is the M-folded total row count for GEMMs and
         per-row ops; ``seq`` (per-sample) is what the batched attention
@@ -617,7 +668,7 @@ class Pi05BatchedPipeline(Pi05Pipeline):
         W = self.weights
         Bb = self.bufs
         ap = self._attn_ptrs_b2
-        fused = self.use_fp8 and self.fp8_calibrated
+        fused = self.use_fp8 and self.fp8_calibrated and not self._nvfp4
 
         # B1: RMSNorm → QKV GEMM
         if fused:
@@ -691,10 +742,11 @@ class Pi05BatchedPipeline(Pi05Pipeline):
                 seq, ENC_NH * ENC_HD, ENC_NKV * ENC_HD, ENC_NKV * ENC_HD,
                 ENC_HD, stream=stream)
 
-        if i == ENC_L - 1:
+        if i == ENC_L - 1 and not self.prefix_export:
+            # Last layer stops after K/V unless the hidden state is exported.
             return
 
-        # B2: Batched attention (B=2 in the leading dim)
+        # B2: Batched attention (B=N in the leading dim)
         enc_o_ptr = self.attn.run_batched(
             "encoder", i, q_seq=seq, stream=stream)
 
@@ -766,6 +818,10 @@ class Pi05BatchedPipeline(Pi05Pipeline):
                 Bb["enc_act_fp8_large_b2"].ptr.value, down_name,
                 Bb["encoder_x_norm_b2"].ptr.value,
                 m, ENC_D, ENC_H, act_scale_down, stream)
+        elif self.use_fp8 and f"encoder_ffn_down_w_{i}" in self._nvfp4:
+            self._nvfp4_geglu_down(
+                Bb["encoder_gate_merged_b2"].ptr.value, f"encoder_ffn_down_w_{i}",
+                Bb["encoder_x_norm_b2"].ptr.value, m, ENC_D, ENC_H, stream)
         elif self.use_fp8:
             fvk.gate_geglu_merged(
                 Bb["encoder_gate_merged_b2"].ptr.value,
@@ -808,20 +864,56 @@ class Pi05BatchedPipeline(Pi05Pipeline):
         fused = self.use_fp8_decoder and self.fp8_calibrated
 
         for step in range(self.num_steps):
-            # C0: Action input projection
-            gemm.bf16_nn(
-                Bb["diffusion_noise_b2"].ptr.value,
-                W["decoder_action_in_proj_w"],
-                Bb["decoder_x_b2"].ptr.value,
-                m, DEC_D, ACTION_DIM, stream=stream)
-            self._bias_add_bf16(
-                Bb["decoder_x_b2"].ptr.value, W["decoder_action_in_proj_b"],
-                m, DEC_D, stream)
+            skinny_step = fused and self._skinny
+            if skinny_step:
+                rc = fvk.pi05_dec_skinny_action_in_norm(
+                    Bb["diffusion_noise_b2"].ptr.value,
+                    W["decoder_action_in_proj_w"], W["decoder_action_in_proj_b"],
+                    Bb["decoder_x_b2"].ptr.value, self._rms_ones_dec.ptr.value,
+                    self._style_slice_ptr("decoder_style_attn", step, 0),
+                    Bb["dec_act_fp8_b2"].ptr.value, Bb["gate_buf_b2"].ptr.value,
+                    self.fp8_act_scales["decoder_attn_qkv_w_0"].ptr.value,
+                    m, 1e-6, self._skinny_pdl, stream)
+                if rc != 0:
+                    raise RuntimeError(f"skinny decoder action_in failed: cudaError {rc}")
+            else:
+                # C0: Action input projection
+                gemm.bf16_nn(
+                    Bb["diffusion_noise_b2"].ptr.value,
+                    W["decoder_action_in_proj_w"],
+                    Bb["decoder_x_b2"].ptr.value,
+                    m, DEC_D, ACTION_DIM, stream=stream)
+                self._bias_add_bf16(
+                    Bb["decoder_x_b2"].ptr.value, W["decoder_action_in_proj_b"],
+                    m, DEC_D, stream)
 
             for i in range(DEC_L):
-                skip_c1 = fused and i > 0
+                skip_c1 = (fused and i > 0) or skinny_step
                 self._decoder_layer_batched(i, step, enc_seq, ds, m,
                                              skip_c1, stream)
+
+            if skinny_step:
+                trace_x = trace_delta = 0
+                if self.denoise_trace:
+                    off = step * m * ACTION_DIM * 2
+                    trace_x = Bb["denoise_trace_x_b2"].ptr.value + off
+                    trace_delta = Bb["denoise_trace_delta_b2"].ptr.value + off
+                if self.sde:
+                    rc = fvk.pi05_dec_skinny_action_out_residual_sde(
+                        Bb["x_normed_buf_b2"].ptr.value,
+                        W["decoder_action_out_proj_w"], W["decoder_action_out_proj_b"],
+                        Bb["decoder_action_buf_b2"].ptr.value, Bb["diffusion_noise_b2"].ptr.value,
+                        trace_x, trace_delta, *self._sde_step_ptrs(step, m, suffix="_b2"),
+                        m, self._skinny_pdl, stream)
+                else:
+                    rc = fvk.pi05_dec_skinny_action_out_residual(
+                        Bb["x_normed_buf_b2"].ptr.value,
+                        W["decoder_action_out_proj_w"], W["decoder_action_out_proj_b"],
+                        Bb["decoder_action_buf_b2"].ptr.value, Bb["diffusion_noise_b2"].ptr.value,
+                        trace_x, trace_delta, m, self._skinny_pdl, stream)
+                if rc != 0:
+                    raise RuntimeError(f"skinny decoder action_out failed: cudaError {rc}")
+                continue
 
             # C8: Final AdaRMSNorm + output projection
             fvk.ada_rms_norm_style(
@@ -838,15 +930,28 @@ class Pi05BatchedPipeline(Pi05Pipeline):
                 Bb["decoder_action_buf_b2"].ptr.value,
                 W["decoder_action_out_proj_b"],
                 m, ACTION_DIM, stream)
-            fvk.residual_add(
-                Bb["diffusion_noise_b2"].ptr.value,
-                Bb["decoder_action_buf_b2"].ptr.value,
-                m * ACTION_DIM, stream=stream)
+            if self.denoise_trace:
+                self._record_denoise_step(
+                    step, Bb["diffusion_noise_b2"], Bb["decoder_action_buf_b2"],
+                    m, stream, suffix="_b2")
+            if self.sde:
+                eps_ptr, sigma_ptr = self._sde_step_ptrs(step, m, suffix="_b2")
+                rc = fvk.pi05_sde_residual_add(
+                    Bb["diffusion_noise_b2"].ptr.value,
+                    Bb["decoder_action_buf_b2"].ptr.value,
+                    eps_ptr, sigma_ptr, m * ACTION_DIM, stream)
+                if rc != 0:
+                    raise RuntimeError(f"pi05_sde_residual_add failed: cudaError {rc}")
+            else:
+                fvk.residual_add(
+                    Bb["diffusion_noise_b2"].ptr.value,
+                    Bb["decoder_action_buf_b2"].ptr.value,
+                    m * ACTION_DIM, stream=stream)
 
     def _decoder_layer_batched(self, i: int, step: int, enc_seq: int,
                                 ds: int, m: int, skip_c1: bool,
                                 stream: int) -> None:
-        """One Gemma-300M decoder layer with B=2 sample batching.
+        """One Gemma-300M decoder layer with B=N sample batching.
 
         ``ds`` is per-sample chunk length; ``m = B*ds`` is the M-fold
         for GEMMs and per-row ops.
@@ -857,6 +962,19 @@ class Pi05BatchedPipeline(Pi05Pipeline):
         Bb = self.bufs
         ap = self._attn_ptrs_b2
         fused = self.use_fp8_decoder and self.fp8_calibrated
+        if fused and self._skinny:
+            # Skinny FP8 family over the B-folded rows: the per-sample K/V
+            # cache slots are addressed by the consumer's sample stride.
+            kv_rows_per_sample = ap["enc_k_sample_stride_bytes"] // (DEC_NKV * DEC_HD * 2)
+            self._decoder_layer_skinny(
+                i, step, enc_seq, ds, skip_c1, stream,
+                rows=m, suffix="_b2", attn_ptrs=ap,
+                kv_ptrs=self._enc_kv_layer_ptrs_b2(i, offset_tokens=enc_seq),
+                kv_base_ptrs=self._enc_kv_layer_ptrs_b2(i, offset_tokens=0),
+                kv_sample_stride=kv_rows_per_sample,
+                dec_o_ptr_fn=lambda: self.attn.run_batched(
+                    "decoder", i, q_seq=ds, kv_seq=enc_seq + ds, stream=stream))
+            return
 
         # C1: AdaRMSNorm with style → FP8 (fused) or BF16
         qkv_name = f"decoder_attn_qkv_w_{i}"
@@ -1020,7 +1138,7 @@ class Pi05BatchedPipeline(Pi05Pipeline):
     # ══════════════════════════════════════════════════════════════════
 
     def run_pipeline(self, stream: int = 0) -> None:
-        """Run the B=2 pipeline end-to-end.
+        """Run the B=N pipeline end-to-end.
 
         Override of the parent's :meth:`Pi05Pipeline.run_pipeline`. The
         captured CUDA Graph (recorded by the inherited
@@ -1029,31 +1147,34 @@ class Pi05BatchedPipeline(Pi05Pipeline):
         self._copy_lang_embeds_to_encoder_x_b2(stream=stream)
         self.vision_encoder_batched(stream)
         self.transformer_encoder_batched(stream)
+        if self.prefix_export:
+            self._export_prefix_hidden(stream, suffix="_b2",
+                                       rows=self.B * self.encoder_seq_len)
         self.transformer_decoder_batched(stream)
 
     def autotune_gemms(self) -> None:
-        """Autotune GEMM tactics for both B=1 and B=2 M values.
+        """Autotune GEMM tactics for both B=1 and B=N M values.
 
         The parent's :meth:`Pi05Pipeline.autotune_gemms` only sees the
-        B=1 ``M = vs / seq / ds`` shapes; running with B=2 doubles each
-        M and cuBLASLt then has to pick a tactic on the fly, which can
+        B=1 ``M = vs / seq / ds`` shapes; running with B=N multiplies each
+        M by N and cuBLASLt then has to pick a tactic on the fly, which can
         fail (CUBLAS_STATUS_INTERNAL_ERROR) on shapes the autotune
         cache hasn't seen. We run the parent's tune first (so the B=1
         calibration / parent-path forwards remain bit-equal) and then
-        an additional pass at the B=2 M values using the b2 buffers.
+        an additional pass at the B=N M values using the b2 buffers.
         """
         # First, the parent's B=1 tune (covers calibration-time GEMMs).
         super().autotune_gemms()
         if getattr(self, "_gemms_autotuned_b2", False):
             return
 
-        # Then run an additional autotune at the B=2 ``M = B*seq`` shapes.
+        # Then run an additional autotune at the B=N ``M = B*seq`` shapes.
         # When this code first landed we hit
-        # ``CUBLAS_STATUS_INTERNAL_ERROR`` selecting a B=2 FP8 tactic on
+        # ``CUBLAS_STATUS_INTERNAL_ERROR`` selecting a B=N FP8 tactic on
         # RTX 5090; that turned out to depend on input-buffer state at
         # autotune time, not the shape itself, and was masked by simply
         # skipping the pass. After fixing Bugs 5+6 (slot-1 OOB in
-        # ``_bias_zero_buf`` and decoder style buffers), the B=2 buffers
+        # ``_bias_zero_buf`` and decoder style buffers), the B=N buffers
         # carry valid post-warmup activations during autotune and the
         # tactic picker no longer trips. Reaching M=B*seq tactics
         # tightens the production-path cosine vs serial CFG by ~1.5%
@@ -1081,7 +1202,7 @@ class Pi05BatchedPipeline(Pi05Pipeline):
             m_vis, VIS_D, VIS_PATCH_FLAT)
 
         # Vision FP8 at B*vs
-        if self.use_fp8 and self.fp8_calibrated and "vision_attn_qkv_w_0" in self.weights.get("fp8", {}):
+        if self.use_fp8 and self.fp8_calibrated and not self._nvfp4 and "vision_attn_qkv_w_0" in self.weights.get("fp8", {}):
             for name_prefix, M_val, N_val, K_val, out_key in [
                 ("vision_attn_qkv_w_0", m_vis, 3 * VIS_D, VIS_D, "vision_QKV_b2"),
                 ("vision_attn_o_w_0",   m_vis, VIS_D,     VIS_D, "vision_x_norm_b2"),
@@ -1098,7 +1219,7 @@ class Pi05BatchedPipeline(Pi05Pipeline):
                     M_val, N_val, K_val, act_scale_ptr, w_scale_ptr)
 
         # Encoder FP8 at B*seq
-        if self.use_fp8 and self.fp8_calibrated:
+        if self.use_fp8 and self.fp8_calibrated and not self._nvfp4:
             for name_prefix, M_val, N_val, K_val, out_key in [
                 ("encoder_attn_qkv_w_0",    m_seq, (ENC_NH + 2 * ENC_NKV) * ENC_HD, ENC_D, "encoder_QKV_b2"),
                 ("encoder_attn_o_w_0",      m_seq, ENC_D,      ENC_D, "encoder_x_norm_b2"),
@@ -1138,7 +1259,7 @@ class Pi05BatchedPipeline(Pi05Pipeline):
 
         Per-tensor FP8 scales are sample-invariant for Pi0.5 under typical
         observation distributions, so the parent's single-sample
-        calibration pass produces scales that apply directly to the B=2
+        calibration pass produces scales that apply directly to the B=N
         forward. We run the parent's :meth:`Pi05Pipeline.run_pipeline`
         rather than this subclass's batched override so the calibration
         path uses the parent's B=1 buffers (already pre-populated by
@@ -1160,8 +1281,8 @@ class Pi05BatchedPipeline(Pi05Pipeline):
     #   Public API: input/output buffer handles for the batched path
     # ══════════════════════════════════════════════════════════════════
 
-    def forward(self) -> int:
-        """Replay the captured B=2 graph and return the batched-noise ptr.
+    def forward(self, stream: int | None = None) -> int:
+        """Replay the captured B=N graph and return the batched-noise ptr.
 
         Override of :meth:`Pi05Pipeline.forward` so the returned pointer
         points at the batched diffusion-noise output buffer rather than
@@ -1172,8 +1293,9 @@ class Pi05BatchedPipeline(Pi05Pipeline):
             self._graph.replay(self._graph_stream)
             self._cudart.cudaStreamSynchronize(self._graph_stream)
         else:
-            self.run_pipeline(stream=0)
-            self._cudart.cudaDeviceSynchronize()
+            run_stream = 0 if stream is None else int(stream)
+            self.run_pipeline(stream=run_stream)
+            self._cudart.cudaStreamSynchronize(ctypes.c_void_p(run_stream))
         return self.bufs["diffusion_noise_b2"].ptr.value
 
     @property
@@ -1185,3 +1307,31 @@ class Pi05BatchedPipeline(Pi05Pipeline):
     def input_noise_buf_b2(self) -> CudaBuffer:
         """Pipeline input/output: per-sample diffusion noise (B*chunk, 32)."""
         return self.bufs["diffusion_noise_b2"]
+
+    @property
+    def sde_eps_buf_b2(self) -> CudaBuffer:
+        """Sampler input: per-step noise, ``(num_steps, B, chunk, 32)`` bf16."""
+        if not self.sde:
+            raise RuntimeError("pipeline was built without sde=True")
+        return self.bufs["sde_eps_b2"]
+
+    @property
+    def denoise_trace_x_buf_b2(self) -> CudaBuffer:
+        """Trace output: per-step input state, ``(num_steps, B*chunk, 32)`` bf16."""
+        if not self.denoise_trace:
+            raise RuntimeError("pipeline was built without denoise_trace=True")
+        return self.bufs["denoise_trace_x_b2"]
+
+    @property
+    def prefix_hidden_buf_b2(self) -> CudaBuffer:
+        """Export: final encoder hidden state, ``(B*encoder_seq_len, ENC_D)`` bf16."""
+        if not self.prefix_export:
+            raise RuntimeError("pipeline was built without prefix_export=True")
+        return self.bufs["prefix_hidden_b2"]
+
+    @property
+    def denoise_trace_delta_buf_b2(self) -> CudaBuffer:
+        """Trace output: per-step increment, ``(num_steps, B*chunk, 32)`` bf16."""
+        if not self.denoise_trace:
+            raise RuntimeError("pipeline was built without denoise_trace=True")
+        return self.bufs["denoise_trace_delta_b2"]

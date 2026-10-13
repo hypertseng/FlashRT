@@ -32,6 +32,10 @@ void run_mha_fwd_(Flash_fwd_params& params, cudaStream_t stream);
 
 template<typename elem_type, int kHeadDim, bool Is_causal>
 void run_mha_fwd_splitkv_dispatch(Flash_fwd_params& params, cudaStream_t stream);
+
+// Short-query FA2 tile specialisation (flash_fwd_smallq_bf16_sm80.cu).
+void run_mha_fwd_smallq_bf16(int head_dim, Flash_fwd_params& params,
+                             cudaStream_t stream);
 }
 
 static inline int round_up_128(int x) { return ((x + 127) / 128) * 128; }
@@ -77,7 +81,7 @@ static void fill_params(
     int k_batch_stride, int k_row_stride, int k_head_stride,
     int v_batch_stride, int v_row_stride, int v_head_stride,
     int o_batch_stride, int o_row_stride, int o_head_stride,
-    float softmax_scale)
+    float softmax_scale, int window_left = -1, int window_right = -1)
 {
     params = {};
     params.is_bf16 = elem_is_bf16;
@@ -128,8 +132,10 @@ static void fill_params(
     params.scale_softmax_rp_dropout = softmax_scale;
 
     params.is_causal = false;
-    params.window_size_left = -1;
-    params.window_size_right = -1;
+    // A bounded past is a local mask: Is_local is enabled by
+    // LOCAL_SWITCH whenever window_size_* >= 0 and !Is_causal.
+    params.window_size_left = window_left;
+    params.window_size_right = window_right;
 
     params.alibi_slopes_ptr = nullptr;
     params.alibi_slopes_batch_stride = 0;
@@ -257,6 +263,36 @@ extern "C" void NAME(                                                           
     dispatch_hdim<ELEM_T>(head_dim, num_splits, params, stream);                 \
 }
 
+#define DEFINE_FA2_ENTRY_WINDOW(NAME, ELEM_T, IS_BF16)                           \
+extern "C" void NAME(                                                            \
+    const void* q_ptr, const void* k_ptr, const void* v_ptr,                     \
+    void* o_ptr, void* softmax_lse_ptr,                                          \
+    void* softmax_lse_accum_ptr, void* o_accum_ptr,                              \
+    int batch, int seqlen_q, int seqlen_k,                                       \
+    int num_heads_q, int num_heads_kv, int head_dim,                             \
+    int q_batch_stride, int q_row_stride, int q_head_stride,                     \
+    int k_batch_stride, int k_row_stride, int k_head_stride,                     \
+    int v_batch_stride, int v_row_stride, int v_head_stride,                     \
+    int o_batch_stride, int o_row_stride, int o_head_stride,                     \
+    float softmax_scale, int window_left, int window_right,                      \
+    int num_sms, cudaStream_t stream)                                            \
+{                                                                                \
+    FLASH_NAMESPACE::Flash_fwd_params params;                                    \
+    fill_params(params, IS_BF16,                                                 \
+                q_ptr, k_ptr, v_ptr, o_ptr, softmax_lse_ptr,                     \
+                batch, seqlen_q, seqlen_k,                                       \
+                num_heads_q, num_heads_kv, head_dim,                             \
+                q_batch_stride, q_row_stride, q_head_stride,                     \
+                k_batch_stride, k_row_stride, k_head_stride,                     \
+                v_batch_stride, v_row_stride, v_head_stride,                     \
+                o_batch_stride, o_row_stride, o_head_stride,                     \
+                softmax_scale, window_left, window_right);                       \
+    int num_splits = setup_splitkv(params, softmax_lse_accum_ptr, o_accum_ptr,   \
+                                    num_sms, seqlen_q, seqlen_k,                 \
+                                    head_dim, batch, num_heads_q);               \
+    dispatch_hdim<ELEM_T>(head_dim, num_splits, params, stream);                 \
+}
+
 // ──────────────────────────────────────────────────────────────
 // Entry symbols. Each dtype is guarded by an FA2_HAS_{FP16,BF16}
 // macro set from CMake via FA2_DTYPES. If a dtype was dropped to
@@ -280,6 +316,25 @@ extern "C" void NAME(                                                           
     std::abort();                                                                \
 }
 
+// Same, for the windowed entry, whose signature carries the two extra window
+// bounds the plain stub above does not have. Keeping the pair in step matters:
+// an entry with no stub here is an undefined symbol at link time for any build
+// whose FA2_DTYPES drops bf16.
+#define DEFINE_FA2_STUB_WINDOW(NAME, DTYPE_STR)                                  \
+extern "C" void NAME(                                                            \
+    const void*, const void*, const void*, void*, void*,                         \
+    void*, void*,                                                                \
+    int, int, int, int, int, int,                                                \
+    int, int, int, int, int, int,                                                \
+    int, int, int, int, int, int,                                                \
+    float, int, int, int, cudaStream_t)                                          \
+{                                                                                \
+    fprintf(stderr,                                                              \
+        "fvk_attention_fa2: " DTYPE_STR " window entry was not compiled. "       \
+        "Rebuild with -DFA2_DTYPES=\"fp16;bf16\" to enable it.\n");              \
+    std::abort();                                                                \
+}
+
 #ifdef FA2_HAS_FP16
 DEFINE_FA2_ENTRY(fvk_attention_fa2_fwd_fp16, cutlass::half_t,    false)
 #else
@@ -288,6 +343,7 @@ DEFINE_FA2_STUB(fvk_attention_fa2_fwd_fp16,  "fp16")
 
 #ifdef FA2_HAS_BF16
 DEFINE_FA2_ENTRY(fvk_attention_fa2_fwd_bf16, cutlass::bfloat16_t, true)
+DEFINE_FA2_ENTRY_WINDOW(fvk_attention_fa2_fwd_bf16_window, cutlass::bfloat16_t, true)
 
 // seqused_k variant: K/V length is read per-batch from device memory
 // (seqused_k[b]); the kernel clamps n_block_max to that length and early-exits.
@@ -347,8 +403,62 @@ extern "C" void fvk_attention_fa2_fwd_bf16_seqused_splitkv(
                                     head_dim, batch, num_heads_q);
     dispatch_hdim<cutlass::bfloat16_t>(head_dim, num_splits, params, stream);
 }
+
+// Short-query tile entry. Same parameter surface as the seqused variant
+// (seqused_k_ptr may be null for full attention) but dispatches to the
+// narrow-query-tile traits in flash_fwd_smallq_bf16_sm80.cu instead of the
+// vendored <128,64,4> default. num_splits is forced to 1 (graph-safe, no
+// reduction scratch). head_dim must be in (0,128]; it is not a general
+// replacement for the full dispatch, and out-of-range head_dim aborts.
+extern "C" void fvk_attention_fa2_fwd_bf16_tile(
+    const void* q_ptr, const void* k_ptr, const void* v_ptr,
+    void* o_ptr, void* softmax_lse_ptr, const void* seqused_k_ptr,
+    int batch, int seqlen_q, int seqlen_k,
+    int num_heads_q, int num_heads_kv, int head_dim,
+    int q_batch_stride, int q_row_stride, int q_head_stride,
+    int k_batch_stride, int k_row_stride, int k_head_stride,
+    int v_batch_stride, int v_row_stride, int v_head_stride,
+    int o_batch_stride, int o_row_stride, int o_head_stride,
+    float softmax_scale, int /*num_sms*/, cudaStream_t stream)
+{
+#ifdef FA2_HAS_SMALLQ_BF16
+    if (head_dim <= 0 || head_dim > 128) {
+        std::fprintf(stderr,
+            "[flash_rt_fa2] fwd_bf16_tile: head_dim=%d out of the supported "
+            "(0, 128] range; use fwd_bf16/fwd_bf16_seqused instead.\n",
+            head_dim);
+        std::abort();
+    }
+    if (head_dim <= 96) {
+#ifndef FA2_HAS_HDIM_96
+        fa2_not_built("smallq head_dim<=96", head_dim);
+#endif
+    } else {
+#ifndef FA2_HAS_HDIM_128
+        fa2_not_built("smallq head_dim<=128", head_dim);
+#endif
+    }
+    FLASH_NAMESPACE::Flash_fwd_params params;
+    fill_params(params, true, q_ptr, k_ptr, v_ptr, o_ptr, softmax_lse_ptr,
+                batch, seqlen_q, seqlen_k, num_heads_q, num_heads_kv, head_dim,
+                q_batch_stride, q_row_stride, q_head_stride,
+                k_batch_stride, k_row_stride, k_head_stride,
+                v_batch_stride, v_row_stride, v_head_stride,
+                o_batch_stride, o_row_stride, o_head_stride, softmax_scale);
+    params.seqused_k = seqused_k_ptr
+        ? reinterpret_cast<int*>(const_cast<void*>(seqused_k_ptr)) : nullptr;
+    params.num_splits = 1;
+    params.softmax_lseaccum_ptr = nullptr;
+    params.oaccum_ptr = nullptr;
+    FLASH_NAMESPACE::run_mha_fwd_smallq_bf16(head_dim, params, stream);
+#else
+    fa2_not_built("bf16 small-query tile head_dim", head_dim);
+#endif
+}
+
 #else
 DEFINE_FA2_STUB(fvk_attention_fa2_fwd_bf16,  "bf16")
+DEFINE_FA2_STUB_WINDOW(fvk_attention_fa2_fwd_bf16_window, "bf16")
 extern "C" void fvk_attention_fa2_fwd_bf16_seqused(
     const void*, const void*, const void*, void*, void*, const void*,
     int, int, int, int, int, int, int, int, int, int, int, int,
@@ -357,6 +467,11 @@ extern "C" void fvk_attention_fa2_fwd_bf16_seqused(
 extern "C" void fvk_attention_fa2_fwd_bf16_seqused_splitkv(
     const void*, const void*, const void*, void*, void*, const void*,
     void*, void*,
+    int, int, int, int, int, int, int, int, int, int, int, int,
+    int, int, int, int, int, int, float, int, cudaStream_t)
+{ std::abort(); }
+extern "C" void fvk_attention_fa2_fwd_bf16_tile(
+    const void*, const void*, const void*, void*, void*, const void*,
     int, int, int, int, int, int, int, int, int, int, int, int,
     int, int, int, int, int, int, float, int, cudaStream_t)
 { std::abort(); }

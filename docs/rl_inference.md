@@ -251,10 +251,244 @@ The residual gap (~0.001–0.002) is per-frontend FP8 calibration noise
 amplified by the CFG combine; it is not a correctness issue (well
 inside the deployment cosine floor of 0.99 vs PyTorch FP32 reference).
 
+## Reproducible sampling and denoise trace (RL rollouts)
+
+RL training loops need two things from the sampler that deployment
+does not: a way to reproduce a sample, and a view of how it was
+produced. Both are engine-level capabilities on the Pi0.5 RTX
+frontend; the RL semantics (log-probabilities, importance ratios)
+stay with the training code that consumes them.
+
+### Noise injection and seeding
+
+```python
+rt = Pi05TorchFrontendRtx(ckpt, num_views=2)
+rt.set_prompt("pick up the cup")
+
+out = rt.infer(obs, return_noise=True)       # opt-in host noise export
+noise = out["noise"]                         # (chunk_size, 32) float32
+same = rt.infer(obs, noise=noise)            # bit-identical actions
+
+g = torch.Generator(device="cuda").manual_seed(1234)
+seeded = rt.infer(obs, generator=g)          # reproducible draw
+
+batch = rt.infer_batch([obs_a, obs_b], noise=noise_pair)   # (B, chunk, 32)
+```
+
+Contract: same weights, prompt and noise give bit-identical actions
+(graph replay is deterministic). Prompts are normalized before
+tokenization the way openpi's `PaligemmaTokenizer` does (strip, `_`
+and `\n` become spaces, then BOS + text + the `\n` start-of-answer
+token); both the openpi and the SentencePiece fallback path of the
+frontend produce the same ids, including for the RL prompt
+`"<task>\nAdvantage: positive"`. A trainer must tokenize the same way
+or it trains on a different prefix than the one served. `noise` is taken as given (rounded
+to bf16); `generator` seeds the internal draw; passing both is an
+error. With `return_noise=True`, the result carries `"noise"`, the bf16-rounded noise that was
+used, which round-trips exactly when passed back. The CFG batched
+path accepts the same arguments (one noise, replicated across the
+conditioned and unconditioned slots). No pipeline change is involved
+and the default path is untouched.
+
+### Denoise trace
+
+```python
+rt = Pi05TorchFrontendRtx(ckpt, num_views=2, denoise_trace=True)
+rt.set_prompt("pick up the cup")
+out = rt.infer(obs, noise=noise)
+tr = out["denoise_trace"]      # x, delta: (num_steps, chunk, 32) float32
+out["raw_actions"]             # normalized (chunk, 32), before unnormalization
+```
+
+`x[s]` is the state entering denoising step `s` (`x[0]` is the input
+noise) and `delta[s]` is what the step adds, so
+
+    x[s+1] == x[s] + delta[s]        (bf16 arithmetic, exact)
+    x[-1] + delta[-1] == raw_actions
+
+and for the linear flow-matching schedule `delta[s] == -v[s] / num_steps`
+where `v[s]` is the action expert's velocity prediction at flow time
+`timesteps[s]` (`1, 1-dt, ..., dt`). A consumer computing a flow-SDE
+log-probability needs exactly `x`, `delta` and `timesteps`.
+
+Mechanics: the pipeline is built with two extra buffers of
+`(num_steps, chunk, 32)` bf16 (64 KB at the defaults) and issues two
+device-to-device copies per step inside `transformer_decoder`, so the
+copies are captured into the same CUDA graph as the rest of the
+denoise loop and replay with it. The option is decided at
+construction because the graph either contains those copies or not;
+with it off, the pipeline and its graph are unchanged from before.
+The batched pipeline records a per-slot trace, returned per entry of
+`infer_batch`.
+
+Scope: Pi0.5 RTX `Pi05Pipeline` and `Pi05BatchedPipeline`. The CFG
+pipelines do not record a trace yet and `set_rl_mode` refuses a
+trace-enabled frontend. Thor and FP16 pipelines and the C++ runtime
+export are not covered.
+
+### Batched rollouts, B = N
+
+```python
+rt = Pi05TorchFrontendRtx(ckpt, num_views=2)
+rt.set_batched_mode(enable=True, batch_size=8)   # any B >= 1; default 2
+rt.set_prompt_batch([prompt] * 8)                 # one prompt per slot, padded to a common length
+rt.calibrate_batch([obs])
+out = rt.infer_batch([obs_0, ..., obs_7], noise=noise_8)   # list of 8 results
+```
+
+The batched attention backend and `Pi05BatchedPipeline` take their
+width from `batch_size`; every folded buffer scales with it. The decoder
+defaults to cuBLASLt. The skinny GEMM family requires both
+`FLASHRT_ENABLE_PI05_SKINNY=ON` and explicit `decoder_kernel="skinny"`
+in the single or batched frontend; see `docs/pi05_decoder_skinny.md`.
+The separate `FLASHRT_ENABLE_PI05_NVFP4=ON` build option and explicit
+`prefix_precision="nvfp4"` move vision and encoder GEMMs to approximate
+block-scaled 4-bit operands; FP8 remains the default. See
+`docs/pi05_prefix_nvfp4.md` for the opt-in tier's contract. Slots are
+independent: identical inputs give bit-identical outputs per slot.
+The mixed-slot FP8 test compares each slot with independent B=1 inference
+under identical calibration and the existing synthetic-input cosine gate
+of 0.99; permuting slots must preserve outputs bit-for-bit. GEMM tactics
+change with M, so B=N and B=1 are not promised bit-equal. Compare widths
+using synchronized observation-to-final-action E2E on identical inputs;
+per-environment throughput is not individual request latency. The CFG batched pipeline
+still requires B = 2 (conditioned and unconditioned slots) and
+`set_rl_mode` refuses a wider backend.
+
+### Prompt rotation and several batched widths (fleet serving)
+
+Task-only prompt embeddings (`state is None`) are cached per frontend
+(text, max length), and the tokenizer is built once per process. Repeated tasks
+avoid tokenization and embedding. `set_prompt_batch` uploads only the
+device rows of slots that changed (`set_language_embeds_batch(...,
+slots=[...])`); the cache is dropped on `reload_weights` because the
+embedding table changes. State-bearing prompts always perform the full
+embedding work without retaining entries, so continuously changing robot
+states cannot fill the host/device embedding cache. Unseen tasks also perform
+the full embedding work. `tests/test_pi05_prompt_cache.py` checks rotated prompts
+against cold re-embedding; performance reports must label cache warmup
+and distinguish repeated-input workloads from unseen-input workloads.
+
+```python
+rt.set_batched_mode(enable=True, batch_size=8)
+rt.set_prompt_batch(prompts_8); rt.calibrate_batch([obs])
+rt.select_batch_size(2)                        # parks width 8, enables width 2
+rt.set_prompt_batch(prompts_2); rt.calibrate_batch([obs])
+rt.select_batch_size(8)                        # O(1) swap back; rt.batch_sizes == (2, 8)
+```
+
+`select_batch_size` keeps several batched pipelines in one frontend.
+They share every weight buffer (BF16, FP8 and NVFP4 copies, decoder
+styles: `reload_weights` reaches the parked ones too); each has its own
+attention backend, staging tensors, prompts, FP8 activation scales and
+captured graph. Each extra width therefore consumes setup time and memory.
+A request-level batcher can select the smallest width that fits pending
+requests. Width switches, reload and inference use the same instance lock.
+`tests/test_pi05_batched_widths.py` covers width restoration and reload;
+serving latency must be measured separately with queueing included, not
+inferred from graph replay timing.
+
+### Stochastic sampler (flow-SDE rollouts)
+
+Build with `-DFLASHRT_ENABLE_PI05_SDE=ON` before selecting `sde=True`.
+Both the build option and runtime sampler are off by default.
+
+```python
+rt = Pi05TorchFrontendRtx(ckpt, num_views=2, denoise_trace=True, sde=True)
+out = rt.infer(obs, noise=z, sde_sigma=[0.08] * 9 + [0.0], generator=g)   # or step_noise=eps
+out["step_noise"], out["sde_sigma"]          # (num_steps, chunk, 32) float32 and the schedule
+rt.infer(obs, noise=z)                        # no schedule: the ODE sampler, bit for bit
+```
+
+A frontend built with `sde=True` runs the denoising step as
+`x[s+1] = bf16(x[s] + fma(sigma[s], eps[s], delta[s]))`: the flow
+increment `delta[s]` (what the trace records, so the step mean is still
+`x[s] + delta[s]`) plus per-step Gaussian noise scaled by a per-step
+`sigma`. Both `eps` and `sigma` live in device buffers written per call,
+so one captured graph serves the ODE sampler (no schedule, or all zeros:
+the fused multiply-add with a zero multiplier is exact) and the SDE
+sampler. `step_noise` is `(num_steps, chunk, 32)` (`(num_steps, B, chunk,
+32)` for `infer_batch`); when only a schedule is given the noise is drawn
+from `generator` (after the initial noise) or the default CUDA generator
+and returned, so `(noise, step_noise, sde_sigma)` reproduces the sample
+bit for bit. The skinny step kernel and the library path each have an
+SDE variant; the CFG pipelines do not take it. An on-policy trainer
+evaluates each stochastic step's Gaussian density from `denoise_trace`
+and the schedule (physis `trajectory_log_prob`); steps with `sigma 0`
+are deterministic and carry no density, so a schedule usually ends in
+`0.0` and the final action is the last step's mean.
+`tests/test_pi05_sde_sampler.py`.
+
+### Prefix hidden-state export
+
+```python
+rt = Pi05TorchFrontendRtx(ckpt, num_views=2, prefix_features=True)
+rt.set_prompt(prompt); rt.calibrate([obs])
+feat = rt.infer(obs)["prefix_features"]          # (2048,) float32
+```
+
+With `prefix_features=True` the pipeline copies the Gemma-2B encoder's
+final residual stream (vision + prompt tokens, before the final norm)
+into an export buffer inside the captured graph, and the frontend
+returns its mean over the valid tokens. This is the input a value
+function trained on the VLA's own representation needs, and it costs
+nothing beyond a 2 MB device copy per environment, plus one detail:
+by default the last encoder layer stops after its K/V projection
+because the decoder reads only per-layer K/V, so with the export
+enabled the last layer runs to completion (about 1/18 of the encoder).
+Checked against the torch reference's pre-norm residual stream on the
+same inputs: BF16 path per-token cosine 0.998 and pooled 1.0000; FP8
+path pooled 0.9999 (the export adds the last layer's residual that the
+fused FP8 path leaves pending). Batched: one feature vector per slot.
+
+### Weight hot swap (RL redeploy)
+
+```python
+rt.reload_weights(merged_state)      # a mapping of safetensors-style names, or a checkpoint dir
+rt.weight_version                    # 1, 2, ... after each reload
+```
+
+`reload_weights` writes a new set of weights into the running frontend
+without rebuilding a pipeline or re-capturing a graph: the BF16 weight
+tensors the pipelines point at are overwritten in place (the checkpoint
+conversion streams layer by layer straight into them), the FP8 weights and
+their per-tensor scales are re-quantized into the same buffers (transposed
+decoder copies included), the pre-computed decoder styles of every live
+pipeline are re-uploaded into the existing device buffers, and the current
+prompt(s) are re-embedded with the new embedding table. The captured
+graphs keep replaying; they read the same addresses. The FP8 activation
+scales stay as calibrated (they describe the activation range of the model
+that was calibrated, which moves little across the fine-tuning steps of an
+RL loop); call `calibrate` again to refresh them, which re-captures.
+
+Reload performs a complete streaming conversion preflight before writing
+live weights. Reload, inference, prompt changes and calibration are serialized
+per frontend. A preflight error leaves the model usable; any error after
+mutation permanently invalidates the frontend, and the caller must construct
+a new instance. It never continues inference with mixed weights.
+
+Neither construction nor reload calls `torch.cuda.empty_cache()`. Process-wide
+allocator management belongs to the caller. Earlier reload timing/memory
+measurements predate preflight validation and are not current guarantees.
+
+Against a frontend built fresh from the same weights on the same
+prompt, images and noise: BF16 cosine 0.99999, FP8 (scales kept) 0.9997–
+0.9999; replays after the reload are bit-identical; reloading the original
+weights restores the original output (`tests/test_pi05_weight_reload.py`).
+INT8 modes are not supported.
+
 ## Tests
 
 | test | what it validates |
 |---|---|
+| `tests/test_pi05_seeded_noise_trace.py` | noise injection / seeded reproducibility, trace self-consistency, batched per-slot trace |
+| `tests/test_pi05_batched_n.py` | B = 4 / 8 batched slots vs B = 1, per-env timing, prefix features single vs batched and FP8 vs BF16, CFG refuses B ≠ 2 |
+| `tests/test_pi05_decoder_skinny.py` | skinny FP8 decoder family (sm_120a): GEMM vs FP32, consumers bit-identical to the kernels they replace, attention vs torch, frontend vs the library decoder plus 300 bit-identical replays, batched vs batched |
+| `tests/test_pi05_weight_reload.py` | in-place weight reload vs a fresh build (BF16 and FP8), no re-capture, batched pipeline, mapping source, restore |
+| `tests/test_pi05_prefix_nvfp4.py` | NVFP4 prefix tier: fused GeGLU quantizer bit-identical to the unfused pair, tier vs FP8, batched, reload |
+| `tests/test_pi05_prompt_cache.py` | prompt embedding cache: LRU and tokenizer helpers (host), rotated batch prompts bit-identical to a cold re-embedding and cheap, single-prompt switch, reload drops the cache |
+| `tests/test_pi05_batched_widths.py` | several batched widths in one frontend: width 2 next to width 4 (shared weights, cosine 0.999 per slot), exact swap back, reload reaches the parked width |
+| `tests/test_pi05_sde_sampler.py` | stochastic sampler: no schedule equals the plain frontend (skinny FP8, library FP8, BF16), zero schedule bit-identical, trace consistent under the SDE rule, seeded reproduction, batched per slot |
 | `tests/test_rl_cfg_inference.py` | RTX serial + batched CFG, all βs, validation gates |
 | `tests/test_thor_rl_cfg_inference.py --backends torch,jax` | Thor serial CFG: validation, β=1.0 collapse, β=1.5 finite |
 | `tests/test_cfg_correctness_oracle.py` | per-step C1–C5 contract (RTX) vs frozen reference |

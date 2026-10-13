@@ -33,24 +33,64 @@ def detect_arch() -> str:
     """Return a short string identifier for the current CUDA device.
 
     Supported:
+        ``"npu"``       — Huawei Ascend via torch_npu (CANN 7/8, 910/A2+)
         ``"thor"``      — Jetson AGX Thor, SM110 (cc 11.0)
         ``"rtx_sm120"`` — RTX 5090 / DGX Spark GB10 Blackwell, SM120/SM121
         ``"rtx_sm89"``  — RTX 4090 / Ada, SM89 (cc 8.9)
         ``"rtx_sm87"``  — Jetson Orin via RTX consumer backend, SM87 (cc 8.7)
+        ``"amd_cdna3"`` — AMD Instinct MI300 series, ROCm (gfx942)
+        ``"amd_cdna4"`` — AMD Instinct MI350 series, ROCm (gfx950)
+        ``"amd_rdna35"`` — AMD RDNA 3.5 (gfx1151 / Radeon 8060S)
 
-    Raises RuntimeError if CUDA is unavailable or the card has an
-    unsupported SM level. Deliberately strict: silently falling back to
-    the wrong backend would hide latency/correctness regressions.
+    Raises RuntimeError if no supported accelerator is available or the
+    card has an unsupported SM level. Deliberately strict: silently
+    falling back to the wrong backend would hide latency/correctness
+    regressions.
+
+    **Order matters and is visible to callers.** The Ascend probe runs
+    before the CUDA one, because on a CANN box ``torch.cuda.is_available()``
+    is False while the part is perfectly usable, so a CUDA-first order would
+    reject a working machine. The consequence is that on a host carrying both
+    a usable Ascend device and a CUDA GPU, ``hardware="auto"`` selects the
+    NPU. Pass ``hardware="rtx_sm120"`` (or whichever applies) to pin the
+    other one; an explicit choice is never overridden.
     """
     try:
         import torch
     except ImportError as e:
         raise RuntimeError(
             "FlashRT requires PyTorch for GPU detection") from e
+    # Ascend NPU (torch_npu). Routed before CUDA because on a CANN box
+    # ``torch.cuda.is_available()`` is False while ``torch.npu`` exists.
+    # Importing torch_npu registers the ``torch.npu`` namespace; on a
+    # non-Ascend machine the import simply fails and we fall through.
+    try:
+        import torch_npu  # noqa: F401
+        npu_available = bool(torch.npu.is_available())
+    except Exception:
+        npu_available = False
+    if npu_available:
+        return "npu"
     if not torch.cuda.is_available():
         raise RuntimeError(
-            "FlashRT requires a CUDA-capable GPU "
+            "FlashRT requires a CUDA- or ROCm-capable GPU "
             "(torch.cuda.is_available()==False)")
+    if getattr(torch.version, "hip", None):
+        # ROCm build: route by the gfx architecture name, not the CUDA
+        # cc tuple (which ROCm fills with unrelated values).
+        gcn = torch.cuda.get_device_properties(0).gcnArchName
+        base_arch = gcn.split(":", 1)[0]
+        if base_arch == "gfx942":
+            return "amd_cdna3"
+        if base_arch == "gfx950":
+            return "amd_cdna4"
+        if base_arch == "gfx1151":
+            return "amd_rdna35"
+        raise RuntimeError(
+            f"FlashRT: unsupported ROCm GPU arch {gcn!r}. "
+            "Supported: gfx942 (MI300 series / CDNA3), "
+            "gfx950 (MI350 series / CDNA4), or gfx1151 "
+            "(Radeon 8060S / Ryzen AI Max+ 395).")
     major, minor = torch.cuda.get_device_capability()
     if (major, minor) == (11, 0):
         return "thor"
@@ -72,6 +112,13 @@ def detect_arch() -> str:
 # drag in every backend. External plugins may add entries to this dict
 # to register new models — see ``docs/plugin_model_template.md``.
 _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
+    # ── Spark-X2.5-4B ──
+    # Discovery only, like qwen3_vl: this is a text decoder, not a VLA, so it is
+    # constructed directly rather than through load_model's wrapper. SM120 only
+    # -- the kernels build into a separate module gated on GPU_ARCH 120.
+    ("spark_x25", "torch", "rtx_sm120"):
+        ("flash_rt.frontends.torch.spark_x25_rtx", "SparkX25TorchFrontendRtx"),
+
     # ── Pi0.5 ──
     ("pi05", "torch", "thor"):
         ("flash_rt.frontends.torch.pi05_thor", "Pi05TorchFrontendThor"),
@@ -79,6 +126,15 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
         ("flash_rt.frontends.torch.pi05_rtx", "Pi05TorchFrontendRtx"),
     ("pi05", "torch", "rtx_sm87"):
         ("flash_rt.frontends.torch.pi05_rtx", "Pi05TorchFrontendRtx"),
+    ("pi05", "torch", "amd_cdna4"):
+        ("flash_rt.amd.frontends.torch.pi05", "Pi05TorchFrontendAmd"),
+    ("pi05", "torch", "amd_cdna3"):
+        ("flash_rt.amd.frontends.torch.pi05", "Pi05TorchFrontendAmd"),
+    ("pi05", "torch", "amd_rdna35"):
+        ("flash_rt.amd.frontends.torch.pi05_rdna35",
+         "Pi05TorchFrontendAmdRdna35"),
+    ("pi05", "torch", "npu"):
+        ("flash_rt.npu.frontends.torch.pi05", "Pi05TorchFrontendNpu"),
     ("pi05", "torch", "rtx_sm89"):
         ("flash_rt.frontends.torch.pi05_rtx", "Pi05TorchFrontendRtx"),
     ("pi05", "jax", "thor"):
@@ -107,6 +163,8 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
         ("flash_rt.frontends.torch.hyvla_thor", "HyVLATorchFrontendThor"),
     ("hyvla", "torch", "rtx_sm87"):
         ("flash_rt.frontends.torch.hyvla_orin", "HyVLATorchFrontendOrin"),
+    ("hyvla", "torch", "rtx_sm120"):
+        ("flash_rt.frontends.torch.hyvla_rtx", "HyVLATorchFrontendRtx"),
 
     # ── GROOT N1.6 ──
     ("groot", "torch", "thor"):
@@ -124,6 +182,14 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     ("groot_n17", "torch", "rtx_sm89"):
         ("flash_rt.frontends.torch.groot_n17_rtx_sm89",
          "GrootN17TorchFrontendRtxSm89"),
+    ("groot_n17", "torch", "npu"):
+        ("flash_rt.npu.frontends.torch.groot_n17", "GrootN17TorchFrontendNpu"),
+    ("groot_n17", "torch", "amd_cdna4"):
+        ("flash_rt.amd.frontends.torch.groot_n17",
+         "GrootN17TorchFrontendAmd"),
+    ("groot_n17", "torch", "amd_cdna3"):
+        ("flash_rt.amd.frontends.torch.groot_n17",
+         "GrootN17TorchFrontendAmd"),
 
     # ── Motus (Wan2.2 + Qwen-VL + action/understanding experts) ──
     # RTX 5090 path only for now. Motus uses a bundle-based E2E contract

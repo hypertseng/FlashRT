@@ -26,6 +26,7 @@ import math
 import os
 import pathlib
 import time
+import threading
 from typing import Optional, Union
 
 import numpy as np
@@ -34,6 +35,7 @@ import torch.nn.functional as F
 
 from flash_rt.core.utils.actions import unnormalize_actions, LIBERO_ACTION_DIM
 from flash_rt.frontends._fp8_layout import select_fp8_layout
+from flash_rt.models.pi05._lifecycle import serialized, reload_guard
 from flash_rt.hardware.rtx.attn_backend import RtxFlashAttnBackend
 from flash_rt.models.pi05.pipeline_rtx import (
     Pi05Pipeline,
@@ -79,8 +81,74 @@ def _interleave_qk(w: torch.Tensor, num_heads: int) -> torch.Tensor:
     )
 
 
-def convert_pi05_safetensors(safetensors_path: Union[str, pathlib.Path]) -> dict:
+class _StateReader:
+    """Uniform ``keys()`` / ``get_tensor()`` over a safetensors file or an
+    in-memory state dict (safetensors-style names)."""
+
+    def __init__(self, source):
+        if isinstance(source, (str, pathlib.Path)):
+            from safetensors import safe_open
+            self._file = safe_open(str(source), framework="pt")
+            self._dict = None
+        else:
+            self._file = None
+            self._dict = source
+
+    def keys(self):
+        return self._file.keys() if self._file is not None else list(self._dict.keys())
+
+    def get_tensor(self, key: str) -> torch.Tensor:
+        if self._file is not None:
+            return self._file.get_tensor(key)
+        return self._dict[key]
+
+
+class _SinkDict(dict):
+    """dict that hands every stored tensor to ``sink(key, tensor, layer)``
+    and keeps nothing, so a conversion can stream into existing buffers."""
+
+    def __init__(self, sink):
+        super().__init__()
+        self._sink = sink
+
+    def __setitem__(self, key, value):
+        if value is not None:
+            self._sink(key, value, None)
+
+    def put_layer(self, key, layer, value):
+        self._sink(key, value, layer)
+
+
+class _LayerList(list):
+    """Per-layer tensors of one stacked checkpoint group. With a sink
+    destination every appended tensor is handed over at once (layer by
+    layer) instead of being kept for the final stack."""
+
+    def __init__(self, key, ckpt):
+        super().__init__()
+        self._key = key
+        self._ckpt = ckpt if isinstance(ckpt, _SinkDict) else None
+        self._layer = 0
+
+    def append(self, value):
+        if self._ckpt is not None:
+            self._ckpt.put_layer(self._key, self._layer, value)
+            self._layer += 1
+        else:
+            super().append(value)
+
+
+def _stack(layers: list):
+    return torch.stack(layers) if len(layers) else None
+
+
+def convert_pi05_safetensors(safetensors_path, sink=None) -> dict:
     """Convert a HuggingFace Pi0.5 safetensors file to BF16 torch tensor dict.
+
+    ``safetensors_path`` may also be an in-memory mapping of the same
+    tensor names (a merged checkpoint that never touched disk). With
+    ``sink`` the converted tensors are passed to ``sink(key, tensor)`` one
+    by one instead of being collected (the returned dict is then empty).
 
     Key transformations (verified bit-exact against the openpi PyTorch
     reference forward on LIBERO data):
@@ -97,22 +165,26 @@ def convert_pi05_safetensors(safetensors_path: Union[str, pathlib.Path]) -> dict
         by ``-1.0 / num_steps`` (matching the flow-matching residual accumulation).
       - 10-step sinusoidal time embeddings.
     """
-    from safetensors import safe_open
     from flash_rt.executors.torch_weights import _autodetect_strip_prefix
 
-    logger.info("Loading Pi0.5 safetensors: %s", safetensors_path)
-    f = safe_open(str(safetensors_path), framework="pt")
+    if isinstance(safetensors_path, (str, pathlib.Path)):
+        logger.info("Loading Pi0.5 safetensors: %s", safetensors_path)
+    f = _StateReader(safetensors_path)
+    ckpt: dict = _SinkDict(sink) if sink is not None else {}
     # Auto-strip the lerobot HF policy ``model.`` wrap so the openpi
     # bare-key lookups below resolve transparently on either layout.
     _strip = _autodetect_strip_prefix(set(f.keys()))
 
+    # Tensors are moved to the GPU as they are read: the layout work below
+    # (transposes, head interleaving, norm folds) is hundreds of small ops
+    # that are slow on the host, and streaming one tensor at a time keeps
+    # the peak at one converted copy of the model.
     def g(key: str) -> torch.Tensor:
-        return f.get_tensor((_strip + key) if _strip else key).to(bf16)
+        return f.get_tensor((_strip + key) if _strip else key).to("cuda", bf16, non_blocking=True)
 
     def g_raw(key: str) -> torch.Tensor:
-        return f.get_tensor((_strip + key) if _strip else key)
+        return f.get_tensor((_strip + key) if _strip else key).to("cuda", non_blocking=True)
 
-    ckpt: dict = {}
 
     # ── Vision encoder (27 SigLIP layers) ──
     vp = "paligemma_with_expert.paligemma.model.vision_tower.vision_model"
@@ -123,12 +195,12 @@ def convert_pi05_safetensors(safetensors_path: Union[str, pathlib.Path]) -> dict
     ckpt["vision_patch_embedding_b"] = g(f"{vp}.embeddings.patch_embedding.bias")
     ckpt["vision_position_embedding"] = g(f"{vp}.embeddings.position_embedding.weight")
 
-    qkv_w_list, qkv_b_list = [], []
-    o_w_list, o_b_list = [], []
-    up_w_list, up_b_list = [], []
-    down_w_list, down_b_list = [], []
-    ln1_w_list, ln1_b_list = [], []
-    ln2_w_list, ln2_b_list = [], []
+    qkv_w_list, qkv_b_list = _LayerList("vision_attn_qkv_w", ckpt), _LayerList("vision_attn_qkv_b", ckpt)
+    o_w_list, o_b_list = _LayerList("vision_attn_o_w", ckpt), _LayerList("vision_attn_o_b", ckpt)
+    up_w_list, up_b_list = _LayerList("vision_ffn_up_w", ckpt), _LayerList("vision_ffn_up_b", ckpt)
+    down_w_list, down_b_list = _LayerList("vision_ffn_down_w", ckpt), _LayerList("vision_ffn_down_b", ckpt)
+    ln1_w_list, ln1_b_list = _LayerList("vision_pre_attn_norm_w", ckpt), _LayerList("vision_pre_attn_norm_b", ckpt)
+    ln2_w_list, ln2_b_list = _LayerList("vision_pre_ffn_norm_w", ckpt), _LayerList("vision_pre_ffn_norm_b", ckpt)
 
     for i in range(VIS_L):
         lp = f"{vp}.encoder.layers.{i}"
@@ -156,18 +228,18 @@ def convert_pi05_safetensors(safetensors_path: Union[str, pathlib.Path]) -> dict
         ln2_w_list.append(g(f"{lp}.layer_norm2.weight"))
         ln2_b_list.append(g(f"{lp}.layer_norm2.bias"))
 
-    ckpt["vision_attn_qkv_w"] = torch.stack(qkv_w_list)
-    ckpt["vision_attn_qkv_b"] = torch.stack(qkv_b_list)
-    ckpt["vision_attn_o_w"] = torch.stack(o_w_list)
-    ckpt["vision_attn_o_b"] = torch.stack(o_b_list)
-    ckpt["vision_ffn_up_w"] = torch.stack(up_w_list)
-    ckpt["vision_ffn_up_b"] = torch.stack(up_b_list)
-    ckpt["vision_ffn_down_w"] = torch.stack(down_w_list)
-    ckpt["vision_ffn_down_b"] = torch.stack(down_b_list)
-    ckpt["vision_pre_attn_norm_w"] = torch.stack(ln1_w_list)
-    ckpt["vision_pre_attn_norm_b"] = torch.stack(ln1_b_list)
-    ckpt["vision_pre_ffn_norm_w"] = torch.stack(ln2_w_list)
-    ckpt["vision_pre_ffn_norm_b"] = torch.stack(ln2_b_list)
+    ckpt["vision_attn_qkv_w"] = _stack(qkv_w_list)
+    ckpt["vision_attn_qkv_b"] = _stack(qkv_b_list)
+    ckpt["vision_attn_o_w"] = _stack(o_w_list)
+    ckpt["vision_attn_o_b"] = _stack(o_b_list)
+    ckpt["vision_ffn_up_w"] = _stack(up_w_list)
+    ckpt["vision_ffn_up_b"] = _stack(up_b_list)
+    ckpt["vision_ffn_down_w"] = _stack(down_w_list)
+    ckpt["vision_ffn_down_b"] = _stack(down_b_list)
+    ckpt["vision_pre_attn_norm_w"] = _stack(ln1_w_list)
+    ckpt["vision_pre_attn_norm_b"] = _stack(ln1_b_list)
+    ckpt["vision_pre_ffn_norm_w"] = _stack(ln2_w_list)
+    ckpt["vision_pre_ffn_norm_b"] = _stack(ln2_b_list)
     ckpt["vision_final_norm_w"] = g(f"{vp}.post_layernorm.weight")
     ckpt["vision_final_norm_b"] = g(f"{vp}.post_layernorm.bias")
 
@@ -178,8 +250,8 @@ def convert_pi05_safetensors(safetensors_path: Union[str, pathlib.Path]) -> dict
 
     # ── Encoder (18 Gemma-2B layers with RMSNorm fold) ──
     ep = "paligemma_with_expert.paligemma.model.language_model.layers"
-    enc_qkv_list, enc_o_list = [], []
-    enc_gate_list, enc_up_list, enc_down_list = [], [], []
+    enc_qkv_list, enc_o_list = _LayerList("encoder_attn_qkv_w", ckpt), _LayerList("encoder_attn_o_w", ckpt)
+    enc_gate_list, enc_up_list, enc_down_list = _LayerList("encoder_ffn_gate_w", ckpt), _LayerList("encoder_ffn_up_w", ckpt), _LayerList("encoder_ffn_down_w", ckpt)
 
     for i in range(ENC_L):
         # CRITICAL: fuse in FP32 — bf16 rounds values near -1.0 to exactly
@@ -210,18 +282,18 @@ def convert_pi05_safetensors(safetensors_path: Union[str, pathlib.Path]) -> dict
 
         enc_down_list.append(g(f"{ep}.{i}.mlp.down_proj.weight").t())
 
-    ckpt["encoder_attn_qkv_w"] = torch.stack(enc_qkv_list)
-    ckpt["encoder_attn_o_w"] = torch.stack(enc_o_list)
-    ckpt["encoder_ffn_gate_w"] = torch.stack(enc_gate_list)
-    ckpt["encoder_ffn_up_w"] = torch.stack(enc_up_list)
-    ckpt["encoder_ffn_down_w"] = torch.stack(enc_down_list)
+    ckpt["encoder_attn_qkv_w"] = _stack(enc_qkv_list)
+    ckpt["encoder_attn_o_w"] = _stack(enc_o_list)
+    ckpt["encoder_ffn_gate_w"] = _stack(enc_gate_list)
+    ckpt["encoder_ffn_up_w"] = _stack(enc_up_list)
+    ckpt["encoder_ffn_down_w"] = _stack(enc_down_list)
 
     # ── Decoder (18 Gemma-300M layers) ──
     dp = "paligemma_with_expert.gemma_expert.model.layers"
-    dec_qkv_list, dec_o_list = [], []
-    dec_gate_list, dec_up_list, dec_down_list = [], [], []
-    dec_attn_mod_w_list, dec_attn_mod_b_list = [], []
-    dec_ffn_mod_w_list, dec_ffn_mod_b_list = [], []
+    dec_qkv_list, dec_o_list = _LayerList("decoder_attn_qkv_w", ckpt), _LayerList("decoder_attn_o_w", ckpt)
+    dec_gate_list, dec_up_list, dec_down_list = _LayerList("decoder_ffn_gate_w", ckpt), _LayerList("decoder_ffn_up_w", ckpt), _LayerList("decoder_ffn_down_w", ckpt)
+    dec_attn_mod_w_list, dec_attn_mod_b_list = _LayerList("decoder_pre_attn_norm_mod_w", ckpt), _LayerList("decoder_pre_attn_norm_mod_b", ckpt)
+    dec_ffn_mod_w_list, dec_ffn_mod_b_list = _LayerList("decoder_pre_ffn_norm_mod_w", ckpt), _LayerList("decoder_pre_ffn_norm_mod_b", ckpt)
 
     for i in range(DEC_L):
         dec_attn_mod_w_list.append(g(f"{dp}.{i}.input_layernorm.dense.weight").t())
@@ -245,15 +317,15 @@ def convert_pi05_safetensors(safetensors_path: Union[str, pathlib.Path]) -> dict
         dec_up_list.append(g(f"{dp}.{i}.mlp.up_proj.weight").t())
         dec_down_list.append(g(f"{dp}.{i}.mlp.down_proj.weight").t())
 
-    ckpt["decoder_attn_qkv_w"] = torch.stack(dec_qkv_list)
-    ckpt["decoder_attn_o_w"] = torch.stack(dec_o_list)
-    ckpt["decoder_ffn_gate_w"] = torch.stack(dec_gate_list)
-    ckpt["decoder_ffn_up_w"] = torch.stack(dec_up_list)
-    ckpt["decoder_ffn_down_w"] = torch.stack(dec_down_list)
-    ckpt["decoder_pre_attn_norm_mod_w"] = torch.stack(dec_attn_mod_w_list)
-    ckpt["decoder_pre_attn_norm_mod_b"] = torch.stack(dec_attn_mod_b_list)
-    ckpt["decoder_pre_ffn_norm_mod_w"] = torch.stack(dec_ffn_mod_w_list)
-    ckpt["decoder_pre_ffn_norm_mod_b"] = torch.stack(dec_ffn_mod_b_list)
+    ckpt["decoder_attn_qkv_w"] = _stack(dec_qkv_list)
+    ckpt["decoder_attn_o_w"] = _stack(dec_o_list)
+    ckpt["decoder_ffn_gate_w"] = _stack(dec_gate_list)
+    ckpt["decoder_ffn_up_w"] = _stack(dec_up_list)
+    ckpt["decoder_ffn_down_w"] = _stack(dec_down_list)
+    ckpt["decoder_pre_attn_norm_mod_w"] = _stack(dec_attn_mod_w_list)
+    ckpt["decoder_pre_attn_norm_mod_b"] = _stack(dec_attn_mod_b_list)
+    ckpt["decoder_pre_ffn_norm_mod_w"] = _stack(dec_ffn_mod_w_list)
+    ckpt["decoder_pre_ffn_norm_mod_b"] = _stack(dec_ffn_mod_b_list)
 
     ckpt["decoder_final_norm_mod_w"] = g(
         "paligemma_with_expert.gemma_expert.model.norm.dense.weight").t()
@@ -295,38 +367,79 @@ def convert_pi05_safetensors(safetensors_path: Union[str, pathlib.Path]) -> dict
     return ckpt
 
 
-def _embed_prompt(prompt_text: str, embedding_weight: torch.Tensor,
-                  max_len: int = 48, state=None) -> tuple[torch.Tensor, int]:
-    """Tokenise + embed via PaliGemma embedding table (CUDA, bf16)."""
-    # PaliGemma tokenizer resolution — see
-    # `flash_rt.utils.paligemma_tokenizer` for the search order and
-    # the download instructions emitted on failure.
+_TOKENIZERS: dict = {}
+
+
+def _get_tokenizer(max_len: int):
+    """Tokenizer instance, built once per process.
+
+    Returns ``("openpi", PaligemmaTokenizer)`` when openpi is importable
+    and its tokenizer can be constructed, else ``("sp", SentencePiece)``
+    through the FlashRT locator. Building either re-reads the 4 MiB
+    SentencePiece model from disk (~40 ms), which used to be paid on
+    every prompt change, per prompt.
+    """
+    key = ("openpi", int(max_len))
+    tok = _TOKENIZERS.get(key)
+    if tok is not None:
+        return tok
     try:
         # Preferred: openpi's PaligemmaTokenizer (exact same vocab,
         # same prompt prefix logic FlashRT was built against).
         from openpi.models.tokenizer import PaligemmaTokenizer
-        tokenizer = PaligemmaTokenizer(max_len=max_len)
-        tokens_np, mask_np = tokenizer.tokenize(prompt_text, state=state)
-        prompt_len = int(mask_np.sum())
-        token_ids = torch.tensor(
-            tokens_np[:prompt_len], dtype=torch.long, device="cuda")
+        tok = ("openpi", PaligemmaTokenizer(max_len=max_len))
+        _TOKENIZERS[key] = tok
+        return tok
     except (ImportError, FileNotFoundError, OSError, RuntimeError):
+        pass
+    tok = _TOKENIZERS.get(("sp",))
+    if tok is None:
         # Fallback: locate the SentencePiece model directly via the
         # FlashRT helper (clear error if not found — never silent
         # segfault).
         from flash_rt.utils.paligemma_tokenizer import (
             load_paligemma_sentencepiece,
         )
-        sp = load_paligemma_sentencepiece()
-        if state is None:
-            # 108 is PaliGemma's `\n` token, used by openpi as the
-            # prompt-end separator before the action prefix.
-            tokens = [sp.bos_id()] + sp.Encode(prompt_text) + [108]
-        else:
-            tokens = sp.Encode(format_pi05_prompt(prompt_text, state),
-                               add_bos=True)
-        token_ids = torch.tensor(tokens, dtype=torch.long, device="cuda")
-        prompt_len = len(token_ids)
+        tok = ("sp", load_paligemma_sentencepiece())
+        _TOKENIZERS[("sp",)] = tok
+    return tok
+
+
+def _prompt_token_ids(prompt_text: str, max_len: int = 48, state=None) -> list:
+    """Token ids for a prompt (host side), via the cached tokenizer."""
+    kind, tok = _get_tokenizer(max_len)
+    if kind == "openpi":
+        try:
+            tokens_np, mask_np = tok.tokenize(prompt_text, state=state)
+            prompt_len = int(mask_np.sum())
+            return [int(t) for t in tokens_np[:prompt_len]]
+        except (FileNotFoundError, OSError, RuntimeError):
+            _TOKENIZERS.pop(("openpi", int(max_len)), None)
+            kind, tok = _get_tokenizer(max_len)
+            if kind == "openpi":
+                raise
+    sp = tok
+    if state is None:
+        # Same normalization as openpi's PaligemmaTokenizer (strip,
+        # "_" and "\n" become spaces) so both tokenizer paths yield
+        # the same ids; matters for RL prompts that carry a "\n"
+        # before the advantage tag. 108 is PaliGemma's `\n` token,
+        # used by openpi as the prompt-end separator before the
+        # action prefix.
+        from flash_rt.utils.paligemma_tokenizer import encode_pi05_prompt
+        return encode_pi05_prompt(sp, prompt_text)
+    return list(sp.Encode(format_pi05_prompt(prompt_text, state), add_bos=True))
+
+
+def _embed_prompt(prompt_text: str, embedding_weight: torch.Tensor,
+                  max_len: int = 48, state=None) -> tuple[torch.Tensor, int]:
+    """Tokenise + embed via PaliGemma embedding table (CUDA, bf16)."""
+    # PaliGemma tokenizer resolution — see
+    # `flash_rt.utils.paligemma_tokenizer` for the search order and
+    # the download instructions emitted on failure.
+    tokens = _prompt_token_ids(prompt_text, max_len=max_len, state=state)
+    token_ids = torch.tensor(tokens, dtype=torch.long, device="cuda")
+    prompt_len = len(tokens)
 
     if embedding_weight.device.type != "cuda":
         embedding_weight = embedding_weight.to(device="cuda")
@@ -336,17 +449,58 @@ def _embed_prompt(prompt_text: str, embedding_weight: torch.Tensor,
     return embeds, prompt_len
 
 
+class _PromptEmbedCache:
+    """Per-frontend cache of prompt embeddings (device bf16 rows + the
+    host uint16 copy the pipelines upload), keyed by prompt text, state
+    and max length. A fleet cycles through a few dozen task strings;
+    without the cache every episode boundary re-tokenised, re-embedded
+    and synchronised every slot of the batch. Cleared on weight reload
+    (the embedding table changes)."""
+
+    def __init__(self, capacity: int = 512):
+        self._d: dict = {}
+        self._cap = int(capacity)
+
+    @staticmethod
+    def key(prompt_text: str, max_len: int, state):
+        st = None
+        if state is not None:
+            st = np.asarray(state, dtype=np.float32).tobytes()
+        return (str(prompt_text), int(max_len), st)
+
+    def get(self, key):
+        v = self._d.get(key)
+        if v is not None:
+            # move to the back: least recently used is evicted first
+            self._d.pop(key)
+            self._d[key] = v
+        return v
+
+    def put(self, key, value) -> None:
+        if len(self._d) >= self._cap:
+            self._d.pop(next(iter(self._d)))
+        self._d[key] = value
+
+    def clear(self) -> None:
+        self._d.clear()
+
+    def __len__(self) -> int:
+        return len(self._d)
+
+
 # ════════════════════════════════════════════════════════════════════
 #   Weight FP8 quantization + precomputed decoder styles
 # ════════════════════════════════════════════════════════════════════
 
 
 def _quantize_fp8_e4m3(w_bf16: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-tensor symmetric FP8 E4M3 quantization."""
-    amax = w_bf16.float().abs().max().item()
-    scale = max(amax / 448.0, 1e-12)
-    w_fp8 = (w_bf16.float() / scale).clamp(-448.0, 448.0).to(fp8_e4m3)
-    scale_tensor = torch.tensor([scale], dtype=torch.float32, device="cuda")
+    """Per-tensor symmetric FP8 E4M3 quantization (no host sync: the scale
+    stays a device tensor so hundreds of tensors quantize back to back)."""
+    w = w_bf16.float()
+    # Match the original Python-double scale and scalar-division rounding.
+    # FP32 scale arithmetic can move BF16 weights across FP8 midpoints.
+    scale_tensor = (w.abs().amax().double() / 448.0).clamp_min(1e-12).float().reshape(1)
+    w_fp8 = (w * scale_tensor.reciprocal()).clamp(-448.0, 448.0).to(fp8_e4m3)
     return w_fp8, scale_tensor
 
 
@@ -473,8 +627,48 @@ class Pi05TorchFrontendRtx:
                  use_fp8: bool = True,
                  hardware: Optional[str] = None,
                  fp8_layout: Optional[str] = None,
-                 state_prompt_mode: str = "exact"):
+                 state_prompt_mode: str = "exact",
+                 use_cuda_graph: bool = True,
+                 denoise_trace: bool = False,
+                 prefix_features: bool = False,
+                 decoder_kernel: Optional[str] = None,
+                 prefix_precision: Optional[str] = None,
+                 sde: bool = False):
         checkpoint_dir = pathlib.Path(checkpoint_dir)
+        # Stochastic sampler: pipelines take a per-step noise scale and
+        # per-step noise (infer(..., sde_sigma=, step_noise=)); with no
+        # sigma the sampler is the ODE one bit for bit. Construction-time
+        # because the buffers are read by the captured graph.
+        self._sde = bool(sde)
+        # Prefix (SigLIP + Gemma-2B) GEMM precision: "fp8" (per-tensor,
+        # calibrated) or "nvfp4" (block-scaled 4-bit weights and
+        # activations, no calibration, sm_120a only). The decoder is not
+        # affected. FLASHRT_PI05_PREFIX_PRECISION overrides the default.
+        self._prefix_precision = (prefix_precision
+                                  or os.environ.get("FLASHRT_PI05_PREFIX_PRECISION", "fp8")).lower()
+        if self._prefix_precision not in ("fp8", "nvfp4"):
+            raise ValueError(f"prefix_precision must be fp8 or nvfp4, got {self._prefix_precision!r}")
+        # Decoder GEMM family for the calibrated FP8 decoder: "auto" picks
+        # the skinny K-split kernels on sm_120a builds, "cublaslt" keeps
+        # the library GEMMs, "skinny" requires the kernels. The environment
+        # variable FLASHRT_PI05_DECODER_KERNEL overrides the default.
+        self._lifecycle_lock = threading.RLock()
+        self._reload_failed = False
+        self._decoder_kernel = (decoder_kernel
+                                or os.environ.get("FLASHRT_PI05_DECODER_KERNEL", "cublaslt"))
+        # Batched-mode width; set_batched_mode(batch_size=N) changes it.
+        self._batch_size = PI05_BATCH_SIZE
+        # Prefix features: pipelines export the encoder's final hidden
+        # state and infer()/infer_batch() return its mean over the valid
+        # (vision + prompt) tokens under "prefix_features". Off by default.
+        self._prefix_features = bool(prefix_features)
+        self._last_prompt_len = 0
+        # Denoise trace: every pipeline this frontend builds records the
+        # per-step state and increment of the denoising loop, returned by
+        # infer()/infer_batch() under "denoise_trace". Construction-time
+        # because the copies are captured into the CUDA graph. Off by
+        # default; the default graphs are then unchanged.
+        self._denoise_trace = bool(denoise_trace)
         # State-in-prompt graph strategy (Pi0.5 renders robot state into the
         # prompt, so its token length drifts with the state values):
         #   "exact" (default): a separate pipeline captured per exact length,
@@ -518,6 +712,7 @@ class Pi05TorchFrontendRtx:
                 f"got {self._vision_num_layers}")
         # _use_int8_vision_static is set after _force_int8_decoder below
         self.use_fp8 = bool(use_fp8)
+        self.use_cuda_graph = bool(use_cuda_graph)
         self.hardware = _resolve_effective_hardware(hardware)
         self.fp8_layout = select_fp8_layout(hardware, fp8_layout)
 
@@ -601,6 +796,12 @@ class Pi05TorchFrontendRtx:
         self._int8_weight_scales: dict[str, torch.Tensor] = {}
         if self.use_fp8 and not self._force_bf16 and not self._force_int8_decoder:
             self._quantize_all_fp8()
+        self._nvfp4_weights: dict = {}
+        self._nvfp4_store: list = []
+        if self._prefix_precision == "nvfp4":
+            if not (self.use_fp8 and not self._force_bf16 and not self._force_int8_decoder):
+                raise ValueError("prefix_precision='nvfp4' needs the FP8 frontend (use_fp8=True)")
+            self._quantize_prefix_nvfp4()
         if self._force_int8_decoder:
             self._quantize_decoder_int8()
         if self._use_int8_encoder:
@@ -634,6 +835,11 @@ class Pi05TorchFrontendRtx:
             self.chunk_size, ACTION_DIM, dtype=bf16, device="cuda")
         self._noise_out = torch.empty(
             self.chunk_size, ACTION_DIM, dtype=bf16, device="cuda")
+        if self._denoise_trace:
+            self._trace_x_out = torch.empty(
+                self._num_steps, self.chunk_size, ACTION_DIM,
+                dtype=bf16, device="cuda")
+            self._trace_delta_out = torch.empty_like(self._trace_x_out)
         from flash_rt.core.cuda_buffer import _cudart
         self._cudart = _cudart
 
@@ -662,6 +868,12 @@ class Pi05TorchFrontendRtx:
                     self.max_prompt_len)
 
     def _pipeline_precision_kwargs(self) -> dict:
+        kwargs = self._pipeline_precision_kwargs_base()
+        kwargs["decoder_kernel"] = self._decoder_kernel
+        kwargs["prefix_precision"] = self._prefix_precision
+        return kwargs
+
+    def _pipeline_precision_kwargs_base(self) -> dict:
         if self._force_int8_decoder or getattr(self, "_int8_encoder_only", False):
             mode = ("INT8 encoder+decoder" if self._force_int8_decoder
                     else "INT8 encoder only (decoder stays BF16 for M=10 efficiency)")
@@ -716,11 +928,21 @@ class Pi05TorchFrontendRtx:
             raise FileNotFoundError(
                 f"norm_stats not found near checkpoint: {e}") from e
 
-    def _quantize_all_fp8(self) -> None:
-        """Pre-quantize all large GEMM weights to FP8 E4M3."""
+    def _quantize_all_fp8(self, inplace: bool = False) -> None:
+        """Pre-quantize all large GEMM weights to FP8 E4M3.
+
+        With ``inplace=True`` (weight reload) every quantized tensor and
+        scale is written into the buffer the pipelines already point at.
+        """
         W = self._ckpt_bf16
         store = self._fp8_store
         fp8 = self._fp8_weights
+
+        if inplace:
+            store_index = self._fp8_store_index
+        else:
+            store_index = {}
+            self._fp8_store_index = store_index
 
         def quant(name: str, w: torch.Tensor):
             if self.fp8_layout == "nk":
@@ -728,6 +950,12 @@ class Pi05TorchFrontendRtx:
             else:
                 w = w.contiguous()
             w_fp8, scale = _quantize_fp8_e4m3(w)
+            if inplace:
+                idx = store_index[name]
+                store[idx].copy_(w_fp8)
+                store[idx + 1].copy_(scale)
+                return
+            store_index[name] = len(store)
             store.append(w_fp8)
             store.append(scale)
             fp8[name] = (w_fp8.data_ptr(), scale.data_ptr())
@@ -761,6 +989,241 @@ class Pi05TorchFrontendRtx:
             quant(f"decoder_ffn_down_w_{i}", W["decoder_ffn_down_w"][i])
 
         logger.info("FP8 quantized %d GEMM weights (layout=%s)", len(fp8), self.fp8_layout)
+
+        # The skinny decoder family streams weight rows, i.e. wants [N, K].
+        # On the "kn" layout keep a transposed copy of the decoder weights
+        # under "<name>__nk" (same values, same per-tensor scale); the
+        # calibration and fallback paths keep using the "kn" tensors.
+        if self.fp8_layout == "kn" and self._skinny_weights_wanted():
+            n_copies = 0
+            for i in range(DEC_L):
+                for base in ("decoder_attn_qkv_w", "decoder_attn_o_w",
+                             "decoder_ffn_gate_up_w", "decoder_ffn_down_w"):
+                    name = f"{base}_{i}"
+                    w_fp8, scale = store[store_index[name]], store[store_index[name] + 1]
+                    w_nk = w_fp8.view(torch.uint8).t().contiguous().view(w_fp8.dtype)
+                    if inplace:
+                        store[store_index[name + "__nk"]].copy_(w_nk)
+                        continue
+                    store_index[name + "__nk"] = len(store)
+                    store.append(w_nk)
+                    fp8[name + "__nk"] = (w_nk.data_ptr(), scale.data_ptr())
+                    n_copies += 1
+            if not inplace:
+                logger.info("FP8 decoder weights transposed for the skinny family: %d", n_copies)
+
+    # -----------------------------------------------------------------
+    # Weight hot swap
+    # -----------------------------------------------------------------
+
+    @property
+    def weight_version(self) -> int:
+        """Number of successful :meth:`reload_weights` calls."""
+        return getattr(self, "_weight_version", 0)
+
+    def _live_pipelines(self) -> list:
+        seen: dict[int, object] = {}
+        parked = [c.get("pipeline") for c in getattr(self, "_batch_ctx", {}).values()]
+        for pipe in [self.pipeline, getattr(self, "_fixed_pipeline", None),
+                     *getattr(self, "_prompt_pipeline_cache", {}).values(), *parked]:
+            if pipe is not None:
+                seen[id(pipe)] = pipe
+        return list(seen.values())
+
+    @reload_guard
+    def reload_weights(self, source) -> float:
+        """Replace every model weight in place without rebuilding or
+        re-capturing anything.
+
+        ``source`` is a checkpoint directory, a ``model.safetensors`` path
+        or an in-memory mapping of safetensors-style tensor names (for
+        example a LoRA merge that never touched disk). The tensors must
+        have the shapes of the loaded model.
+
+        What is refreshed: the BF16 weight tensors the pipelines point at
+        (copied in place, output projection pre-scaled as at load time),
+        the FP8 weight tensors and their per-tensor scales (re-quantized
+        into the same buffers, transposed copies included), the
+        pre-computed decoder styles of every live pipeline (uploaded into
+        the existing device buffers) and the language embeddings of the
+        current prompt(s). Captured CUDA graphs keep replaying; they read
+        the same addresses.
+
+        What is kept: the FP8 activation scales from the last calibration.
+        They describe the activation range of the model that was
+        calibrated; for the usual fine-tuning steps of an RL loop that
+        range moves little. Call :meth:`calibrate` again to refresh them
+        (that re-captures the graph).
+
+        INT8 modes are not supported. Returns the wall time in seconds.
+        """
+        if self._int8_weights or self._force_int8_decoder:
+            raise NotImplementedError("weight reload is not available for INT8 modes")
+        t0 = time.perf_counter()
+        if isinstance(source, (str, pathlib.Path)):
+            from safetensors.torch import load_file
+            path = pathlib.Path(source)
+            if path.is_dir():
+                path = path / "model.safetensors"
+            source = load_file(str(path))
+        scale_out = -1.0 / self._num_steps
+
+        # Complete conversion/shape preflight before touching graph-owned storage.
+        # Streaming twice avoids holding a second full model on the device.
+        seen = set()
+        def validate(key, value, layer):
+            if not isinstance(value, torch.Tensor):
+                return
+            if key not in self._ckpt_bf16:
+                raise ValueError(f"reload_weights: unexpected converted key {key}")
+            dst = self._ckpt_bf16[key]
+            if layer is not None:
+                dst = dst[layer]
+            if value.shape != dst.shape or value.dtype != dst.dtype:
+                raise ValueError(f"reload_weights: incompatible shape/dtype for {key}")
+            seen.add((key, layer))
+
+        for key, value in source.items():
+            if not isinstance(value, torch.Tensor) or not value.is_floating_point():
+                raise ValueError(f"reload_weights: {key} must be a floating-point tensor")
+        convert_pi05_safetensors(source, sink=validate)
+        for key, value in self._ckpt_bf16.items():
+            if isinstance(value, torch.Tensor) and (key, None) not in seen:
+                if not all((key, layer) in seen for layer in range(value.shape[0])):
+                    raise ValueError(f"reload_weights: missing converted weight {key}")
+        torch.cuda.synchronize()
+        self._reload_mutating = True
+
+        def sink(key: str, value, layer) -> None:
+            if not isinstance(value, torch.Tensor):
+                return
+            dst = self._ckpt_bf16.get(key)
+            if dst is None:
+                return
+            if layer is not None:
+                dst = dst[layer]
+            if tuple(dst.shape) != tuple(value.shape):
+                raise ValueError(
+                    f"reload_weights: {key} has shape {tuple(value.shape)}, "
+                    f"loaded model has {tuple(dst.shape)}")
+            value = value.to("cuda", bf16)
+            if key in ("decoder_action_out_proj_w", "decoder_action_out_proj_b"):
+                value = value * scale_out
+            dst.copy_(value)
+
+        phases = {}
+        with torch.no_grad():
+            # Streams group by group into the existing tensors: the peak is
+            # one converted group, not a second copy of the model.
+            convert_pi05_safetensors(source, sink=sink)
+            torch.cuda.synchronize(); phases["convert_copy"] = time.perf_counter() - t0
+            if self._fp8_weights:
+                self._quantize_all_fp8(inplace=True)
+            if self._nvfp4_weights:
+                self._quantize_prefix_nvfp4(inplace=True)
+            torch.cuda.synchronize(); phases["quantize"] = time.perf_counter() - t0 - sum(phases.values())
+            self._precomputed_styles = _precompute_decoder_styles(
+                self._ckpt_bf16, self.chunk_size, num_steps=self._num_steps)
+        for pipe in self._live_pipelines():
+            pipe.weights["precomputed"] = self._precomputed_styles
+            pipe._upload_precomputed_styles()
+        torch.cuda.synchronize(); phases["styles"] = time.perf_counter() - t0 - sum(phases.values())
+        # Prompt embeddings come from the (now updated) embedding table.
+        cache = getattr(self, "_prompt_embed_cache", None)
+        if cache is not None:
+            cache.clear()
+        self._batch_prompt_texts = None
+        call = getattr(self, "_last_prompt_call", None)
+        if call is not None:
+            if call[0] == "single":
+                self.set_prompt(call[1], call[2])
+            else:
+                self.set_prompt_batch(list(call[1]))
+        torch.cuda.synchronize()
+        self._weight_version = self.weight_version + 1
+        elapsed = time.perf_counter() - t0
+        phases["prompt"] = elapsed - sum(phases.values())
+        self._last_reload_phases = phases
+        logger.info("Weights reloaded in place (version %d, %.2f s: %s)", self._weight_version, elapsed,
+                    ", ".join(f"{k} {v:.2f}" for k, v in phases.items()))
+        return elapsed
+
+    # Prefix GEMM sites quantized to NVFP4: name -> (checkpoint key, layer index or None)
+    _NVFP4_PREFIX_SITES = (
+        [(f"vision_attn_qkv_w_{i}", "vision_attn_qkv_w", i) for i in range(VIS_L)]
+        + [(f"vision_attn_o_w_{i}", "vision_attn_o_w", i) for i in range(VIS_L)]
+        + [(f"vision_ffn_up_w_{i}", "vision_ffn_up_w", i) for i in range(VIS_L)]
+        + [(f"vision_ffn_down_w_{i}", "vision_ffn_down_w", i) for i in range(VIS_L)]
+        + [("vision_projector_w", "encoder_multi_modal_projector_w", None)]
+        + [(f"encoder_attn_qkv_w_{i}", "encoder_attn_qkv_w", i) for i in range(ENC_L)]
+        + [(f"encoder_attn_o_w_{i}", "encoder_attn_o_w", i) for i in range(ENC_L)]
+        + [(f"encoder_ffn_gate_up_w_{i}", None, i) for i in range(ENC_L)]
+        + [(f"encoder_ffn_down_w_{i}", "encoder_ffn_down_w", i) for i in range(ENC_L)]
+    )
+
+    @staticmethod
+    def _nvfp4_k_pad(k: int) -> int:
+        return (k + 63) // 64 * 64
+
+    def _quantize_prefix_nvfp4(self, inplace: bool = False) -> None:
+        """Quantize the vision and encoder GEMM weights to NVFP4 (e2m1 with
+        per-16 UE4M3 block scales in the swizzled layout and a per-tensor
+        global scale). Weights are laid out [N, K]; K is padded to a
+        multiple of 64 with zero columns where needed (SigLIP FFN down,
+        K = 4304). With ``inplace=True`` the existing buffers are refilled
+        (weight reload)."""
+        from flash_rt import flash_rt_kernels as fvk
+        if not hasattr(fvk, "bf16_weight_to_nvfp4_swizzled"):
+            raise RuntimeError("this kernel build has no NVFP4 quantizer")
+        W = self._ckpt_bf16
+        store = self._nvfp4_store
+        if inplace:
+            index = self._nvfp4_store_index
+        else:
+            index = {}
+            self._nvfp4_store_index = index
+        scratch_amax = torch.zeros(1, dtype=torch.float32, device="cuda")
+        out_gs = torch.zeros(1, dtype=torch.float32, device="cuda")
+        for name, key, layer in self._NVFP4_PREFIX_SITES:
+            if key is None:   # merged encoder gate|up, [K, 2H] as the FP8 path builds it
+                w_kn = torch.cat([W["encoder_ffn_gate_w"][layer], W["encoder_ffn_up_w"][layer]], dim=1)
+            else:
+                w_kn = W[key] if layer is None else W[key][layer]
+            w_nk = w_kn.t().contiguous()                     # [N, K]
+            N, K = w_nk.shape
+            Kp = self._nvfp4_k_pad(K)
+            if Kp != K:
+                w_nk = torch.nn.functional.pad(w_nk, (0, Kp - K))
+            n_blocks = Kp // 16
+            sf_bytes = ((N + 127) // 128) * ((n_blocks + 3) // 4) * 512
+            if inplace:
+                packed, sf = store[index[name]], store[index[name] + 1]
+            else:
+                packed = torch.empty(N, Kp // 2, dtype=torch.uint8, device="cuda")
+                sf = torch.zeros(sf_bytes, dtype=torch.uint8, device="cuda")
+            scratch_amax.zero_()
+            fvk.bf16_weight_to_nvfp4_swizzled(
+                w_nk.data_ptr(), packed.data_ptr(), sf.data_ptr(),
+                scratch_amax.data_ptr(), out_gs.data_ptr(), N, Kp, 0)
+            alpha = float(out_gs.item())
+            if not inplace:
+                index[name] = len(store)
+                store.append(packed)
+                store.append(sf)
+            self._nvfp4_weights[name] = (packed.data_ptr(), sf.data_ptr(), alpha, Kp, K)
+        for pipe in self._live_pipelines() if inplace else []:
+            pipe.weights["nvfp4"] = self._nvfp4_weights
+            pipe._nvfp4 = self._nvfp4_weights
+        if not inplace:
+            logger.info("NVFP4 prefix weights: %d tensors", len(self._nvfp4_weights))
+
+    def _skinny_weights_wanted(self) -> bool:
+        """Whether the FP8 decoder may run on the skinny GEMM family."""
+        if not self.use_fp8 or self._decoder_kernel == "cublaslt":
+            return False
+        from flash_rt import flash_rt_kernels as fvk
+        probe = getattr(fvk, "pi05_dec_skinny_available", None)
+        return bool(probe is not None and probe())
 
     def _quantize_decoder_int8(self) -> None:
         """Pre-quantize the decoder hot-path GEMM weights to INT8."""
@@ -928,6 +1391,8 @@ class Pi05TorchFrontendRtx:
 
             # FP8 quantized weights
             "fp8": self._fp8_weights,
+            # NVFP4 prefix weights: name -> (packed, swizzled SF, alpha, K padded, K)
+            "nvfp4": self._nvfp4_weights,
             "int8": self._int8_weights,
             "fp8_layout": self.fp8_layout,
             "hardware": self.hardware,
@@ -941,6 +1406,7 @@ class Pi05TorchFrontendRtx:
     # Public API
     # -----------------------------------------------------------------
 
+    @serialized
     def set_rl_mode(
         self,
         *,
@@ -982,6 +1448,14 @@ class Pi05TorchFrontendRtx:
                 self.graph_recorded = False
                 self.calibrated = False
             return
+        if self._denoise_trace or self._prefix_features or self._sde:
+            raise NotImplementedError(
+                "denoise_trace / prefix_features / sde are not supported by the CFG "
+                "pipelines yet; build the frontend without them to use RL CFG mode")
+        if getattr(self, "_batched_active", False) and self._batch_size != 2:
+            raise ValueError(
+                f"RL CFG batched mode needs batch_size=2 (cond + uncond); "
+                f"set_batched_mode was called with batch_size={self._batch_size}")
         if cfg_beta < 1.0:
             raise ValueError(
                 f"cfg_beta must be >= 1.0 (1.0 disables CFG); got {cfg_beta}")
@@ -1001,6 +1475,27 @@ class Pi05TorchFrontendRtx:
             "RL mode enabled: cfg_beta=%.2f, advantage_positive=%s",
             new_config["cfg_beta"], new_config["advantage_positive"])
 
+    def _embed_prompt_cached(self, prompt_text: str, max_len: int, state=None):
+        """``(embeds_bf16_cuda, prompt_len, host_uint16)`` for a prompt, from
+        the per-frontend cache for task-only prompts. Dynamic state bypasses
+        storage so per-frame states cannot retain host/device embeddings."""
+        cache = getattr(self, "_prompt_embed_cache", None)
+        if cache is None:
+            cache = self._prompt_embed_cache = _PromptEmbedCache()
+        key = _PromptEmbedCache.key(prompt_text, max_len, state)
+        hit = cache.get(key) if state is None else None
+        if hit is not None:
+            return hit
+        embeds, prompt_len = _embed_prompt(
+            prompt_text, self.embedding_weight, max_len=max_len, state=state)
+        embeds = embeds.contiguous()
+        host = np.ascontiguousarray(embeds.view(torch.uint16).cpu().numpy())
+        hit = (embeds, int(prompt_len), host)
+        if state is None:
+            cache.put(key, hit)
+        return hit
+
+    @serialized
     def set_prompt(self, prompt_text: str, state=None) -> None:
         """Tokenise prompt + (re)build the pipeline for the exact prompt length.
 
@@ -1008,6 +1503,7 @@ class Pi05TorchFrontendRtx:
         builds the unconditioned prompt embeddings and uploads both into
         the CFG-aware pipeline.
         """
+        self._last_prompt_call = ("single", prompt_text, state)
         if self._rl_config is not None:
             if state is not None:
                 raise ValueError(
@@ -1021,8 +1517,9 @@ class Pi05TorchFrontendRtx:
 
         max_len = (PI05_STATE_PROMPT_MAX_LEN if state is not None
                    else MAX_PROMPT_LEN_DEFAULT)
-        embeds, prompt_len = _embed_prompt(
-            prompt_text, self.embedding_weight, max_len=max_len, state=state)
+        embeds, prompt_len, embeds_np = self._embed_prompt_cached(
+            prompt_text, max_len, state=state)
+        self._last_prompt_len = int(prompt_len)
 
         if self._state_prompt_mode == "fixed" and state is not None:
             self._set_prompt_fixed(prompt_len)
@@ -1039,7 +1536,6 @@ class Pi05TorchFrontendRtx:
 
         # Upload language embeds into pipeline's encoder_x slot. In fixed mode
         # set_language_embeds pads to max + updates the seqused/devpos buffers.
-        embeds_np = embeds.contiguous().view(torch.uint16).cpu().numpy()
         self.pipeline.set_language_embeds(embeds_np)
         self._frame_count = 0
         logger.info("Set prompt: '%s' (%d tokens, state=%s, mode=%s)",
@@ -1072,6 +1568,9 @@ class Pi05TorchFrontendRtx:
                 vision_pool_factor=self._vision_pool_factor,
                 vision_num_layers=self._vision_num_layers,
                 fixed_shape=True,
+                denoise_trace=self._denoise_trace,
+                prefix_export=self._prefix_features,
+                sde=self._sde,
                 **self._pipeline_precision_kwargs())
             if self._fixed_pipeline.use_int8_vision_static:
                 self._fixed_pipeline.vis_int8_static_calibrated = False
@@ -1122,6 +1621,9 @@ class Pi05TorchFrontendRtx:
                     num_steps=self._num_steps,
                     vision_pool_factor=self._vision_pool_factor,
                     vision_num_layers=self._vision_num_layers,
+                    denoise_trace=self._denoise_trace,
+                    prefix_export=self._prefix_features,
+                    sde=self._sde,
                     **self._pipeline_precision_kwargs())
                 self._prompt_pipeline_cache[prompt_len] = self.pipeline
                 # Static INT8 vision scales are per-pipeline-instance.
@@ -1262,6 +1764,7 @@ class Pi05TorchFrontendRtx:
             "Set RL prompt: '%s' (cond_len=%d, uncond_len=%d, padded=%d, batched=%s)",
             prompt_text, cond_len, uncond_len, target_len, use_batched_cfg)
 
+    @serialized
     def calibrate(
         self,
         observations,
@@ -1310,6 +1813,7 @@ class Pi05TorchFrontendRtx:
             self._calibrate_multi_frame(
                 obs_list, percentile=percentile, verbose=verbose)
 
+    @serialized
     def calibrate_with_real_data(self, sample_observations) -> None:
         """Legacy alias for :meth:`calibrate`."""
         self.calibrate(sample_observations)
@@ -1383,16 +1887,16 @@ class Pi05TorchFrontendRtx:
                     "(~0.96 vs dynamic 0.991 on test sequence). Set "
                     "FVK_PI05_RTX_INT8_ENCODER_STATIC=0 to disable.")
             self.pipeline.autotune_gemms()
-            from flash_rt.subgraphs.capture import apply_frontend_capture_hooks
-            apply_frontend_capture_hooks(self)
-            self.pipeline.record_infer_graph(external_stream_int=stream_int)
+            self._record_infer_graph_if_enabled(stream_int)
 
         self.calibrated = True
-        self.graph_recorded = True
+        self.graph_recorded = self.use_cuda_graph
         self._precision_spec = self._snapshot_precision_spec(
             method="single_frame", n=1, percentile=None)
         self._warn_if_scale_ceiling_exceeded()
-        logger.info("Calibration + graph capture complete")
+        logger.info(
+            "Calibration%s complete",
+            " + graph capture" if self.use_cuda_graph else "")
 
     def _calibrate_multi_frame(
         self, obs_list, *, percentile: float, verbose: bool,
@@ -1450,24 +1954,32 @@ class Pi05TorchFrontendRtx:
 
             self.pipeline.fp8_calibrated = True
             self.pipeline.autotune_gemms()
-            from flash_rt.subgraphs.capture import apply_frontend_capture_hooks
-            apply_frontend_capture_hooks(self)
-            self.pipeline.record_infer_graph(external_stream_int=stream_int)
+            self._record_infer_graph_if_enabled(stream_int)
 
         self.calibrated = True
-        self.graph_recorded = True
+        self.graph_recorded = self.use_cuda_graph
         self._precision_spec = self._snapshot_precision_spec(
             method="percentile", n=n, percentile=percentile)
         self._warn_if_scale_ceiling_exceeded(label=f"pi05_rtx_N{n}")
         logger.info(
-            "Pi0.5 multi-frame calibration + graph capture complete "
-            "(N=%d, percentile=%.2f)", n, percentile)
+            "Pi0.5 multi-frame calibration%s complete "
+            "(N=%d, percentile=%.2f)",
+            " + graph capture" if self.use_cuda_graph else "",
+            n, percentile)
 
     def _zero_pipeline_scales(self) -> None:
         for buf in self.pipeline.fp8_act_scales.values():
             buf.zero_()
         for buf in getattr(self.pipeline, "int8_act_scales", {}).values():
             buf.zero_()
+
+    def _record_infer_graph_if_enabled(self, stream_int: int) -> None:
+        """Apply capture hooks and record graphs when graph mode is enabled."""
+        if not self.use_cuda_graph:
+            return
+        from flash_rt.subgraphs.capture import apply_frontend_capture_hooks
+        apply_frontend_capture_hooks(self)
+        self.pipeline.record_infer_graph(external_stream_int=stream_int)
 
     def _warn_if_scale_ceiling_exceeded(self, label: str = "pi05_rtx") -> None:
         """Diagnostic warning if any FP8 scale exceeds the sanity ceiling."""
@@ -1545,12 +2057,25 @@ class Pi05TorchFrontendRtx:
         """:class:`ModelPrecisionSpec` captured at calibration time."""
         return getattr(self, "_precision_spec", None)
 
-    def infer(self, observation: dict, debug: bool = False) -> dict:
+    @serialized
+    def infer(self, observation: dict, debug: bool = False, *,
+              noise=None, generator=None, step_noise=None, sde_sigma=None, return_noise: bool = False) -> dict:
         """Run inference on a single observation.
 
         All GPU work happens on ``self._graph_torch_stream`` — the same
         stream the graph was captured on — so replay + pre/post D2D copies
         are serialized correctly.
+
+        Sampling is reproducible on request: ``noise`` supplies the
+        initial diffusion noise ``(chunk_size, 32)`` directly and
+        ``generator`` (a CUDA ``torch.Generator``) seeds the internal
+        draw; with neither, the draw is unseeded as before. The noise
+        actually used is returned under ``"noise"`` only with
+        ``return_noise=True``; the same noise,
+        prompt and weights give bit-identical actions. When the
+        frontend was built with ``denoise_trace=True`` the result also
+        carries ``"raw_actions"`` (normalized, ``(chunk, 32)``) and
+        ``"denoise_trace"`` (see :meth:`_download_denoise_trace`).
 
         When the active pipeline is :class:`Pi05CFGBatchedPipeline`
         (RL mode + batched mode both on), this routes through a B=2
@@ -1564,7 +2089,9 @@ class Pi05TorchFrontendRtx:
             raise RuntimeError("set_prompt must be called before infer")
 
         if isinstance(self.pipeline, Pi05CFGBatchedPipeline):
-            return self._infer_cfg_batched(observation, debug=debug)
+            return self._infer_cfg_batched(
+                observation, debug=debug, noise=noise, generator=generator,
+                return_noise=return_noise)
 
         t0 = time.perf_counter()
 
@@ -1572,31 +2099,37 @@ class Pi05TorchFrontendRtx:
         # pipeline (vision + encoder + decoder); intermediate frames skip
         # vision and encoder and replay only the decoder with fresh noise,
         # reusing the encoder K/V cache from the last full forward.
-        self._frame_count += 1
-        use_full = (self._cache_frames <= 1 or
-                    self._frame_count % self._cache_frames == 1)
+        use_full = self._use_full_pipeline_for_next_frame()
 
         with torch.cuda.stream(self._graph_torch_stream):
             stream_int = self._graph_torch_stream.cuda_stream
 
-            self._noise_buf.normal_()
+            # With an explicit initial noise and a schedule, the generator
+            # feeds the step noise only.
+            init_gen = None if (noise is not None and sde_sigma is not None and step_noise is None) else generator
+            self._fill_noise(self._noise_buf, noise, init_gen)
             self._copy_tensor_to_pipeline_buf_stream(
                 self._noise_buf, self.pipeline.input_noise_buf, stream_int)
+            sde_used = self._fill_sde(step_noise, sde_sigma, generator, stream_int)
 
             if use_full:
                 self._fill_img_buf(observation)
                 self._copy_tensor_to_pipeline_buf_stream(
                     self._img_buf, self.pipeline.input_images_buf, stream_int)
-                out_ptr = self.pipeline.forward()
+                out_ptr = self.pipeline.forward(stream=stream_int)
             else:
                 # Decode-only: skip vision+encoder, reuse cached K/V
-                out_ptr = self.pipeline.forward_decode_only()
+                out_ptr = self.pipeline.forward_decode_only(stream=stream_int)
 
             # D2D download → staging torch tensor
             self._cudart.cudaMemcpyAsync(
                 ctypes.c_void_p(self._noise_out.data_ptr()),
                 ctypes.c_void_p(out_ptr),
                 self._noise_out.numel() * 2, 3, stream_int)
+            if self._denoise_trace:
+                self._enqueue_denoise_trace_download(stream_int)
+            if self._prefix_features:
+                self._enqueue_prefix_download(stream_int)
 
         self._cudart.cudaStreamSynchronize(
             ctypes.c_void_p(self._graph_torch_stream.cuda_stream))
@@ -1612,10 +2145,27 @@ class Pi05TorchFrontendRtx:
             logger.info("Raw actions[0,:5]: %s", raw_actions[0, :5])
             logger.info("Latency: %.1f ms", latency_ms)
 
-        return {"actions": robot_actions}
+        result = {"actions": robot_actions}
+        if return_noise:
+            result["noise"] = self._noise_buf.float().cpu().numpy()
+        if self._denoise_trace:
+            result["raw_actions"] = raw_actions
+            result["denoise_trace"] = self._denoise_trace_result()
+        if self._prefix_features:
+            result["prefix_features"] = self._prefix_features_result()[0]
+        if sde_used is not None:
+            result["step_noise"], result["sde_sigma"] = sde_used
+        return result
+
+    def _use_full_pipeline_for_next_frame(self) -> bool:
+        """Advance the frame counter and select full vs decode-only work."""
+        self._frame_count += 1
+        return (self._cache_frames <= 1 or
+                self._frame_count % self._cache_frames == 1)
 
     def _infer_cfg_batched(self, observation: dict,
-                           debug: bool = False) -> dict:
+                           debug: bool = False, *,
+                           noise=None, generator=None, return_noise: bool = False) -> dict:
         """Batched CFG inference: single obs replicated across cond + uncond slots."""
         t0 = time.perf_counter()
 
@@ -1624,15 +2174,15 @@ class Pi05TorchFrontendRtx:
 
             # Replicate the single observation into both batch slots.
             stacked = self._stack_images(observation)
-            for b in range(PI05_BATCH_SIZE):
+            for b in range(self._batch_size):
                 self._img_buf_b2[b].copy_(stacked)
             # Each denoising step starts from independent noise in each
             # slot; cond slot is the one CFG reads / updates. Sampling
             # once and copying into both slots ensures the uncond slot
             # starts at the same noise the cond does, which matches
             # the paper-faithful CFG contract.
-            self._noise_buf.normal_()
-            for b in range(PI05_BATCH_SIZE):
+            self._fill_noise(self._noise_buf, noise, generator)
+            for b in range(self._batch_size):
                 self._noise_buf_b2[b].copy_(self._noise_buf)
 
             self._copy_tensor_to_pipeline_buf_stream(
@@ -1641,7 +2191,7 @@ class Pi05TorchFrontendRtx:
                 self._noise_buf_b2, self.pipeline.input_noise_buf_b2, stream_int)
 
             # Graph replay returns the cond slot's noise pointer.
-            out_ptr = self.pipeline.forward()
+            out_ptr = self.pipeline.forward(stream=stream_int)
 
             # D2D download of just the cond slot (chunk * ACTION_DIM bf16)
             self._cudart.cudaMemcpyAsync(
@@ -1664,14 +2214,19 @@ class Pi05TorchFrontendRtx:
                 "CFG batched raw actions[0,:5]: %s", raw_actions[0, :5])
             logger.info("CFG batched latency: %.1f ms", latency_ms)
 
-        return {"actions": robot_actions}
+        result = {"actions": robot_actions}
+        if return_noise:
+            result["noise"] = self._noise_buf.float().cpu().numpy()
+        return result
 
     # -----------------------------------------------------------------
-    # Batched (B=2) inference path — additive, default API unchanged
+    # Batched (B=N) inference path — _b2 names are historical, not a width limit
     # -----------------------------------------------------------------
 
-    def set_batched_mode(self, *, enable: bool = True) -> None:
-        """Enable / disable the B=2 batched inference path (opt-in).
+    @serialized
+    def set_batched_mode(self, *, enable: bool = True,
+                         batch_size: int = PI05_BATCH_SIZE) -> None:
+        """Enable / disable B=N batching (N >= 1, default 2; opt-in).
 
         Once enabled, the next :meth:`set_prompt_batch` call builds a
         :class:`Pi05BatchedPipeline` (with a
@@ -1690,14 +2245,24 @@ class Pi05TorchFrontendRtx:
                 self.calibrated = False
                 self._batched_active = False
             return
-        # Switch to a batched-capable attention backend if not already.
-        if not isinstance(self.attn_backend, RtxFlashAttnBatchedBackendPi05):
+        if int(batch_size) < 1:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+        self._batch_size = int(batch_size)
+        # Switch to a batched-capable attention backend of the requested
+        # width if not already installed.
+        if (not isinstance(self.attn_backend, RtxFlashAttnBatchedBackendPi05)
+                or self.attn_backend.batch_size != self._batch_size):
             enc_seq_max = self.num_views * 256 + self.max_prompt_len
             self.attn_backend = RtxFlashAttnBatchedBackendPi05(
                 num_views=self.num_views,
                 encoder_seq_max=enc_seq_max,
                 chunk_size=self.chunk_size,
-                num_encoder_layers=ENC_L)
+                num_encoder_layers=ENC_L,
+                batch_size=self._batch_size)
+            self.pipeline = None
+            self.current_prompt_len = 0
+            self.graph_recorded = False
+            self.calibrated = False
             # Replacing the backend orphans any single-sample pipelines that were
             # bound to the old one; drop the caches so they are rebuilt on the
             # new backend (mirrors _ensure_prompt_capacity()).
@@ -1712,23 +2277,90 @@ class Pi05TorchFrontendRtx:
             self.calibrated = False
         # Pre-allocate batched input/output staging tensors.
         self._img_buf_b2 = torch.empty(
-            PI05_BATCH_SIZE, self.num_views, IMG_HW, IMG_HW, 3,
+            self._batch_size, self.num_views, IMG_HW, IMG_HW, 3,
             dtype=bf16, device="cuda")
         self._noise_buf_b2 = torch.empty(
-            PI05_BATCH_SIZE, self.chunk_size, ACTION_DIM,
+            self._batch_size, self.chunk_size, ACTION_DIM,
             dtype=bf16, device="cuda")
         self._noise_out_b2 = torch.empty(
-            PI05_BATCH_SIZE, self.chunk_size, ACTION_DIM,
+            self._batch_size, self.chunk_size, ACTION_DIM,
             dtype=bf16, device="cuda")
         logger.info(
             "Pi05TorchFrontendRtx: batched mode enabled (B=%d)",
-            PI05_BATCH_SIZE)
+            self._batch_size)
 
+    # Per-width state of a batched pipeline (everything set_batched_mode,
+    # set_prompt_batch and calibrate_batch touch); the weights are shared.
+    _BATCH_CTX_ATTRS = (
+        "attn_backend", "pipeline", "current_prompt_len", "graph_recorded",
+        "calibrated", "_batched_active", "_batch_size", "_img_buf_b2",
+        "_noise_buf_b2", "_noise_out_b2", "_batch_prompt_texts", "_batch_prompt_lens",
+        "_last_prompt_call", "_graph_torch_stream", "_sde_eps_stage")
+
+    @property
+    def batch_sizes(self) -> tuple:
+        """Widths that have a batched pipeline: the active one and the parked ones."""
+        out = set(getattr(self, "_batch_ctx", {}).keys())
+        if getattr(self, "_batched_active", False):
+            out.add(int(self._batch_size))
+        return tuple(sorted(out))
+
+    @serialized
+    def select_batch_size(self, batch_size: int) -> None:
+        """Make the batched pipeline of width ``batch_size`` the active one.
+
+        Several batched pipelines can live in one frontend. They share every
+        weight buffer (BF16, FP8 and NVFP4 copies, decoder styles); each has
+        its own attention backend, staging tensors, prompts, FP8 activation
+        scales and captured graph. The first call for a new width parks the
+        current one and enables batched mode for the new width, after which
+        :meth:`set_prompt_batch` and :meth:`calibrate_batch` build it as
+        usual; later calls swap the active width in O(1). A fleet server
+        runs the smallest width that fits the pending requests instead of
+        padding every call to the largest.
+
+        Weights reloaded while a width was parked are already in place when
+        it comes back (the buffers are shared and :meth:`reload_weights`
+        refreshes every live pipeline's styles); its prompts are re-embedded
+        from the new embedding table on the swap.
+        """
+        bs = int(batch_size)
+        if bs < 1:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+        active = getattr(self, "_batched_active", False)
+        cur = int(self._batch_size) if active else None
+        if cur == bs:
+            return
+        ctxs = self.__dict__.setdefault("_batch_ctx", {})
+        if cur is not None:
+            saved = {a: getattr(self, a, None) for a in self._BATCH_CTX_ATTRS}
+            saved["_weight_version"] = self.weight_version
+            ctxs[cur] = saved
+        if bs in ctxs:
+            saved = ctxs.pop(bs)
+            version = saved.pop("_weight_version")
+            for a, v in saved.items():
+                setattr(self, a, v)
+            call = self._last_prompt_call
+            if version != self.weight_version and call is not None and call[0] == "batch":
+                self._batch_prompt_texts = None
+                self.set_prompt_batch(list(call[1]))
+            return
+        # New width: a fresh backend, staging tensors and (on the next
+        # set_prompt_batch) pipeline. Parked widths keep theirs.
+        self.attn_backend = None
+        self.pipeline = None
+        self._last_prompt_call = None
+        self._batch_prompt_texts = None
+        self._batched_active = False
+        self.set_batched_mode(enable=True, batch_size=bs)
+
+    @serialized
     def set_prompt_batch(self, prompts: list) -> None:
         """Set per-sample prompts for the batched pipeline.
 
         Args:
-            prompts: list of length B (currently 2). Each entry is a
+            prompts: list of length B (the configured batch_size). Each entry is a
                 task description string. Prompts are individually
                 tokenised, then padded to a common length so the
                 encoder sees a fixed-shape buffer.
@@ -1737,28 +2369,25 @@ class Pi05TorchFrontendRtx:
             raise RuntimeError(
                 "set_batched_mode(enable=True) must be called before "
                 "set_prompt_batch")
-        if len(prompts) != PI05_BATCH_SIZE:
+        if len(prompts) != self._batch_size:
             raise ValueError(
-                f"set_prompt_batch expects {PI05_BATCH_SIZE} prompts, "
+                f"set_prompt_batch expects {self._batch_size} prompts, "
                 f"got {len(prompts)}")
-        embeds_list = []
-        prompt_lens = []
-        for p in prompts:
-            e, plen = _embed_prompt(p, self.embedding_weight,
-                                    max_len=MAX_PROMPT_LEN_DEFAULT)
-            embeds_list.append(e)
-            prompt_lens.append(plen)
+        self._last_prompt_call = ("batch", tuple(prompts))
+        entries = [self._embed_prompt_cached(p, MAX_PROMPT_LEN_DEFAULT)
+                   for p in prompts]
+        prompt_lens = [e[1] for e in entries]
         target_len = max(prompt_lens)
+        self._batch_prompt_lens = tuple(prompt_lens)
 
         # Pad each embed to target_len (BF16 zeros are valid pad tokens).
         padded_np_list = []
-        for e, plen in zip(embeds_list, prompt_lens):
-            arr = e.contiguous().view(torch.uint16).cpu().numpy()
+        for (_, plen, arr) in entries:
             if plen < target_len:
                 pad = np.zeros(
                     (target_len - plen, arr.shape[1]), dtype=arr.dtype)
-                arr = np.concatenate([arr, pad], axis=0)
-            padded_np_list.append(np.ascontiguousarray(arr))
+                arr = np.ascontiguousarray(np.concatenate([arr, pad], axis=0))
+            padded_np_list.append(arr)
 
         rebuild = (
             self.pipeline is None
@@ -1768,7 +2397,7 @@ class Pi05TorchFrontendRtx:
         if rebuild:
             logger.info(
                 "Building Pi05BatchedPipeline (B=%d) for prompt_len=%d...",
-                PI05_BATCH_SIZE, target_len)
+                self._batch_size, target_len)
             self.current_prompt_len = target_len
             self.graph_recorded = False
             self.calibrated = False
@@ -1779,21 +2408,36 @@ class Pi05TorchFrontendRtx:
                 num_views=self.num_views,
                 max_prompt_len=target_len,
                 chunk_size=self.chunk_size,
+                denoise_trace=self._denoise_trace,
+                prefix_export=self._prefix_features,
+                sde=self._sde,
                 **self._pipeline_precision_kwargs())
-        # B=1 pipeline path is what calibrate_fp8 uses for FP8 scale collection.
-        self.pipeline.set_language_embeds(padded_np_list[0])
-        self.pipeline.set_language_embeds_batch(padded_np_list)
+        # Only the slots whose prompt changed are uploaded again (same
+        # padded length, so the device rows are the same size); a fleet
+        # whose tasks rotate at episode boundaries pays for the slots
+        # that actually changed.
+        prev = None if rebuild else getattr(self, "_batch_prompt_texts", None)
+        if prev is None or len(prev) != len(prompts):
+            slots = list(range(self._batch_size))
+        else:
+            slots = [b for b in range(self._batch_size) if prev[b] != prompts[b]]
+        if rebuild or 0 in slots:
+            # B=1 pipeline path is what calibrate_fp8 uses for FP8 scale collection.
+            self.pipeline.set_language_embeds(padded_np_list[0])
+        self.pipeline.set_language_embeds_batch(padded_np_list, slots=slots)
+        self._batch_prompt_texts = tuple(prompts)
         self._frame_count = 0
         logger.info(
             "Set batch prompt (B=%d, padded_len=%d): %s",
-            PI05_BATCH_SIZE, target_len,
+            self._batch_size, target_len,
             [p[:30] + ("…" if len(p) > 30 else "") for p in prompts])
 
+    @serialized
     def calibrate_batch(self, sample_observations) -> None:
         """Calibrate FP8 scales for the batched pipeline.
 
         Uses the parent B=1 calibration pass (per-tensor scales are
-        sample-invariant) on the first observation; the batched B=2
+        sample-invariant) on the first observation; the batched B=N
         forward then reuses those scales.
         """
         if not isinstance(self.pipeline, Pi05BatchedPipeline):
@@ -1816,51 +2460,66 @@ class Pi05TorchFrontendRtx:
                 images, self.pipeline.input_images_buf, stream_int)
             self._copy_tensor_to_pipeline_buf_stream(
                 noise, self.pipeline.input_noise_buf, stream_int)
+            # calibrate_fp8 runs the parent forward on stream 0. Its inputs
+            # must be complete before crossing from this non-default stream.
+            self._cudart.cudaStreamSynchronize(ctypes.c_void_p(stream_int))
             self.pipeline.calibrate_fp8()
             self.pipeline.autotune_gemms()
-            from flash_rt.subgraphs.capture import apply_frontend_capture_hooks
-            apply_frontend_capture_hooks(self)
-            self.pipeline.record_infer_graph(external_stream_int=stream_int)
+            self._record_infer_graph_if_enabled(stream_int)
         self.calibrated = True
-        self.graph_recorded = True
+        self.graph_recorded = self.use_cuda_graph
 
-    def infer_batch(self, observations: list) -> list:
-        """Run B=2 inference on two independent observations.
+    @serialized
+    def infer_batch(self, observations: list, *,
+                    noise=None, generator=None, step_noise=None, sde_sigma=None, return_noise: bool = False) -> list:
+        """Run B=N inference on N independent observations.
 
         Args:
-            observations: list of length B (currently 2) of obs dicts
+            observations: list of length B (the configured batch_size) of obs dicts
                 matching :meth:`infer`'s contract (``image``,
                 ``wrist_image`` if ``num_views >= 2``, ``state``).
+            noise: optional initial noise ``(B, chunk_size, 32)``; one
+                slot per observation. ``generator`` seeds the internal
+                draw instead. See :meth:`infer`.
 
         Returns:
-            List of length B; each entry is ``{"actions": (action_horizon, action_dim)}``.
+            List of length B; each entry is ``{"actions": (action_horizon,
+            action_dim), "noise": (chunk_size, 32)}`` plus
+            ``"raw_actions"`` and ``"denoise_trace"`` when the frontend
+            was built with ``denoise_trace=True``.
         """
         if not isinstance(self.pipeline, Pi05BatchedPipeline):
             raise RuntimeError("set_batched_mode + set_prompt_batch required")
-        if len(observations) != PI05_BATCH_SIZE:
+        if len(observations) != self._batch_size:
             raise ValueError(
-                f"infer_batch expects {PI05_BATCH_SIZE} observations, "
+                f"infer_batch expects {self._batch_size} observations, "
                 f"got {len(observations)}")
         t0 = time.perf_counter()
 
-        # Stage per-sample inputs into the B=2 staging tensors, then D2D.
-        for b, obs in enumerate(observations):
-            self._img_buf_b2[b].copy_(self._stack_images(obs))
-        self._noise_buf_b2.normal_()
-
         with torch.cuda.stream(self._graph_torch_stream):
+            # Stage per-sample inputs into B=N tensors (_b2 is a legacy suffix).
+            for b, obs in enumerate(observations):
+                self._img_buf_b2[b].copy_(self._stack_images(obs))
+            init_gen = None if (noise is not None and sde_sigma is not None and step_noise is None) else generator
+            self._fill_noise(self._noise_buf_b2, noise, init_gen)
+            sde_used = self._fill_sde(step_noise, sde_sigma, generator,
+                                      self._graph_torch_stream.cuda_stream, batched=True)
             stream_int = self._graph_torch_stream.cuda_stream
             self._copy_tensor_to_pipeline_buf_stream(
                 self._img_buf_b2, self.pipeline.input_images_buf_b2, stream_int)
             self._copy_tensor_to_pipeline_buf_stream(
                 self._noise_buf_b2, self.pipeline.input_noise_buf_b2, stream_int)
 
-            out_ptr = self.pipeline.forward()
+            out_ptr = self.pipeline.forward(stream=stream_int)
 
             self._cudart.cudaMemcpyAsync(
                 ctypes.c_void_p(self._noise_out_b2.data_ptr()),
                 ctypes.c_void_p(out_ptr),
                 self._noise_out_b2.numel() * 2, 3, stream_int)
+            if self._denoise_trace:
+                self._enqueue_denoise_trace_download(stream_int, batched=True)
+            if self._prefix_features:
+                self._enqueue_prefix_download(stream_int, batched=True)
 
         self._cudart.cudaStreamSynchronize(
             ctypes.c_void_p(self._graph_torch_stream.cuda_stream))
@@ -1868,11 +2527,26 @@ class Pi05TorchFrontendRtx:
         latency_ms = (time.perf_counter() - t0) * 1000
         self.latency_records.append(latency_ms)
 
+        trace = self._denoise_trace_result(batched=True) if self._denoise_trace else None
+        prefix = self._prefix_features_result(batched=True) if self._prefix_features else None
         results = []
-        for b in range(PI05_BATCH_SIZE):
+        for b in range(self._batch_size):
             raw = self._noise_out_b2[b].float().cpu().numpy()
             unnorm = unnormalize_actions(raw, self.norm_stats)
-            results.append({"actions": unnorm[:, :LIBERO_ACTION_DIM]})
+            entry = {"actions": unnorm[:, :LIBERO_ACTION_DIM]}
+            if return_noise:
+                entry["noise"] = self._noise_buf_b2[b].float().cpu().numpy()
+            if prefix is not None:
+                entry["prefix_features"] = prefix[b]
+            if trace is not None:
+                entry["raw_actions"] = raw
+                entry["denoise_trace"] = {
+                    "x": trace["x"][:, b], "delta": trace["delta"][:, b],
+                    "timesteps": trace["timesteps"]}
+            if sde_used is not None:
+                entry["step_noise"] = sde_used[0][:, b]
+                entry["sde_sigma"] = sde_used[1]
+            results.append(entry)
         return results
 
     def get_latency_stats(self) -> dict:
@@ -1927,6 +2601,148 @@ class Pi05TorchFrontendRtx:
         """
         stream_int = torch.cuda.current_stream().cuda_stream
         self._copy_tensor_to_pipeline_buf_stream(src, dst_buf, stream_int)
+
+    # ── Reproducible sampling + denoise trace ────────────────────────
+
+    def _fill_noise(self, buf: torch.Tensor, noise, generator) -> None:
+        """Fill the staging noise tensor without a host copy or synchronization.
+
+        ``noise`` (tensor or array shaped like ``buf``) is copied in;
+        otherwise ``buf`` is drawn from ``generator`` when given, else
+        from the default CUDA generator. Host export is opt-in at the
+        inference boundary, after the forward stream has completed.
+        """
+        if noise is not None:
+            if generator is not None:
+                raise ValueError("pass either noise or generator, not both")
+            src = torch.as_tensor(noise)
+            if tuple(src.shape) != tuple(buf.shape):
+                raise ValueError(
+                    f"noise must have shape {tuple(buf.shape)}, got {tuple(src.shape)}")
+            buf.copy_(src.to(device=buf.device, dtype=buf.dtype))
+        elif generator is not None:
+            buf.normal_(generator=generator)
+        else:
+            buf.normal_()
+
+    def _fill_sde(self, step_noise, sde_sigma, generator, stream_int: int,
+                  batched: bool = False):
+        """Upload the stochastic sampler's per-step sigma and noise.
+
+        ``sde_sigma`` is a sequence of ``num_steps`` non-negative floats
+        (the std of the Gaussian added after step ``s``: ``x[s+1] = x[s] +
+        delta[s] + sigma[s] * eps[s]``); ``step_noise`` is
+        ``(num_steps, chunk, 32)`` (``(num_steps, B, chunk, 32)`` batched),
+        else drawn from ``generator`` or the default CUDA generator. Returns
+        ``(step_noise_f32, sigma_list)`` when a sigma was given (what a
+        caller passes back to reproduce the sample), ``None`` otherwise;
+        without a sigma the sigma buffer is zeroed and the sampler is the
+        ODE one bit for bit.
+        """
+        if sde_sigma is None and step_noise is None:
+            if self._sde:
+                self._sde_sigma_dev().zero_()
+                self._copy_tensor_to_pipeline_buf_stream(
+                    self._sde_sigma_dev(), self.pipeline.sde_sigma_buf, stream_int)
+            return None
+        if not self._sde:
+            raise ValueError("step_noise / sde_sigma need a frontend built with sde=True")
+        if sde_sigma is None:
+            raise ValueError("step_noise needs sde_sigma")
+        sigma = np.asarray(sde_sigma, dtype=np.float32).reshape(-1)
+        if (sigma.shape[0] != self._num_steps or not np.isfinite(sigma).all()
+                or (sigma < 0).any()):
+            raise ValueError(f"sde_sigma must hold {self._num_steps} finite non-negative values")
+        self._sde_sigma_dev().copy_(torch.from_numpy(sigma))
+        self._copy_tensor_to_pipeline_buf_stream(
+            self._sde_sigma_dev(), self.pipeline.sde_sigma_buf, stream_int)
+        shape = ((self._num_steps, self._batch_size, self.chunk_size, ACTION_DIM) if batched
+                 else (self._num_steps, self.chunk_size, ACTION_DIM))
+        buf = getattr(self, "_sde_eps_stage", None)
+        if buf is None or tuple(buf.shape) != shape:
+            buf = self._sde_eps_stage = torch.empty(shape, dtype=bf16, device="cuda")
+        self._fill_noise(buf, step_noise, generator)
+        eps_used = buf.float().cpu().numpy()
+        dst = self.pipeline.sde_eps_buf_b2 if batched else self.pipeline.sde_eps_buf
+        self._copy_tensor_to_pipeline_buf_stream(buf, dst, stream_int)
+        return eps_used, [float(v) for v in sigma]
+
+    def _sde_sigma_dev(self) -> torch.Tensor:
+        t = getattr(self, "_sde_sigma_stage", None)
+        if t is None or t.numel() != self._num_steps:
+            t = self._sde_sigma_stage = torch.zeros(self._num_steps, dtype=torch.float32, device="cuda")
+        return t
+
+    def denoise_timesteps(self) -> list:
+        """Flow-matching time of each denoising step (``1, 1-dt, ..., dt``)."""
+        dt = -1.0 / self._num_steps
+        return [1.0 + k * dt for k in range(self._num_steps)]
+
+    def _enqueue_denoise_trace_download(self, stream_int: int,
+                                        batched: bool = False) -> None:
+        """Queue D2D copies of the pipeline trace buffers into staging tensors."""
+        if batched:
+            x_buf = self.pipeline.denoise_trace_x_buf_b2
+            d_buf = self.pipeline.denoise_trace_delta_buf_b2
+            need = (self._num_steps, self._batch_size, self.chunk_size, ACTION_DIM)
+        else:
+            x_buf = self.pipeline.denoise_trace_x_buf
+            d_buf = self.pipeline.denoise_trace_delta_buf
+            need = (self._num_steps, self.chunk_size, ACTION_DIM)
+        if tuple(self._trace_x_out.shape) != need:
+            self._trace_x_out = torch.empty(need, dtype=bf16, device="cuda")
+            self._trace_delta_out = torch.empty_like(self._trace_x_out)
+        for dst, src in ((self._trace_x_out, x_buf), (self._trace_delta_out, d_buf)):
+            nbytes = dst.numel() * dst.element_size()
+            assert nbytes == src.nbytes, f"trace size mismatch: {nbytes} vs {src.nbytes}"
+            self._cudart.cudaMemcpyAsync(
+                ctypes.c_void_p(dst.data_ptr()), src.ptr, nbytes, 3, stream_int)
+
+    def _denoise_trace_result(self, batched: bool = False) -> dict:
+        """Host copy of the last trace. Call after the stream is synchronized.
+
+        ``x[s]`` is the denoising state entering step ``s`` (``x[0]`` is
+        the initial noise) and ``delta[s]`` the increment the step adds,
+        so ``x[s+1] == x[s] + delta[s]`` and the final raw actions are
+        ``x[-1] + delta[-1]``. For the linear flow-matching schedule
+        ``delta[s] == -v[s] / num_steps``. Shapes are
+        ``(num_steps, chunk, 32)`` (``(num_steps, B, chunk, 32)`` when
+        batched), float32 on the host; ``timesteps`` lists the flow time
+        of each step.
+        """
+        return {
+            "x": self._trace_x_out.float().cpu().numpy(),
+            "delta": self._trace_delta_out.float().cpu().numpy(),
+            "timesteps": self.denoise_timesteps(),
+        }
+
+    def _enqueue_prefix_download(self, stream_int: int, batched: bool = False) -> None:
+        """Queue a D2D copy of the exported prefix hidden state into staging."""
+        buf = self.pipeline.prefix_hidden_buf_b2 if batched else self.pipeline.prefix_hidden_buf
+        rows = buf.nbytes // (ENC_D * 2)
+        if getattr(self, "_prefix_out", None) is None or self._prefix_out.numel() != rows * ENC_D:
+            self._prefix_out = torch.empty(rows, ENC_D, dtype=bf16, device="cuda")
+        self._cudart.cudaMemcpyAsync(
+            ctypes.c_void_p(self._prefix_out.data_ptr()), buf.ptr, buf.nbytes, 3, stream_int)
+
+    def _prefix_features_result(self, batched: bool = False) -> np.ndarray:
+        """Mean of the exported hidden state over the valid tokens, ``(B, ENC_D)`` float32.
+
+        Valid tokens are the pooled vision tokens followed by the prompt
+        tokens; padded prompt positions are excluded. Call after the
+        stream is synchronized.
+        """
+        es = int(self.pipeline.encoder_seq_len)
+        if batched:
+            n_slots = self._batch_size
+            prompt_lens = self._batch_prompt_lens
+        else:
+            n_slots = 1
+            prompt_lens = (int(self._last_prompt_len),)
+        hidden = self._prefix_out.view(n_slots, es, ENC_D)
+        pooled = [hidden[b, :int(self.pipeline.vision_seq_enc) + plen].float().mean(dim=0)
+                  for b, plen in enumerate(prompt_lens)]
+        return torch.stack(pooled).cpu().numpy()
 
     def _copy_tensor_to_pipeline_buf_stream(
             self, src: torch.Tensor, dst_buf, stream_int: int) -> None:

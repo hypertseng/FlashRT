@@ -84,6 +84,10 @@ class Pi05CFGBatchedPipeline(Pi05BatchedPipeline):
             raise ValueError(
                 f"cfg_beta must be >= 1.0 (1.0 disables CFG); got {cfg_beta}")
         super().__init__(*args, **kwargs)
+        if self.B != 2:
+            raise ValueError(
+                f"Pi05CFGBatchedPipeline needs B=2 (cond + uncond slots); "
+                f"the attention backend was built with batch_size={self.B}")
         self.cfg_beta = float(cfg_beta)
 
     # ══════════════════════════════════════════════════════════════════
@@ -416,7 +420,7 @@ class Pi05CFGBatchedPipeline(Pi05BatchedPipeline):
     #   Output routing: action readback comes from the cond slot
     # ══════════════════════════════════════════════════════════════════
 
-    def forward(self) -> int:
+    def forward(self, stream: int | None = None) -> int:
         """Replay the captured B=2 CFG graph; return the cond slot pointer.
 
         The batched pipeline runs both slots' decoder per step, but the
@@ -427,8 +431,9 @@ class Pi05CFGBatchedPipeline(Pi05BatchedPipeline):
             self._graph.replay(self._graph_stream)
             self._cudart.cudaStreamSynchronize(self._graph_stream)
         else:
-            self.run_pipeline(stream=0)
-            self._cudart.cudaDeviceSynchronize()
+            run_stream = 0 if stream is None else int(stream)
+            self.run_pipeline(stream=run_stream)
+            self._cudart.cudaStreamSynchronize(ctypes.c_void_p(run_stream))
         per_slot_bytes = self.chunk_size * ACTION_DIM * 2
         return (self.bufs["diffusion_noise_b2"].ptr.value
                 + self.COND_SLOT * per_slot_bytes)

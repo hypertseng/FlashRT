@@ -7,7 +7,9 @@ Public exports (stable API — see ``docs/stable_api.md``):
     flash_rt.VLAModel          — unified inference wrapper
 
 Supported models: Pi0.5, Pi0, Pi0-FAST, GROOT N1.6, GROOT N1.7.
-Supported hardware: Jetson Thor (SM110), RTX 5090 (SM120), RTX 4090 (SM89).
+Supported hardware: Jetson Thor (SM110), RTX 5090 (SM120), RTX 4090
+(SM89), AMD Instinct MI350 series (ROCm gfx950), and AMD Radeon 8060S
+(ROCm gfx1151, Pi0.5 BF16).
 
 Extending with new models: see ``docs/plugin_model_template.md``.
 
@@ -25,7 +27,7 @@ Usage::
                             prompt="pick up the red block")
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # ── Windows: register CUDA / cuDNN DLL search paths ──
 # Python 3.8+ on Windows ignores PATH for C-extension dependencies
@@ -65,17 +67,20 @@ del _os, _sys
 
 from flash_rt import _extensions as _ext  # noqa: E402
 
-__all__ = ["load_model", "VLAModel", "structures"]
+__all__ = ["load_model", "VLAModel", "catalog"]
 
 
 def __getattr__(name):
     """PEP 562. ``import flash_rt`` stays free of torch and of the
     compiled extensions.
 
-    The catalog, the adapters and the structures layer are all usable
-    without either, and a serving host that only wants
-    ``flash_rt.structures`` should not pay for the VLA API to reach it.
-    Naming ``load_model`` still loads everything it needs.
+    The structure catalog is usable without either, and a consumer that
+    only wants ``flash_rt.catalog`` should not pay for the VLA API to
+    reach it. Naming ``load_model`` still loads everything it needs.
+
+    ``flash_rt.structures`` moved to its own distribution
+    (``flashrt-structures``); asking for it here answers with that
+    pointer rather than an AttributeError.
 
     An extension name reaching here means the import machinery did not
     find it beside the package — this distribution ships no ``.so`` — so
@@ -84,9 +89,16 @@ def __getattr__(name):
     if name in ("load_model", "VLAModel"):
         from flash_rt import api
         return getattr(api, name)
-    if name == "structures":
-        import flash_rt.structures as mod
+    if name == "catalog":
+        import flash_rt.catalog as mod
         return mod
+    if name == "structures":
+        raise ImportError(
+            "flash_rt.structures moved to the flashrt-structures "
+            "distribution: pip install flashrt-structures, then "
+            "`import flashrt_structures as structures`. The structure "
+            "catalog itself stayed here as flash_rt.catalog. "
+            "See https://github.com/flashrt-project/FlashRT-Structures")
     if name in _ext.EXTENSIONS:
         return _ext.require(name)
     raise AttributeError("module %r has no attribute %r" % (__name__, name))
