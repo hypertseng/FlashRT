@@ -85,13 +85,28 @@ def _decoder_mods_block() -> LayerBlock:
     return LayerBlock(prefix_fmt="", num_layers=18, items=items, name="decoder_mods")
 
 
-def build_spec(*, use_fp8: bool = True) -> ModelWeightSpec:
+def build_spec(
+    *,
+    use_fp8: bool = True,
+    siglip_use_fp8: bool | None = None,
+    encoder_use_fp8: bool | None = None,
+    decoder_use_fp8: bool | None = None,
+) -> ModelWeightSpec:
+    """Build a weight layout matching each runtime precision branch.
+
+    The force-FP16 runtime switches used to change only the kernels while the
+    loader still quantized every weight whenever ``use_fp8`` was true.  That
+    made mixed-precision PI0.5 configurations feed FP8 bytes to FP16 GEMMs.
+    """
+    siglip_fp8 = use_fp8 if siglip_use_fp8 is None else siglip_use_fp8
+    encoder_fp8 = use_fp8 if encoder_use_fp8 is None else encoder_use_fp8
+    decoder_fp8 = use_fp8 if decoder_use_fp8 is None else decoder_use_fp8
     return ModelWeightSpec(
         framework="torch",
         blocks=[
-            paligemma_siglip_block(use_fp8=use_fp8),
-            paligemma_encoder_block(use_fp8=use_fp8),
-            _decoder_block(use_fp8=use_fp8),
+            paligemma_siglip_block(use_fp8=siglip_fp8),
+            paligemma_encoder_block(use_fp8=encoder_fp8),
+            _decoder_block(use_fp8=decoder_fp8),
             _decoder_mods_block(),
         ],
     )
