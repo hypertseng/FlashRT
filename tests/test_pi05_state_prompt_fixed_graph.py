@@ -41,6 +41,16 @@ CKPT_PI05 = os.environ.get(
 
 _GPU_AVAILABLE = torch.cuda.is_available()
 _CKPT_AVAILABLE = os.path.isdir(CKPT_PI05)
+_IS_THOR = (
+    _GPU_AVAILABLE and "thor" in torch.cuda.get_device_name(0).lower()
+)
+if _IS_THOR:
+    pytestmark = pytest.mark.skip(
+        reason=(
+            "this file inspects the RTX frontend wrapper; Thor coverage lives "
+            "in test_pi05_thor_state_prompt_fixed.py"
+        )
+    )
 
 _CHILD = r"""
 import sys, numpy as np, torch

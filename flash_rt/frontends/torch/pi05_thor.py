@@ -106,6 +106,7 @@ def _env_float(name, default):
         logger.warning("Invalid float env %s=%r; using %.3f", name, value, default)
         return float(default)
 
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -128,6 +129,12 @@ class Pi05TorchFrontendThor:
         set_prompt(prompt_text)
         infer(observation) -> {"actions": np.ndarray}
     """
+
+    # Model weights are independent of NFE. The serving adapter may create
+    # one frontend per supported NFE, but they must share the same CUDA
+    # tensors instead of reopening the checkpoint and allocating another
+    # copy of every layer. Runtime buffers/graphs remain per-frontend.
+    _WEIGHT_CACHE = {}
 
     _BATCH_GRAPH_BANK_ATTRS = (
         "_Kc_b2", "_Vc_b2",
@@ -161,7 +168,8 @@ class Pi05TorchFrontendThor:
                  use_cuda_graph: bool = True, autotune: int = 3,
                  use_fp8: bool = True, state_prompt_mode: str = "exact",
                  state_prompt_fixed_max_len: Optional[int] = None,
-                 use_fa4: bool = False, rtc_prefix_len: int = 0):
+                 use_fa4: bool = False, rtc_prefix_len: int = 0,
+                 num_steps: int | None = None):
         """
         Args:
             autotune: CUDA Graph autotune trials per set_prompt().
@@ -174,6 +182,39 @@ class Pi05TorchFrontendThor:
         self.use_fp8 = bool(use_fp8)
         self.use_fa4 = bool(use_fa4)
         self.rtc_prefix_len = max(0, int(rtc_prefix_len))
+        # NFE is supplied explicitly by the serving scheduler.
+        steps_value = (
+            num_steps if num_steps is not None
+            else os.environ.get("FLASHRT_PI05_NUM_STEPS", "10")
+        )
+        steps = int(steps_value)
+        if steps < 1 or steps > 10:
+            raise ValueError(f"num_steps must be in [1, 10], got {steps}")
+        self.steps = steps
+        # State-conditioned VLASh requests arrive with a changing projected
+        # robot state. Exact-length CUDA graphs would recapture whenever the
+        # tokenized state changes length, which creates long LIBERO tails.
+        # Fixed mode captures one max-length graph and only updates device
+        # valid-prefix scalars at runtime, matching the FlashRT/JAX contract.
+        # State prompt mode is an explicit frontend argument; no environment
+        # override is permitted because it changes the captured graph path.
+        state_mode = state_prompt_mode
+        if state_mode not in ("exact", "fixed"):
+            raise ValueError(
+                "state_prompt_mode must be 'exact' or 'fixed', "
+                f"got {state_mode!r}")
+        self._state_prompt_mode = state_mode
+        fixed_cap = state_prompt_fixed_max_len
+        if state_mode == "fixed":
+            if fixed_cap is None:
+                fixed_cap = PI05_STATE_PROMPT_MAX_LEN
+            fixed_cap = int(fixed_cap)
+            if fixed_cap <= 0:
+                raise ValueError(
+                    "state_prompt_fixed_max_len must be positive, "
+                    f"got {fixed_cap}")
+        self._state_prompt_fixed_max_len = fixed_cap
+        self._state_prompt_fixed_shape_active = False
         # CUDA graphs bake the prefix length into the decoder call.  Keep
         # the active value separate so the first request (which has no
         # previous chunk) can run with prefix_len=0 and the prefix graph is
@@ -202,6 +243,10 @@ class Pi05TorchFrontendThor:
             os.environ.get("FLASHRT_THOR_BATCH_GRAPH_BANK", "0") == "1"
         )
         self._batch_graph_bank = {}
+        # A slot is resident only after both graph objects are captured.
+        # Shape switching clears the active graph transiently; readiness
+        # must survive that transition without overwriting the old slot.
+        self._batch_graph_bank_ready_keys = set()
         self._batch_graph_bank_active_key = None
         self.prompt_bank_enabled = (
             os.environ.get("FLASHRT_THOR_PROMPT_BANK", "0") == "1"
@@ -240,6 +285,13 @@ class Pi05TorchFrontendThor:
         # ---- FvkContext + GemmRunner ----
         self._ctx = fvk.FvkContext()
         self._gemm = fvk.GemmRunner()
+
+        # Device scalars used by fixed-shape attention and the decoder's
+        # devpos KV append. They are allocated once and updated in-place
+        # between CUDA-graph replays.
+        self._enc_seqused = torch.zeros(1, dtype=torch.int32, device="cuda")
+        self._dec_seqused = torch.zeros(1, dtype=torch.int32, device="cuda")
+        self._dec_devpos = torch.zeros(1, dtype=torch.int32, device="cuda")
 
         # ---- Load CUTLASS FMHA (compiled from csrc/attention/) ----
         # Search order: next to the checkpoint, then the installed
@@ -309,27 +361,55 @@ class Pi05TorchFrontendThor:
         from flash_rt.frontends.torch._pi05_thor_spec import build_spec
 
         from flash_rt.executors.torch_weights import _autodetect_strip_prefix
-        sf = safe_open(str(safetensors_path), framework='pt', device='cuda')
-        # The lerobot HF policy releases (e.g. lerobot/pi05_libero
-        # _finetuned_v044) wrap every weight key under an extra
-        # ``model.`` namespace. Auto-detect and prepend it on the raw
-        # safetensors lookup so the rest of this loader can stay
-        # written against the openpi-converted bare keys.
-        _strip = _autodetect_strip_prefix(set(sf.keys()))
-        def g_raw(k): return sf.get_tensor((_strip + k) if _strip else k)
-        def g(k): return g_raw(k).to(fp16)
 
-        # Declarative weight-loader pass (stage 7.3). Populates:
-        #   self._sig_{ln_attn,ln_ffn,qkv,o,up,down}_{w,b}  (27-layer lists)
-        #   self._sig_alpha                                  (108 fp32 scales)
-        #   self._enc_{qkv,o,gu,d}_w                          (18-layer lists)
-        #   self._enc_w_scales                                (72 fp32 scales)
-        #   self._dec_{qkv,o,gu,d}_flat                       (flat cat tensors)
-        #   self._ae_w_scales                                 (72 fp32 scales)
-        #   self._{attn,ffn}_mod_{w,b}                        (18-layer lists)
-        _src = SafetensorsSource(str(safetensors_path), device='cuda')
-        WeightLoader(source=_src, target=self,
-                     spec=build_spec(use_fp8=self.use_fp8)).run()
+        cache_key = (str(pathlib.Path(safetensors_path).resolve()),
+                     bool(self.use_fp8))
+        cache = type(self)._WEIGHT_CACHE.get(cache_key)
+        if cache is None:
+            sf = safe_open(str(safetensors_path), framework='pt', device='cuda')
+            # The HF policy may wrap every weight key under an extra model
+            # namespace. Auto-detect it on the first load only.
+            _strip = _autodetect_strip_prefix(set(sf.keys()))
+            raw_cache = {}
+            fp16_cache = {}
+
+            def g_raw(k):
+                if k not in raw_cache:
+                    raw_cache[k] = sf.get_tensor((_strip + k) if _strip else k)
+                return raw_cache[k]
+
+            def g(k):
+                if k not in fp16_cache:
+                    fp16_cache[k] = g_raw(k).to(fp16)
+                return fp16_cache[k]
+
+            # Load immutable model weights once. Runtime buffers and graphs
+            # are intentionally left per-frontend (and per NFE).
+            before_keys = set(self.__dict__)
+            _src = SafetensorsSource(str(safetensors_path), device='cuda')
+            WeightLoader(source=_src, target=self,
+                         spec=build_spec(use_fp8=self.use_fp8)).run()
+            loaded_keys = set(self.__dict__) - before_keys
+            cache = {
+                'raw': raw_cache,
+                'fp16': fp16_cache,
+                'weight_attrs': {k: self.__dict__[k] for k in loaded_keys},
+            }
+            type(self)._WEIGHT_CACHE[cache_key] = cache
+            logger.info("Pi05 cached shared weights for %s (attrs=%d, tensors=%d)",
+                        safetensors_path, len(loaded_keys),
+                        len(raw_cache) + len(fp16_cache))
+        else:
+            # Reuse immutable weight tensors and pointer lists; do not share
+            # graph/input/calibration buffers between NFE frontends.
+            for key, value in cache['weight_attrs'].items():
+                setattr(self, key, value)
+            raw_cache = cache['raw']
+            fp16_cache = cache['fp16']
+
+            def g_raw(k): return raw_cache[k]
+            def g(k): return fp16_cache[k]
+
         # FP16 path: spec drops Quant() / scale_into, so _sig_alpha,
         # _enc_w_scales, _ae_w_scales never get populated. Provide
         # empty placeholders so downstream pointer-dict construction
@@ -506,8 +586,7 @@ class Pi05TorchFrontendThor:
         # Decoder / AE  (18 layers, 10 steps)
         # ===============================================================
         dp = 'paligemma_with_expert.gemma_expert'
-        steps = 10
-        self.steps = steps
+        steps = self.steps
         D3a = 3 * Da
 
         # Decoder/AE per-layer weights loaded declaratively above as flat cats:
@@ -755,11 +834,34 @@ class Pi05TorchFrontendThor:
     def clear_batch_graph_bank(self) -> None:
         """Drop all resident batch graph-bank entries."""
         self._batch_graph_bank.clear()
+        self._batch_graph_bank_ready_keys.clear()
         self._batch_graph_bank_active_key = None
 
     def batch_graph_bank_keys(self):
-        """Return the resident graph-bank keys for benchmarks/debugging."""
-        return tuple(sorted(self._batch_graph_bank.keys(), key=repr))
+        """Return resident exact-B graph keys, including the serial B1 graph.
+
+        The batched bank stores B>=2 entries, while the native B1 path keeps
+        its own ``_siglip_graph`` and ``_enc_ae_graph`` objects. Expose that
+        resident serial pair as an exact-B=1 key so Manager warmup and runtime
+        diagnostics can prove that B1 is graph-backed without pretending it is
+        a B>=2 fused graph.
+        """
+        keys = [
+            key for key in self._batch_graph_bank.keys()
+            if key in self._batch_graph_bank_ready_keys
+        ]
+        if (
+            getattr(self, "_siglip_graph", None) is not None
+            and getattr(self, "_enc_ae_graph", None) is not None
+        ):
+            keys.append((
+                1,
+                int(getattr(self, "Se", 0)),
+                int(getattr(self, "_S_lang", 0) or 0),
+                None,
+                int(getattr(self, "_rtc_active_prefix_len", 0)),
+            ))
+        return tuple(sorted(keys, key=repr))
 
     def _batch_graph_bank_key(self, B: int, Se: int):
         return (
@@ -768,6 +870,13 @@ class Pi05TorchFrontendThor:
             int(getattr(self, "_S_lang", 0) or 0),
             self._enc_ae_graph_b2_cfg_beta,
             int(getattr(self, "_rtc_active_prefix_len_b2", 0)),
+        )
+
+    def _batch_graph_bank_entry_ready(self) -> bool:
+        """Whether the active B>=2 state owns both captured CUDA graphs."""
+        return (
+            getattr(self, "_siglip_batched_graph", None) is not None
+            and getattr(self, "_enc_ae_graph_b2", None) is not None
         )
 
     def _save_active_batch_graph_bank_entry(self) -> None:
@@ -780,6 +889,14 @@ class Pi05TorchFrontendThor:
         key = self._batch_graph_bank_active_key
         if key is None:
             key = self._batch_graph_bank_key(self.B, self.Se)
+        # set_batched_mode() clears the active graph after saving the old
+        # slot. Do not let this transient empty state overwrite a ready slot
+        # when the next batch shape is enabled.
+        if (
+            key in self._batch_graph_bank_ready_keys
+            and not self._batch_graph_bank_entry_ready()
+        ):
+            return
         entry = {name: getattr(self, name, None)
                  for name in self._BATCH_GRAPH_BANK_ATTRS}
         entry.update({
@@ -789,12 +906,18 @@ class Pi05TorchFrontendThor:
             "batched": bool(self._batched),
         })
         self._batch_graph_bank[key] = entry
+        if self._batch_graph_bank_entry_ready():
+            self._batch_graph_bank_ready_keys.add(key)
+        else:
+            self._batch_graph_bank_ready_keys.discard(key)
         self._batch_graph_bank_active_key = key
 
     def _restore_batch_graph_bank_entry(self, B: int, Se: int) -> bool:
         if not self.batch_graph_bank_enabled:
             return False
         key = self._batch_graph_bank_key(B, Se)
+        if key not in self._batch_graph_bank_ready_keys:
+            return False
         entry = self._batch_graph_bank.get(key)
         if entry is None:
             return False
@@ -810,7 +933,7 @@ class Pi05TorchFrontendThor:
     def _mark_batch_graph_bank_entry_ready(self, B: int, Se: int) -> None:
         if not self.batch_graph_bank_enabled:
             return
-        if self._siglip_batched_graph is None or self._enc_ae_graph_b2 is None:
+        if not self._batch_graph_bank_entry_ready():
             return
         self._batch_graph_bank_active_key = self._batch_graph_bank_key(B, Se)
         self._save_active_batch_graph_bank_entry()
@@ -1446,6 +1569,11 @@ class Pi05TorchFrontendThor:
 
         S_sig = self.sig_S
         nv = self.num_views
+        fixed_shape = (
+            self._state_prompt_mode == "fixed"
+            and state is not None
+            and self._rl_config is None
+        )
 
         # ---- Tokenize ----
         if isinstance(prompt_text, (np.ndarray, list)):
@@ -1455,29 +1583,67 @@ class Pi05TorchFrontendThor:
                 torch.from_numpy(token_ids).long().cuda(), self.embedding_weight)
             embeds = embeds * float(embeds.shape[-1] ** 0.5)
         else:
-            max_len = PI05_STATE_PROMPT_MAX_LEN if state is not None else 48
+            max_len = (
+                self._state_prompt_fixed_max_len if fixed_shape
+                else (PI05_STATE_PROMPT_MAX_LEN if state is not None else 48)
+            )
             embeds, prompt_len = embed_prompt(
                 prompt_text, self.embedding_weight, max_len=max_len,
                 state=state)
 
-        # Se must be EVEN for cuBLASLt FP8
-        Se = S_sig + prompt_len
-        if Se % 2 != 0:
-            Se += 1
-        actual_lang = Se - S_sig
-        if actual_lang > prompt_len:
-            embeds = torch.cat([embeds, embeds[-1:]], dim=0)
+        # Fixed state prompts use one max-length graph. The attention backend
+        # masks the padded rows with a device-side valid-prefix scalar.
+        if fixed_shape:
+            Se = S_sig + int(self._state_prompt_fixed_max_len)
+            if Se % 2 != 0:
+                Se += 1
+            actual_lang = Se - S_sig
+            valid_lang = int(prompt_len)
+            if (S_sig + valid_lang) % 2 != 0:
+                valid_lang += 1
+            if valid_lang > actual_lang:
+                raise ValueError(
+                    f"prompt_len {prompt_len} exceeds fixed state prompt "
+                    f"capacity {actual_lang}")
+            padded = torch.zeros(
+                actual_lang, embeds.shape[1], dtype=embeds.dtype,
+                device=embeds.device)
+            padded[:prompt_len].copy_(embeds[:prompt_len])
+            if valid_lang > prompt_len:
+                padded[prompt_len:valid_lang].copy_(embeds[-1:])
+            embeds = padded
+            valid_prefix = S_sig + valid_lang
+        else:
+            # Se must be EVEN for cuBLASLt FP8
+            Se = S_sig + prompt_len
+            if Se % 2 != 0:
+                Se += 1
+            actual_lang = Se - S_sig
+            if actual_lang > prompt_len:
+                embeds = torch.cat([embeds, embeds[-1:]], dim=0)
+            valid_prefix = Se
 
         if (self.graph_captured and self._lang_emb is not None
                 and self._S_lang == actual_lang and self.Se == Se):
             self._lang_emb.copy_(embeds)
+            self._state_prompt_fixed_shape_active = fixed_shape
+            dec_start = valid_prefix if fixed_shape else Se
+            self._dec_rope.copy_(
+                torch.cat([self._kc_t[dec_start:dec_start + self.Sa, :, None],
+                           self._ks_t[dec_start:dec_start + self.Sa, :, None]],
+                          dim=2).reshape(self.Sa, 256))
+            self._attn.set_fixed_shape(fixed_shape)
+            if fixed_shape:
+                self._attn.set_fixed_valid_len(valid_prefix)
             logger.info(
                 "Updated Pi0.5 Thor prompt in place: '%s' "
-                "(%d tokens, Se=%d, state=%s)",
-                prompt_text, prompt_len, Se, state is not None)
+                "(%d tokens, Se=%d, state=%s, mode=%s)",
+                prompt_text, prompt_len, Se, state is not None,
+                "fixed" if fixed_shape else "exact")
             return
 
         self.Se = Se
+        self._state_prompt_fixed_shape_active = fixed_shape
         self.total_keys = Se + self.Sa
 
         # Stage 1.4 — build AttentionBackend. total_keys must be set first
@@ -1519,7 +1685,15 @@ class Pi05TorchFrontendThor:
                 "scale":        attn_scale,
             },
             use_fa4=self.use_fa4,
+            fixed_control={
+                "enc_seqused": self._enc_seqused,
+                "dec_seqused": self._dec_seqused,
+                "dec_devpos": self._dec_devpos,
+            },
         )
+        self._attn.set_fixed_shape(fixed_shape)
+        if fixed_shape:
+            self._attn.set_fixed_valid_len(valid_prefix)
 
         self._lang_emb = embeds
         self._S_lang = actual_lang
@@ -1534,7 +1708,7 @@ class Pi05TorchFrontendThor:
         self._enc_rope[:Se].copy_(
             torch.cat([self._kc_t[:Se, :, None],
                        self._ks_t[:Se, :, None]], dim=2).reshape(Se, 256))
-        dec_start = Se
+        dec_start = valid_prefix if fixed_shape else Se
         self._dec_rope.copy_(
             torch.cat([self._kc_t[dec_start:dec_start + self.Sa, :, None],
                        self._ks_t[dec_start:dec_start + self.Sa, :, None]], dim=2)
@@ -1542,7 +1716,7 @@ class Pi05TorchFrontendThor:
 
         # ---- Time conditioning (precompute per-step AdaRMSNorm styles) ----
         Sa, Da, La = self.Sa, self.Da, self.La
-        steps = 10; D3a = 3 * Da
+        steps = self.steps; D3a = 3 * Da
         sa_all = torch.zeros(steps * La * Sa, D3a, dtype=fp16, device='cuda')
         sf_all = torch.zeros(steps * La * Sa, D3a, dtype=fp16, device='cuda')
         fs_all = torch.zeros(steps * Sa, D3a, dtype=fp16, device='cuda')
@@ -1770,6 +1944,7 @@ class Pi05TorchFrontendThor:
             'qw':        self._dec_qkv_flat.data_ptr(),
             'Kc':        self._Kc.reshape(-1).data_ptr(),
             'Vc':        self._Vc.reshape(-1).data_ptr(),
+            'dec_devpos': self._dec_devpos.data_ptr(),
             'ow':        self._dec_o_flat.data_ptr(),
             'sf':        self._sf_all.data_ptr(),
             'gw':        self._dec_gu_flat.data_ptr(),
@@ -1784,8 +1959,9 @@ class Pi05TorchFrontendThor:
         }
         ae_dims = {
             'S': Sa, 'D': Da, 'H': Ha, 'NH': 8, 'HD': 256,
-            'steps': 10, 'layers': self.La, 'enc_seq': Se,
+            'steps': self.steps, 'layers': self.La, 'enc_seq': Se,
             'total_keys': total_keys,
+            'fixed_shape': bool(self._state_prompt_fixed_shape_active),
         }
 
         # Decoder scratch buffers
@@ -1896,9 +2072,9 @@ class Pi05TorchFrontendThor:
 
     def _capture_siglip_graph(self):
         """Capture patch_embed + SigLIP + PostLN as CUDA graph."""
-        siglip_use_fp8 = self.use_fp8 and os.environ.get(
-            "FLASHRT_FORCE_SIGLIP_FP16", "0"
-        ).lower() not in ("1", "true", "yes", "on")
+        siglip_use_fp8 = self.use_fp8 and not _env_flag(
+            "FLASHRT_FORCE_SIGLIP_FP16", False
+        )
         logger.info("SigLIP capture mode: siglip_fp8=%s", siglip_use_fp8)
         # Warmup: zero SigLIP input to match production (g_xs = zeros).
         # patch_embed runs but its output is zeroed before SigLIP to avoid
@@ -2061,12 +2237,12 @@ class Pi05TorchFrontendThor:
         Le = self.Le; La = self.La; De = self.De; He = self.He
         NHe = self.NHe; HDe = self.HDe
         Sa = self.Sa; Da = self.Da; Ha = self.Ha
-        enc_use_fp8 = self.use_fp8 and os.environ.get(
-            "FLASHRT_FORCE_ENCODER_FP16", "0"
-        ).lower() not in ("1", "true", "yes", "on")
-        dec_use_fp8 = self.use_fp8 and os.environ.get(
-            "FLASHRT_FORCE_DECODER_FP16", "0"
-        ).lower() not in ("1", "true", "yes", "on")
+        enc_use_fp8 = self.use_fp8 and not _env_flag(
+            "FLASHRT_FORCE_ENCODER_FP16", False
+        )
+        dec_use_fp8 = self.use_fp8 and not _env_flag(
+            "FLASHRT_FORCE_DECODER_FP16", False
+        )
         logger.info("Enc+AE capture modes: encoder_fp8=%s decoder_fp8=%s",
                     enc_use_fp8, dec_use_fp8)
 
@@ -2128,6 +2304,7 @@ class Pi05TorchFrontendThor:
             'qw':         self._dec_qkv_flat.data_ptr(),
             'Kc':         self._Kc.reshape(-1).data_ptr(),
             'Vc':         self._Vc.reshape(-1).data_ptr(),
+            'dec_devpos': self._dec_devpos.data_ptr(),
             'ow':         self._dec_o_flat.data_ptr(),
             'sf':         self._sf_all.data_ptr(),
             'gw':         self._dec_gu_flat.data_ptr(),
@@ -2143,9 +2320,10 @@ class Pi05TorchFrontendThor:
         }
         ae_dims = {
             'S': Sa, 'D': Da, 'H': Ha, 'NH': 8, 'HD': 256,
-            'steps': 10, 'layers': La, 'enc_seq': Se,
+            'steps': self.steps, 'layers': La, 'enc_seq': Se,
             'total_keys': total_keys,
             'rtc_prefix_len': int(self._rtc_active_prefix_len),
+            'fixed_shape': bool(self._state_prompt_fixed_shape_active),
         }
 
         # Warmup
@@ -2185,12 +2363,12 @@ class Pi05TorchFrontendThor:
         Le = self.Le; La = self.La; De = self.De; He = self.He
         NHe = self.NHe; HDe = self.HDe
         Sa = self.Sa; Da = self.Da; Ha = self.Ha
-        enc_use_fp8 = self.use_fp8 and os.environ.get(
-            "FLASHRT_FORCE_ENCODER_FP16", "0"
-        ).lower() not in ("1", "true", "yes", "on")
-        dec_use_fp8 = self.use_fp8 and os.environ.get(
-            "FLASHRT_FORCE_DECODER_FP16", "0"
-        ).lower() not in ("1", "true", "yes", "on")
+        enc_use_fp8 = self.use_fp8 and not _env_flag(
+            "FLASHRT_FORCE_ENCODER_FP16", False
+        )
+        dec_use_fp8 = self.use_fp8 and not _env_flag(
+            "FLASHRT_FORCE_DECODER_FP16", False
+        )
 
         enc_bufs = {
             'x':       self._enc_x.data_ptr(),
@@ -2247,6 +2425,7 @@ class Pi05TorchFrontendThor:
             'qw':         self._dec_qkv_flat.data_ptr(),
             'Kc':         self._Kc.reshape(-1).data_ptr(),
             'Vc':         self._Vc.reshape(-1).data_ptr(),
+            'dec_devpos': self._dec_devpos.data_ptr(),
             'ow':         self._dec_o_flat.data_ptr(),
             'sf':         self._sf_all.data_ptr(),
             'gw':         self._dec_gu_flat.data_ptr(),
@@ -2262,9 +2441,10 @@ class Pi05TorchFrontendThor:
         }
         ae_dims = {
             'S': Sa, 'D': Da, 'H': Ha, 'NH': 8, 'HD': 256,
-            'steps': 10, 'layers': La, 'enc_seq': Se,
+            'steps': self.steps, 'layers': La, 'enc_seq': Se,
             'total_keys': total_keys,
             'rtc_prefix_len': int(self._rtc_active_prefix_len),
+            'fixed_shape': bool(self._state_prompt_fixed_shape_active),
         }
 
         self._Kc.zero_(); self._Vc.zero_()
@@ -2404,7 +2584,7 @@ class Pi05TorchFrontendThor:
         }
         ae_dims_b2 = {
             'S': Sa, 'D': Da, 'H': Ha, 'NH': 8, 'HD': 256,
-            'steps': 10, 'layers': La, 'enc_seq': Se,
+            'steps': self.steps, 'layers': La, 'enc_seq': Se,
             'total_keys': total_keys,
             'rtc_prefix_len': int(self._rtc_active_prefix_len_b2),
         }
@@ -2567,8 +2747,9 @@ class Pi05TorchFrontendThor:
         }
         ae_dims_b2 = {
             'S': Sa, 'D': Da, 'H': Ha, 'NH': 8, 'HD': 256,
-            'steps': 10, 'layers': La, 'enc_seq': Se,
+            'steps': self.steps, 'layers': La, 'enc_seq': Se,
             'total_keys': total_keys,
+            'fixed_shape': bool(self._state_prompt_fixed_shape_active),
         }
 
         lang_nbytes = self._S_lang * De * 2  # fp16
@@ -3168,7 +3349,7 @@ class Pi05TorchFrontendThor:
         self.B = int(B)
 
         # Step 3: Ensure time conditioning buffers for decoder
-        decoder_steps = 10
+        decoder_steps = self.steps
         Sa, Da, La = self.Sa, self.Da, self.La
         D3a = 3 * Da
 
@@ -3506,24 +3687,38 @@ class Pi05TorchFrontendThor:
         """
         if self._rl_config is not None:
             return self._infer_cfg(observation, debug, seed)
-        debug_timing = os.environ.get("FLASHRT_INFER_DEBUG_TIMING", "0").lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
+        debug_timing = (
+            bool(debug)
+            or _env_flag("FLASHRT_INFER_DEBUG_TIMING", False)
+            or _env_flag("FLASHRT_STAGE_TIMING", False)
         )
+        sync_marks = _env_flag("FLASHRT_STAGE_TIMING_SYNC", False)
         stage_ms = {}
         last_mark = None
+        stage_marks = []
+        start_ev = None
 
         def _mark(name):
-            nonlocal last_mark
+            nonlocal last_mark, start_ev
             if not debug_timing:
                 return
-            torch.cuda.synchronize()
             now = time.perf_counter()
             if last_mark is not None:
                 stage_ms[name] = (now - last_mark) * 1000.0
             last_mark = now
+            if sync_marks:
+                # Explicit opt-in only: makes each host delta include the GPU
+                # work enqueued so far, at the cost of a device sync per mark.
+                torch.cuda.synchronize()
+            try:
+                ev = torch.cuda.Event(enable_timing=True)
+                ev.record()
+            except Exception:
+                return
+            if start_ev is None:
+                start_ev = ev
+            else:
+                stage_marks.append((name, ev))
 
         _mark("start")
         t0 = time.perf_counter()
@@ -3577,6 +3772,7 @@ class Pi05TorchFrontendThor:
         # accepted for adapter compatibility; state-conditioned prompts are
         # still materialized by set_prompt(), not injected into the decoder.
         self._prepare_rtc_prefix(rtc_prev_action_chunk, rtc_prefix_len)
+        _mark("rtc_prefix_prepare")
 
         # ---- Graph 1: SigLIP + PostLN ----
         if use_uint8_graph:
@@ -3617,9 +3813,7 @@ class Pi05TorchFrontendThor:
         else:
             R_np = np.random.randn(self.Sa, 32).astype(np.float16)
         R = torch.from_numpy(R_np).to('cuda', non_blocking=True)
-        if os.environ.get("FLASHRT_RECAPTURE_ENC_AE_EACH_INFER", "0").lower() in (
-            "1", "true", "yes", "on"
-        ):
+        if _env_flag("FLASHRT_RECAPTURE_ENC_AE_EACH_INFER", False):
             self._capture_enc_ae_graph()
             _mark("enc_ae_recapture")
         self._g_noise.view(-1, 32).copy_(R)
@@ -3665,9 +3859,7 @@ class Pi05TorchFrontendThor:
                     enc_ae_mode = "graph_retry"
                     _mark("enc_ae_graph_retry")
 
-        if os.environ.get("FLASHRT_FP8_DEBUG_BUFFERS", "0").lower() in (
-            "1", "true", "yes", "on"
-        ):
+        if _env_flag("FLASHRT_FP8_DEBUG_BUFFERS", False):
             for label, tensor in (
                 ("enc_w_scale", getattr(self, "_enc_w_dev", None)),
                 ("ae_w_scale", getattr(self, "_ae_w_dev", None)),
@@ -3722,7 +3914,42 @@ class Pi05TorchFrontendThor:
             # the next request; the 7-D robot actions are not sufficient to
             # reproduce the RTC prefix in latent space.
             result["rtc_raw_actions"] = raw_actions.copy()
+        if debug_timing and start_ev is not None and stage_marks:
+            # One device sync at the very end converts the per-mark events into
+            # per-stage GPU-timeline spans without adding syncs mid-forward.
+            try:
+                torch.cuda.synchronize()
+                prev = start_ev
+                for _name, _ev in stage_marks:
+                    try:
+                        stage_ms[_name + "_gpu"] = prev.elapsed_time(_ev)
+                    except Exception:
+                        pass
+                    prev = _ev
+                if sync_marks:
+                    stage_ms["sync_marks_mode"] = 1.0
+            except Exception:
+                pass
         if debug_timing:
+            _shape = 0
+            _shape_attr = ""
+            for _attr in ("Se", "S", "seq_len"):
+                if not hasattr(self, _attr):
+                    continue
+                try:
+                    _shape = int(getattr(self, _attr))
+                    _shape_attr = _attr
+                except Exception:
+                    pass
+                break
+            stage_ms["num_views"] = float(self.num_views)
+            stage_ms["Sa"] = float(self.Sa)
+            stage_ms["graph_seq_len"] = float(_shape)
+            stage_ms["graph_seq_len_attr"] = {
+                "Se": 1.0, "S": 2.0, "seq_len": 3.0
+            }.get(_shape_attr, 0.0)
+            stage_ms["use_fa4"] = 1.0 if getattr(self, "use_fa4", False) else 0.0
+            stage_ms["use_fp8"] = 1.0 if getattr(self, "use_fp8", False) else 0.0
             stage_ms["enc_ae_exec_ms"] = enc_ae_exec_ms
             stage_ms["enc_ae_mode"] = {
                 "graph": 0.0,
@@ -3930,6 +4157,7 @@ class Pi05TorchFrontendThor:
                 'sa': self._sa_all.data_ptr(), 'qw': self._dec_qkv_flat.data_ptr(),
                 'Kc': dec_Kc.reshape(-1).data_ptr(),
                 'Vc': dec_Vc.reshape(-1).data_ptr(),
+                'dec_devpos': self._dec_devpos.data_ptr(),
                 'ow': self._dec_o_flat.data_ptr(), 'sf': self._sf_all.data_ptr(),
                 'gw': self._dec_gu_flat.data_ptr(), 'dw': self._dec_d_flat.data_ptr(),
                 'aow': self._aow.data_ptr(), 'aob': self._aob.data_ptr(),
@@ -3939,8 +4167,9 @@ class Pi05TorchFrontendThor:
             }
             ae_dims = {
                 'S': self.Sa, 'D': self.Da, 'H': self.Ha, 'NH': 8, 'HD': 256,
-                'steps': 10, 'layers': self.La, 'enc_seq': self.Se,
+                'steps': self.steps, 'layers': self.La, 'enc_seq': self.Se,
                 'total_keys': self.total_keys,
+                'fixed_shape': bool(self._state_prompt_fixed_shape_active),
             }
             s_dec = self._dec_stream.cuda_stream
             decoder_forward(self._ctx, fvk, ae_bufs, ae_weights,
@@ -4109,6 +4338,7 @@ class Pi05TorchFrontendThor:
             'qw':         self._dec_qkv_flat.data_ptr(),
             'Kc':         self._Kc.reshape(-1).data_ptr(),
             'Vc':         self._Vc.reshape(-1).data_ptr(),
+            'dec_devpos': self._dec_devpos.data_ptr(),
             'ow':         self._dec_o_flat.data_ptr(),
             'sf':         self._sf_all.data_ptr(),
             'gw':         self._dec_gu_flat.data_ptr(),
@@ -4123,8 +4353,9 @@ class Pi05TorchFrontendThor:
         }
         ae_dims = {
             'S': Sa, 'D': Da, 'H': Ha, 'NH': 8, 'HD': 256,
-            'steps': 10, 'layers': self.La, 'enc_seq': Se,
+            'steps': self.steps, 'layers': self.La, 'enc_seq': Se,
             'total_keys': total_keys,
+            'fixed_shape': bool(self._state_prompt_fixed_shape_active),
         }
 
         _ae_calib_buf = torch.zeros(ae_scale_count, dtype=torch.float32, device='cuda')
@@ -4153,6 +4384,16 @@ class Pi05TorchFrontendThor:
         # time with pre-calibration scales.
         self._capture_siglip_graph()
         self._capture_enc_ae_graph()
+        # CUDA-graph instantiation on Thor is schedule-sensitive. A plain
+        # recapture after updating FP8 scales can select a slow kernel
+        # schedule even though the pre-calibration graph was autotuned.
+        # Retune the serial graph after real-data recalibration so formal
+        # steady-state timing remains comparable to direct FlashRT timing.
+        if self.autotune > 0:
+            self._autotune_enc_ae(
+                n_trials=self.autotune,
+                n_bench=10,
+            )
         # Also recapture the batched enc+ae graph if batched mode is active.
         if self._batched and self.B >= 2:
             if self.batched_graph_autotune and self.autotune > 0:
@@ -4240,6 +4481,7 @@ class Pi05TorchFrontendThor:
             'qw':         self._dec_qkv_flat.data_ptr(),
             'Kc':         self._Kc.reshape(-1).data_ptr(),
             'Vc':         self._Vc.reshape(-1).data_ptr(),
+            'dec_devpos': self._dec_devpos.data_ptr(),
             'ow':         self._dec_o_flat.data_ptr(),
             'sf':         self._sf_all.data_ptr(),
             'gw':         self._dec_gu_flat.data_ptr(),
@@ -4254,8 +4496,9 @@ class Pi05TorchFrontendThor:
         }
         ae_dims = {
             'S': Sa, 'D': Da, 'H': Ha, 'NH': 8, 'HD': 256,
-            'steps': 10, 'layers': La, 'enc_seq': Se,
+            'steps': self.steps, 'layers': La, 'enc_seq': Se,
             'total_keys': total_keys,
+            'fixed_shape': bool(self._state_prompt_fixed_shape_active),
         }
 
         per_sample_enc: list[np.ndarray] = []

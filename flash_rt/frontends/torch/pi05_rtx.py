@@ -484,8 +484,9 @@ class Pi05TorchFrontendRtx:
         #       every length is served by masking the padded prefix (FA2
         #       seqused) + appending decoder K/V at the valid offset (devpos),
         #       so a changing length never re-captures and no warmup is needed.
-        # Env override: FLASHRT_PI05_STATE_PROMPT_MODE.
-        _spm = os.environ.get("FLASHRT_PI05_STATE_PROMPT_MODE", state_prompt_mode)
+        # State prompt mode is an explicit frontend argument; no environment
+        # override is permitted because it changes the captured graph path.
+        _spm = state_prompt_mode
         if _spm not in ("fixed", "exact"):
             raise ValueError(
                 f"state_prompt_mode must be 'fixed' or 'exact', got {_spm!r}")
