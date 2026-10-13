@@ -186,7 +186,8 @@ class Pi05TorchFrontendThor:
                  use_fp8: bool = True, state_prompt_mode: str = "exact",
                  state_prompt_fixed_max_len: Optional[int] = None,
                  use_fa4: bool = False, rtc_prefix_len: int = 0,
-                 num_steps: int | None = None):
+                 num_steps: int | None = None,
+                 action_dim: int | None = None, action_horizon: int | None = None):
         """
         Args:
             autotune: CUDA Graph autotune trials per set_prompt().
