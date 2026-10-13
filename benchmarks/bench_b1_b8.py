@@ -14,17 +14,96 @@ import argparse
 import ctypes
 import json
 import os
+import subprocess
 import time
+from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
 
 import numpy as np
 import torch
 
 CKPT = os.environ.get(
     "PI05_LIBERO_PYTORCH_CHECKPOINT",
-    "/mnt/home/luoxing/models/pi05/pi05_libero_pytorch",
+    "",
 )
+
+
+def _command_text(command: list[str]) -> str | None:
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = result.stdout.strip()
+    return value.splitlines()[0].strip() if value else None
+
+def _command_output(command: list[str]) -> str | None:
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = result.stdout.strip()
+    return value if value else None
+
+
+def _git_revision(root: Path) -> str | None:
+    return _command_text(["git", "-C", str(root), "rev-parse", "HEAD"])
+
+
+def _collect_environment(*, exclusive_gpu: bool) -> dict[str, object]:
+    flashrt_root = Path(__file__).resolve().parents[1]
+    lingshu_root = Path(__file__).resolve().parents[3]
+    return {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "device_name": torch.cuda.get_device_name(0),
+        "device_capability": list(torch.cuda.get_device_capability(0)),
+        "torch_version": torch.__version__,
+        "cuda_runtime": torch.version.cuda,
+        "driver_version": _command_text([
+            "nvidia-smi", "--query-gpu=driver_version",
+            "--format=csv,noheader,nounits",
+        ]),
+        "gpu_uuid": _command_text([
+            "nvidia-smi", "--query-gpu=uuid",
+            "--format=csv,noheader",
+        ]),
+        "mig_mode": _command_text([
+            "nvidia-smi", "--query-gpu=mig.mode.current",
+            "--format=csv,noheader",
+        ]),
+        "flashrt_revision": _git_revision(flashrt_root),
+        "lingshu_revision": _git_revision(lingshu_root),
+        "flashrt_status_short": _command_output(
+            ["git", "-C", str(flashrt_root), "status", "--short"]),
+        "lingshu_status_short": _command_output(
+            ["git", "-C", str(lingshu_root), "status", "--short"]),
+        "flashrt_dirty_diff_stat": _command_output(
+            ["git", "-C", str(flashrt_root), "diff", "--stat"]),
+        "lingshu_dirty_diff_stat": _command_output(
+            ["git", "-C", str(lingshu_root), "diff", "--stat"]),
+        "power_draw_w": _command_text([
+            "nvidia-smi", "--query-gpu=power.draw",
+            "--format=csv,noheader,nounits",
+        ]),
+        "sm_clock_mhz": _command_text([
+            "nvidia-smi", "--query-gpu=clocks.sm",
+            "--format=csv,noheader,nounits",
+        ]),
+        "exclusive_gpu": exclusive_gpu,
+    }
 
 
 def _make_obs(seed: int = 42, *, same_views: bool = False) -> dict:
@@ -35,6 +114,13 @@ def _make_obs(seed: int = 42, *, same_views: bool = False) -> dict:
     return {"image": img, "wrist_image": wrist}
 
 
+def _parse_num_steps(value: str) -> int:
+    steps = int(value)
+    if not 4 <= steps <= 10:
+        raise argparse.ArgumentTypeError("num steps must be in [4, 10]")
+    return steps
+
+
 def _parse_batch_sizes(value: str) -> list[int]:
     sizes: list[int] = []
     for part in value.split(","):
@@ -43,6 +129,7 @@ def _parse_batch_sizes(value: str) -> list[int]:
             continue
         if "-" in part:
             lo_s, hi_s = part.split("-", 1)
+
             lo, hi = int(lo_s), int(hi_s)
             if lo > hi:
                 raise argparse.ArgumentTypeError(f"invalid range: {part}")
@@ -74,6 +161,26 @@ def _time_call(fn: Callable[[], object], iters: int) -> list[float]:
         torch.cuda.synchronize()
         times.append((time.perf_counter() - t0) * 1000.0)
     return times
+
+
+def _time_call_with_device(
+    fn: Callable[[], object], iters: int
+) -> tuple[list[float], list[float]]:
+    """Measure host wall and CUDA-event time for steady-state calls."""
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    host_times: list[float] = []
+    device_times: list[float] = []
+    for _ in range(iters):
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        start_event.record()
+        fn()
+        end_event.record()
+        end_event.synchronize()
+        host_times.append((time.perf_counter() - t0) * 1000.0)
+        device_times.append(float(start_event.elapsed_time(end_event)))
+    return host_times, device_times
 
 
 def _profile_replay(name: str, fn: Callable[[], object], iters: int) -> dict:
@@ -296,6 +403,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Benchmark Pi0.5 Thor batch inference from B=1..8.")
     parser.add_argument("--checkpoint", default=CKPT)
+    parser.add_argument(
+        "--num-steps",
+        type=_parse_num_steps,
+        default=None,
+        help="Action-expert NFE in [4, 10]; overrides FLASHRT_PI05_NUM_STEPS (default: env value or 10).",
+    )
     parser.add_argument("--batch-sizes", type=_parse_batch_sizes, default="1-8",
                         help="Comma list or range, e.g. 1,2,4,8 or 1-8.")
     parser.add_argument("--warmup", type=int, default=30)
@@ -312,6 +425,8 @@ def main() -> None:
                         help="Use identical image and wrist_image within an observation.")
     parser.add_argument("--no-fp8", action="store_true",
                         help="Run the FP16 baseline path instead of FP8.")
+    parser.add_argument("--use-fa4", action="store_true",
+                        help="Require the Thor FA4 attention backend.")
     parser.add_argument("--reuse-frontend", action="store_true",
                         help="Load weights once and recapture graphs as B changes.")
     parser.add_argument("--cuda-profiler-range", action="store_true",
@@ -321,8 +436,26 @@ def main() -> None:
                               "the resident visual-language context. This is "
                               "an idealized cache/reuse upper-bound probe, not "
                               "a production correctness mode."))
+    parser.add_argument(
+        "--exclusive-gpu",
+        action="store_true",
+        help="Record that the benchmark was run with an explicitly reserved GPU.",
+    )
     parser.add_argument("--json-out", type=Path)
     args = parser.parse_args()
+    requested_num_steps = args.num_steps
+    if requested_num_steps is None:
+        raw_steps = os.environ.get("FLASHRT_PI05_NUM_STEPS", "10")
+        try:
+            requested_num_steps = int(raw_steps)
+        except ValueError:
+            parser.error(
+                f"FLASHRT_PI05_NUM_STEPS must be an integer in [4, 10], got {raw_steps!r}"
+            )
+        if not 4 <= requested_num_steps <= 10:
+            parser.error(
+                f"FLASHRT_PI05_NUM_STEPS must be in [4, 10], got {requested_num_steps}"
+            )
 
     if not torch.cuda.is_available():
         print("SKIP: no CUDA")
@@ -340,25 +473,66 @@ def main() -> None:
         f"(warmup={args.warmup}, iters={args.iters}, profile={args.profile})"
     )
     print(f"checkpoint={args.checkpoint}")
-    print(f"batch_sizes={batch_sizes} fp8={not args.no_fp8} reuse_frontend={args.reuse_frontend}")
+    print(
+        f"batch_sizes={batch_sizes} num_steps={requested_num_steps} "
+        f"fp8={not args.no_fp8} use_fa4={args.use_fa4} "
+        f"reuse_frontend={args.reuse_frontend}"
+    )
     print("=" * 96)
 
     results: dict[int, dict] = {}
     frontend = None
+    setup_by_batch: dict[int, float] = {}
+    graph_capture_by_batch: dict[int, float] = {}
+    cache_miss_by_batch: dict[int, bool] = {}
+    observed_num_steps: int | None = None
 
     for B in batch_sizes:
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        setup_start = time.perf_counter()
+        cache_miss = False
+        graph_capture_start = None
         if frontend is None or not args.reuse_frontend:
+            cache_key = (
+                str((Path(args.checkpoint) / "model.safetensors").resolve()),
+                bool(not args.no_fp8),
+            )
+            cache_miss = cache_key not in getattr(
+                Pi05TorchFrontendThor, "_WEIGHT_CACHE", {}
+            )
             frontend = Pi05TorchFrontendThor(
                 args.checkpoint,
                 num_views=2,
                 use_fp8=not args.no_fp8,
+                use_fa4=args.use_fa4,
+                num_steps=requested_num_steps,
             )
+            graph_capture_start = time.perf_counter()
             frontend.set_prompt(args.prompt)
 
+        if graph_capture_start is None:
+            graph_capture_start = time.perf_counter()
         if B == 1:
             frontend.set_batched_mode(enable=False)
         else:
             frontend.set_batched_mode(enable=True, batch_size=B)
+
+        torch.cuda.synchronize()
+        setup_ms = (time.perf_counter() - setup_start) * 1000.0
+        graph_capture_ms = (time.perf_counter() - graph_capture_start) * 1000.0
+        setup_peak_allocated = int(torch.cuda.max_memory_allocated())
+        setup_peak_reserved = int(torch.cuda.max_memory_reserved())
+        current_steps = int(frontend.steps)
+        if observed_num_steps is None:
+            observed_num_steps = current_steps
+        elif observed_num_steps != current_steps:
+            raise RuntimeError(
+                f"observed NFE changed within benchmark: "
+                f"{observed_num_steps} -> {current_steps}")
+        setup_by_batch[B] = setup_ms
+        graph_capture_by_batch[B] = graph_capture_ms
+        cache_miss_by_batch[B] = cache_miss
 
         batch_data = _make_batch(
             args.prompt,
@@ -369,9 +543,17 @@ def main() -> None:
         infer_fn = _make_infer_fn(frontend, B, batch_data, args.seed)
 
         print(f"\nB={B}: warmup...")
-        for _ in range(args.warmup):
-            infer_fn()
+        torch.cuda.reset_peak_memory_stats()
+        first_use_ms = 0.0
+        first_use_device_ms = 0.0
+        if args.warmup > 0:
+            first_host, first_device = _time_call_with_device(infer_fn, 1)
+            first_use_ms = first_host[0]
+            first_use_device_ms = first_device[0]
+            for _ in range(max(0, args.warmup - 1)):
+                infer_fn()
         torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
 
         cudart = _cuda_profiler_api() if args.cuda_profiler_range else None
         if cudart is not None:
@@ -379,10 +561,34 @@ def main() -> None:
             cudart.cudaProfilerStart()
         try:
             print(f"B={B}: benchmark...")
-            times = _time_call(infer_fn, args.iters)
-            summary = _summarize(times)
+            host_times, device_times = _time_call_with_device(
+                infer_fn, args.iters)
+            summary = _summarize(host_times)
+            device_summary = _summarize(device_times)
             summary["per_sample"] = summary["avg"] / B
             summary["throughput_per_s"] = B * 1000.0 / summary["avg"]
+            summary["avg_ms"] = summary["avg"]
+            summary["p50_ms"] = summary["p50"]
+            summary["p95_ms"] = summary["p95"]
+            summary["per_sample_ms"] = summary["per_sample"]
+            summary["throughput_samples_s"] = summary["throughput_per_s"]
+            summary["host_forward_avg_ms"] = summary["avg"]
+            summary["device_avg_ms"] = device_summary["avg"]
+            summary["device_p50_ms"] = device_summary["p50"]
+            summary["device_p95_ms"] = device_summary["p95"]
+            summary["setup_ms"] = setup_ms
+            summary["first_warmup_ms"] = first_use_ms
+            summary["first_warmup_device_ms"] = first_use_device_ms
+            summary["setup_peak_memory_allocated_bytes"] = setup_peak_allocated
+            summary["setup_peak_memory_reserved_bytes"] = setup_peak_reserved
+            summary["peak_memory_allocated_bytes"] = int(
+                torch.cuda.max_memory_allocated())
+            summary["peak_memory_reserved_bytes"] = int(
+                torch.cuda.max_memory_reserved())
+            summary["observed_num_steps"] = current_steps
+            summary["measured_iters"] = args.iters
+            summary["warmup"] = args.warmup
+            summary["cache_miss"] = cache_miss_by_batch[B]
 
             if args.profile:
                 print(f"B={B}: graph profile...")
@@ -420,7 +626,36 @@ def main() -> None:
 
     if args.json_out is not None:
         payload = {
+            "schema": "lingshu_g1_cost_v1",
+            "config": {
+                "requested_num_steps": requested_num_steps,
+                "observed_num_steps": observed_num_steps,
+                "batch_sizes": batch_sizes,
+                "checkpoint": args.checkpoint,
+                "prompt": args.prompt,
+                "diffusion_seed": args.seed,
+                "precision": "fp16+fp8" if not args.no_fp8 else "fp16",
+                "use_fa4": args.use_fa4,
+                "attention_backend": "fa4" if args.use_fa4 else "default",
+                "rtc_mode": "off",
+                "input_mode": {
+                    "same_inputs": args.same_inputs,
+                    "same_views": args.same_views,
+                },
+            },
+            "setup": {
+                "setup_ms": setup_by_batch,
+                "graph_capture_ms": graph_capture_by_batch,
+                "cache_miss": cache_miss_by_batch,
+                "graph_capture_scope": (
+                    "set_prompt and set_batched_mode wall time; includes "
+                    "buffer allocation, graph capture, and autotuning"
+                ),
+                "cache_miss_semantics": "Pi05 model-weight cache miss on frontend construction",
+                "first_use_excluded_from_steady_state": args.warmup > 0,
+            },
             "checkpoint": args.checkpoint,
+            "num_steps": requested_num_steps,
             "batch_sizes": batch_sizes,
             "warmup": args.warmup,
             "iters": args.iters,
@@ -432,6 +667,9 @@ def main() -> None:
             "same_inputs": args.same_inputs,
             "same_views": args.same_views,
             "context_reuse_upper_bound": args.context_reuse_upper_bound,
+            "exclusive_gpu": args.exclusive_gpu,
+            "environment": _collect_environment(
+                exclusive_gpu=args.exclusive_gpu),
             "results": results,
         }
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
