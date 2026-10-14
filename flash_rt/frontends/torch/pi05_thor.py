@@ -3798,7 +3798,8 @@ class Pi05TorchFrontendThor:
             raw = raw_all[b * self.Sa:(b + 1) * self.Sa]
             unnorm = unnormalize_actions(raw, self.norm_stats)
             result = {"actions": unnorm[:, :self.action_dim]}
-            if batch_rtc_prefix_len > 0:
+            # Include the bootstrap prefix=0 result so the caller can seed RTC.
+            if int(self.rtc_prefix_len) > 0:
                 result["rtc_raw_actions"] = raw.copy()
             results.append(result)
 
@@ -4161,10 +4162,9 @@ class Pi05TorchFrontendThor:
             logger.info("Latency: %.1f ms", latency_ms)
 
         result = {"actions": robot_actions}
-        if int(self._rtc_active_prefix_len) > 0:
-            # Lingshu must feed the raw diffusion chunk back to FlashRT on
-            # the next request; the 7-D robot actions are not sufficient to
-            # reproduce the RTC prefix in latent space.
+        if int(self.rtc_prefix_len) > 0:
+            # Return raw actions on the bootstrap prefix=0 pass too; the caller
+            # needs this first chunk to seed the next RTC request.
             result["rtc_raw_actions"] = raw_actions.copy()
         if debug_timing and start_ev is not None and stage_marks:
             # One device sync at the very end converts the per-mark events into
