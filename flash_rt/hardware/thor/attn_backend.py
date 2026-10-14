@@ -280,6 +280,46 @@ class ThorFlashAttnBackend(AttentionBackendBase):
             return torch.cuda.stream(torch.cuda.default_stream())
         return torch.cuda.stream(torch.cuda.ExternalStream(target))
 
+    @property
+    def uses_fa4(self) -> bool:
+        return self._use_fa4
+
+    def run_batched_siglip(self, qkv: int, output: int, *,
+                           batch_views: int, seq: int, heads: int,
+                           head_dim: int, hidden_dim: int, stream: int) -> None:
+        if not self._use_fa4:
+            raise RuntimeError("FA4 batch entry called on a non-FA4 backend")
+        strides = (seq * 3 * hidden_dim, 3 * hidden_dim, head_dim, 1)
+        shape = (batch_views, seq, heads, head_dim)
+        q = _fp16_tensor_from_ptr(qkv, shape, strides)
+        k = _fp16_tensor_from_ptr(qkv, shape, strides, offset=hidden_dim)
+        v = _fp16_tensor_from_ptr(qkv, shape, strides, offset=2 * hidden_dim)
+        out = _fp16_tensor_from_ptr(output, shape)
+        with self._fa4_stream_context(stream):
+            self._fa4_fwd(q, k, v, causal=False, num_splits=1,
+                          pack_gqa=False, out=out)
+
+    def run_batched_encoder(self, q_output: int, keys: int, values: int,
+                            scratch: int, *, batch: int, seq: int,
+                            heads: int, head_dim: int,
+                            key_batch_stride: int, value_batch_stride: int,
+                            valid_lengths=None, stream: int = 0) -> None:
+        if not self._use_fa4:
+            raise RuntimeError("FA4 batch entry called on a non-FA4 backend")
+        # Existing logits scratch is B*heads*seq*seq fp16 elements.
+        if seq < head_dim:
+            raise ValueError("FA4 output requires larger encoder scratch")
+        q = _fp16_tensor_from_ptr(q_output, (batch, seq, heads, head_dim))
+        k = _fp16_tensor_from_ptr(keys, (batch, seq, 1, head_dim),
+                                  (key_batch_stride, head_dim, head_dim, 1))
+        v = _fp16_tensor_from_ptr(values, (batch, seq, 1, head_dim),
+                                  (value_batch_stride, head_dim, head_dim, 1))
+        out = _fp16_tensor_from_ptr(scratch, (batch, seq, heads, head_dim))
+        with self._fa4_stream_context(stream):
+            self._fa4_fwd(q, k, v, seqused_k=valid_lengths,
+                          causal=False, num_splits=1, pack_gqa=True, out=out)
+            q.copy_(out)
+
     def set_fixed_shape(self, enabled: bool) -> None:
         """Enable/disable fixed-shape state-prompt masking.
 
@@ -287,10 +327,6 @@ class ThorFlashAttnBackend(AttentionBackendBase):
         ``attention_qkv_fp16_seqused``. The captured K/V max shape stays fixed;
         :meth:`set_fixed_valid_len` updates the device-side valid lengths.
         """
-        if enabled and self._use_fa4:
-            raise RuntimeError(
-                "Pi0.5 use_fa4=True does not support fixed-shape state-prompt "
-                "attention")
         if enabled and not (
             self._enc_seqused_ptr and self._dec_seqused_ptr
             and self._dec_devpos_ptr
@@ -471,7 +507,8 @@ class ThorFlashAttnBackend(AttentionBackendBase):
                 with self._fa4_stream_context(stream):
                     self._fa4_fwd(
                         q_tensor, k_tensor, v_tensor, causal=False,
-                        num_splits=1, pack_gqa=True, out=output)
+                        num_splits=1, pack_gqa=True, out=output,
+                        seqused_k=self.enc_seqused if self._fixed_shape else None)
                     q_tensor.copy_(output)
                 return int(s["Q_O"])
             if self._fixed_shape and site in ("encoder", "decoder"):

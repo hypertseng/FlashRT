@@ -116,6 +116,18 @@ def decoder_forward_b2(ctx, fvk, bufs, weights, dims, stream=0, *,
     K_dim = HD
     attn_scale = 1.0 / math.sqrt(float(HD))
     BS = B * S
+    fixed_shape = bool(dims.get('fixed_shape', False))
+    dec_valid = weights.get('dec_seqused_b2', [])
+    dec_positions = weights.get('dec_devpos_b2', [])
+    ropes = weights.get('rope_b2', [])
+    if fixed_shape:
+        for name, values in [('dec_seqused_b2', dec_valid),
+                             ('dec_devpos_b2', dec_positions), ('rope_b2', ropes)]:
+            if len(values) != B or not all(values):
+                raise ValueError(f"fixed batched decoder requires B pointers for {name}")
+        for name in ['attention_qkv_fp16_seqused', 'qkv_split_rope_kvcache_fp16_devpos']:
+            if not hasattr(fvk, name):
+                raise RuntimeError(f"installed kernels lack {name}")
 
     noise = bufs['noise']
     x = bufs['x']
@@ -201,25 +213,40 @@ def decoder_forward_b2(ctx, fvk, bufs, weights, dims, stream=0, *,
             # ── C2b: Per-sample RoPE + QKV split + KV cache ──
             kv_offset = l * total_keys * HD + enc_seq * HD
             for b in range(B):
-                fvk.qkv_split_rope_kvcache_fp16(
-                    qkv + b * qkv_stride_bytes,
-                    rope,
-                    attn_out + b * attn_q_stride_bytes,
-                    Kc_b2[b], Vc_b2[b],
-                    S, Q_dim, K_dim, HD, 2560,
-                    kv_offset, HD, stream)
+                if fixed_shape:
+                    fvk.qkv_split_rope_kvcache_fp16_devpos(
+                        qkv + b * qkv_stride_bytes, ropes[b],
+                        attn_out + b * attn_q_stride_bytes,
+                        Kc_b2[b], Vc_b2[b], dec_positions[b],
+                        S, Q_dim, K_dim, HD, 2560,
+                        l * total_keys * HD, HD, stream)
+                else:
+                    fvk.qkv_split_rope_kvcache_fp16(
+                        qkv + b * qkv_stride_bytes,
+                        rope,
+                        attn_out + b * attn_q_stride_bytes,
+                        Kc_b2[b], Vc_b2[b],
+                        S, Q_dim, K_dim, HD, 2560,
+                        kv_offset, HD, stream)
 
             # ── C3: Per-sample cross-attention ──
             for b in range(B):
                 K_ptr = Kc_b2[b] + l * total_keys * HD * 2
                 V_ptr = Vc_b2[b] + l * total_keys * HD * 2
-                fvk.attention_qkv_fp16(
-                    ctx,
-                    attn_out + b * attn_q_stride_bytes,
-                    K_ptr, V_ptr,
-                    logits,  # scratch reused
-                    attn_out + b * attn_q_stride_bytes,
-                    S, total_keys, NH, HD, attn_scale, stream)
+                if fixed_shape:
+                    fvk.attention_qkv_fp16_seqused(
+                        ctx, attn_out + b * attn_q_stride_bytes,
+                        K_ptr, V_ptr, logits,
+                        attn_out + b * attn_q_stride_bytes,
+                        S, total_keys, NH, HD, dec_valid[b], attn_scale, stream)
+                else:
+                    fvk.attention_qkv_fp16(
+                        ctx,
+                        attn_out + b * attn_q_stride_bytes,
+                        K_ptr, V_ptr,
+                        logits,  # scratch reused
+                        attn_out + b * attn_q_stride_bytes,
+                        S, total_keys, NH, HD, attn_scale, stream)
 
             # ── C4: Quantize attn → FP8 + O proj GEMM (flat, M = B*S) ──
             act_scale_o = act_scales + (step_scale_base + l * 4 + 1) * 4

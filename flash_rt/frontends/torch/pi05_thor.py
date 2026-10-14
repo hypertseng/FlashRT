@@ -152,6 +152,8 @@ class Pi05TorchFrontendThor:
     # tensors instead of reopening the checkpoint and allocating another
     # copy of every layer. Runtime buffers/graphs remain per-frontend.
     _WEIGHT_CACHE = {}
+    supports_fixed_prompt_batch = True
+    supports_fixed_fa4 = True
 
     _BATCH_GRAPH_BANK_ATTRS = (
         "_Kc_b2", "_Vc_b2",
@@ -174,7 +176,7 @@ class Pi05TorchFrontendThor:
         "_sa_all_b2", "_sf_all_b2", "_fs_all_b2",
         "_siglip_batched_graph", "_siglip_batched_B",
         "_enc_ae_graph_b2", "_cfg_b2_outer_graph",
-        "_stream_attn_b2",
+        "_stream_attn_b2", "_fixed_lengths_b2", "_fixed_dec_rope_b2",
     )
 
     # -----------------------------------------------------------------------
@@ -254,9 +256,9 @@ class Pi05TorchFrontendThor:
             if fixed_cap is None:
                 fixed_cap = PI05_STATE_PROMPT_MAX_LEN
             fixed_cap = int(fixed_cap)
-            if fixed_cap <= 0:
+            if not 1 <= fixed_cap <= 256:
                 raise ValueError(
-                    "state_prompt_fixed_max_len must be positive, "
+                    "state_prompt_fixed_max_len must be in [1, 256], "
                     f"got {fixed_cap}")
         self._state_prompt_fixed_max_len = fixed_cap
         self._state_prompt_fixed_shape_active = False
@@ -994,6 +996,8 @@ class Pi05TorchFrontendThor:
             int(getattr(self, "_S_lang", 0) or 0),
             self._enc_ae_graph_b2_cfg_beta,
             int(getattr(self, "_rtc_active_prefix_len_b2", 0)),
+            self._state_prompt_mode,
+            self.use_fa4,
         )
 
     def _batch_graph_bank_entry_ready(self) -> bool:
@@ -1005,6 +1009,10 @@ class Pi05TorchFrontendThor:
 
     def _save_active_batch_graph_bank_entry(self) -> None:
         if not self.batch_graph_bank_enabled:
+            return
+        # A solo transition clears the active graph reference. Never let
+        # a later enable overwrite a resident graph with that inactive state.
+        if not self._batched or self._enc_ae_graph_b2 is None:
             return
         if getattr(self, "_enc_x_b2", None) is None:
             return
@@ -1115,19 +1123,6 @@ class Pi05TorchFrontendThor:
         state = self._normalize_state(state)
 
         def _stable_shape(embeds):
-            if self._state_prompt_mode == "fixed" and state is not None:
-                target = int(self._state_prompt_fixed_max_len)
-                if embeds.shape[0] > target:
-                    raise ValueError(
-                        f"state prompt length {embeds.shape[0]} exceeds fixed "
-                        f"capacity {target}"
-                    )
-                padded = torch.zeros(
-                    (target, embeds.shape[-1]), dtype=embeds.dtype,
-                    device=embeds.device,
-                )
-                padded[:embeds.shape[0]].copy_(embeds)
-                return padded, target
             if embeds.shape[0] % 2 != 0:
                 embeds = torch.cat([embeds, embeds[-1:]], dim=0)
             return embeds, int(embeds.shape[0])
@@ -1173,7 +1168,8 @@ class Pi05TorchFrontendThor:
             end = b + 1
             while end < B:
                 nxt = samples[end]
-                if nxt["prompt"] != prompt or int(nxt["S_lang"]) != S_lang:
+                if (nxt["prompt"] != prompt or int(nxt["S_lang"]) != S_lang
+                        or s.get("state") is not None or nxt.get("state") is not None):
                     break
                 end += 1
             rows = end - b
@@ -1709,16 +1705,9 @@ class Pi05TorchFrontendThor:
 
         S_sig = self.sig_S
         nv = self.num_views
-        fixed_shape = (
-            self._state_prompt_mode == "fixed"
-            and state is not None
-            and self._rl_config is None
-        )
-
         # ---- Tokenize ----
         fixed_shape = (
             self._state_prompt_mode == "fixed"
-            and state is not None
             and self._rl_config is None
         )
         if isinstance(prompt_text, (np.ndarray, list)):
@@ -1728,10 +1717,12 @@ class Pi05TorchFrontendThor:
                 torch.from_numpy(token_ids).long().cuda(), self.embedding_weight)
             embeds = embeds * float(embeds.shape[-1] ** 0.5)
         else:
-            max_len = (
-                self._state_prompt_fixed_max_len if fixed_shape
-                else (PI05_STATE_PROMPT_MAX_LEN if state is not None else 48)
-            )
+            max_len = (self._state_prompt_fixed_max_len if fixed_shape
+                       else PI05_STATE_PROMPT_MAX_LEN)
+            max_len = max_len if fixed_shape or state is not None else 48
+            # One extra token exposes truncation at the fixed capacity.
+            if fixed_shape:
+                max_len += 1
             embeds, prompt_len = embed_prompt(
                 prompt_text, self.embedding_weight, max_len=max_len,
                 state=state)
@@ -1739,7 +1730,11 @@ class Pi05TorchFrontendThor:
         # Fixed state prompts use one max-length graph. The attention backend
         # masks the padded rows with a device-side valid-prefix scalar.
         if fixed_shape:
-            Se = S_sig + int(self._state_prompt_fixed_max_len)
+            if prompt_len > self._state_prompt_fixed_max_len:
+                raise ValueError(f"prompt has at least {prompt_len} tokens, exceeding fixed capacity {self._state_prompt_fixed_max_len}")
+            # Pad to a stable graph shape, but mask the unused tail in
+            # attention; padding must not become meaningful language tokens.
+            Se = S_sig + self._state_prompt_fixed_max_len
             if Se % 2 != 0:
                 Se += 1
             actual_lang = Se - S_sig
@@ -1770,7 +1765,7 @@ class Pi05TorchFrontendThor:
 
         if (self.graph_captured and self._lang_emb is not None
                 and self._S_lang == actual_lang and self.Se == Se
-                and self._fixed_shape_active == fixed_shape):
+                and self._state_prompt_fixed_shape_active == fixed_shape):
             self._lang_emb.copy_(embeds)
             self._state_prompt_fixed_shape_active = fixed_shape
             dec_start = valid_prefix if fixed_shape else Se
@@ -1789,9 +1784,8 @@ class Pi05TorchFrontendThor:
             return
 
         self.Se = Se
-        self._state_prompt_fixed_shape_active = fixed_shape
         self.total_keys = Se + self.Sa
-        self._fixed_shape_active = fixed_shape
+        self._state_prompt_fixed_shape_active = fixed_shape
 
         # Stage 1.4 — build AttentionBackend. total_keys must be set first
         # because the encoder/decoder KV cache layer_stride is computed from
@@ -2759,6 +2753,18 @@ class Pi05TorchFrontendThor:
             'rtc_prefix_len': int(self._rtc_active_prefix_len_b2),
         }
 
+        if self._state_prompt_mode == "fixed":
+            controls = getattr(self, '_fixed_lengths_b2', None)
+            if controls is None or controls.shape != (3, B):
+                raise RuntimeError("fixed batch controls must be staged before capture")
+            enc_dims_b2['fixed_shape'] = True
+            ae_dims_b2['fixed_shape'] = True
+            enc_weights_b2['enc_seqused_b2'] = [controls[0, b].data_ptr() for b in range(B)]
+            enc_weights_b2['enc_seqused_tensor_b2'] = controls[0]
+            ae_weights_b2['dec_seqused_b2'] = [controls[1, b].data_ptr() for b in range(B)]
+            ae_weights_b2['dec_devpos_b2'] = [controls[2, b].data_ptr() for b in range(B)]
+            ae_weights_b2['rope_b2'] = [self._fixed_dec_rope_b2[b].data_ptr() for b in range(B)]
+
         # When the CFG-batched pipeline is active, bake the per-step
         # CFG combine + noise mirror into the captured graph (matches
         # RTX). Non-CFG batched paths leave this None and use the
@@ -2769,7 +2775,7 @@ class Pi05TorchFrontendThor:
             if not self.batched_skip_kv_zero:
                 self._Kc_b2.zero_(); self._Vc_b2.zero_()
             encoder_forward_b2(self._gemm, fvk, enc_bufs_b2, enc_weights_b2,
-                                enc_dims_b2, stream=stream, B=B)
+                                enc_dims_b2, stream=stream, B=B, attn=self._attn)
             decoder_forward_b2(self._ctx, fvk, ae_bufs_b2, ae_weights_b2,
                                 ae_dims_b2, stream=stream, B=B,
                                 cfg_beta=cfg_beta)
@@ -3193,7 +3199,7 @@ class Pi05TorchFrontendThor:
             batch_size, len(self._stream_attn_b2),
             " from graph bank" if restored else "")
 
-    def infer_batch(self, observations):
+    def infer_batch(self, observations, *, seed: int | None = None):
         """Run B=N batched inference on a list of observations.
 
         Stage 2 of the Thor batched-CFG port. Each observation must
@@ -3211,6 +3217,22 @@ class Pi05TorchFrontendThor:
         Pi05ThorCFGBatchedPipeline (which manages cond/uncond
         explicitly).
         """
+        if (
+            isinstance(observations, (list, tuple))
+            and observations
+            and isinstance(observations[0], dict)
+            and "observation" in observations[0]
+        ):
+            return self.infer_multi_prompt_batch(observations, seed=seed)
+
+        if self._state_prompt_mode == "fixed":
+            obs_list = [observations] * self.B if isinstance(observations, dict) else observations
+            if not getattr(self, '_current_prompt', None):
+                raise ValueError("set_prompt must precede homogeneous fixed batching")
+            return self.infer_multi_prompt_batch([
+                {'observation': obs, 'prompt': self._current_prompt} for obs in obs_list
+            ], seed=seed)
+
         if not self._batched:
             raise RuntimeError(
                 "set_batched_mode(enable=True) must be called first")
@@ -3354,6 +3376,20 @@ class Pi05TorchFrontendThor:
             list of dicts with 'actions' key per sample
         """
         B = len(batch_data)
+        fixed_batch = self._state_prompt_mode == "fixed"
+        if not B:
+            raise ValueError("batch_data must not be empty")
+        if fixed_batch and (self._rl_config is not None or self.rtc_prefix_len
+                            or not self._encoder_use_fp8 or not self._decoder_use_fp8):
+            raise ValueError("fixed batching currently requires FP8 encoder/decoder, non-CFG, RTC-off")
+        if fixed_batch and any(
+            int(item.get('rtc_prefix_len', 0) or 0) > 0
+            or item.get('rtc_prev_action_chunk') is not None
+            for item in batch_data
+        ):
+            raise ValueError("fixed batching with per-request RTC is not yet supported")
+        if fixed_batch and self._state_prompt_fixed_max_len % 2:
+            raise ValueError("fixed batching currently requires an even prompt capacity")
         nv = self.num_views
         S_sig = self.sig_S
         De = self.De
@@ -3385,7 +3421,13 @@ class Pi05TorchFrontendThor:
             state = item.get('state')
 
             embeds, S_lang = self._get_prompt_bank_entry(
-                prompt_text, max_len=prompt_max_len, state=state)
+                prompt_text,
+                max_len=(self._state_prompt_fixed_max_len + 1 if fixed_batch else prompt_max_len),
+                state=state,
+            )
+
+            if fixed_batch and S_lang > self._state_prompt_fixed_max_len:
+                raise ValueError(f"prompt length {S_lang} exceeds fixed capacity {self._state_prompt_fixed_max_len}")
 
             if 'images' in obs:
                 img_list = obs['images']
@@ -3409,6 +3451,8 @@ class Pi05TorchFrontendThor:
 
         if max_S_lang % 2 != 0:
             max_S_lang += 1
+        if fixed_batch:
+            max_S_lang = self._state_prompt_fixed_max_len
         Se_max = S_sig + max_S_lang
         batch_S_lang = Se_max - S_sig
 
@@ -3465,6 +3509,13 @@ class Pi05TorchFrontendThor:
         # Se_max so that _enc_x_b2[b*Se_max : b*Se_max+Se_b] aligns with the
         # encoder output layout the decoder expects.
         # For B=1, fall back to serial inference path
+        if B == 1 and fixed_batch:
+            sample = samples[0]
+            if self.batch_graph_bank_enabled:
+                self._save_active_batch_graph_bank_entry()
+            self.set_prompt(sample['prompt'], state=sample['state'])
+            return [self.infer(sample['obs'], seed=seed)]
+
         if B == 1:
             if self.batch_graph_bank_enabled:
                 self._save_active_batch_graph_bank_entry()
@@ -3684,6 +3735,21 @@ class Pi05TorchFrontendThor:
                 self._enc_x_b2[b * S_enc + S_sig + n_lang:
                                (b + 1) * S_enc].zero_()
 
+        if fixed_batch:
+            control = getattr(self, '_fixed_lengths_b2', None)
+            if control is None or control.shape != (3, B):
+                self._fixed_lengths_b2 = torch.empty((3, B), dtype=torch.int32, device='cuda')
+                self._fixed_dec_rope_b2 = torch.empty((B, self.Sa, 256), dtype=fp16, device='cuda')
+                self._enc_ae_graph_b2 = None
+            prefixes = [S_sig + int(sample['S_lang']) for sample in samples]
+            self._fixed_lengths_b2.copy_(torch.tensor(
+                [prefixes, [v + self.Sa for v in prefixes], prefixes],
+                dtype=torch.int32, device='cuda'))
+            for b, start in enumerate(prefixes):
+                self._fixed_dec_rope_b2[b].copy_(torch.cat([
+                    self._kc_t[start:start + self.Sa, :, None],
+                    self._ks_t[start:start + self.Sa, :, None]], dim=2).reshape(self.Sa, 256))
+
         # Step 6: Generate noise and run batched encoder+decoder via CUDA Graph
         if seed is None:
             self._g_noise_b2.normal_()
@@ -3731,7 +3797,7 @@ class Pi05TorchFrontendThor:
         for b in range(B):
             raw = raw_all[b * self.Sa:(b + 1) * self.Sa]
             unnorm = unnormalize_actions(raw, self.norm_stats)
-            result = {"actions": unnorm[:, :LIBERO_ACTION_DIM]}
+            result = {"actions": unnorm[:, :self.action_dim]}
             if batch_rtc_prefix_len > 0:
                 result["rtc_raw_actions"] = raw.copy()
             results.append(result)

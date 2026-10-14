@@ -104,6 +104,13 @@ def encoder_forward_b2(gemm, fvk, bufs, weights, dims, stream=0, *,
     K_dim = HD
     attn_scale = 1.0 / math.sqrt(float(HD))
     BSe = B * Se
+    fixed_shape = bool(dims.get('fixed_shape', False))
+    enc_valid = weights.get('enc_seqused_b2', [])
+    if fixed_shape:
+        if len(enc_valid) != B or not all(enc_valid):
+            raise ValueError("fixed batched encoder requires B device valid-length pointers")
+        if not hasattr(fvk, 'attention_qkv_fp16_seqused'):
+            raise RuntimeError("installed kernels lack fixed-length attention")
 
     x = bufs['x']
     x_fp8 = bufs['x_fp8']
@@ -191,7 +198,26 @@ def encoder_forward_b2(gemm, fvk, bufs, weights, dims, stream=0, *,
             qk_stride_bytes = qk_elem_off * 2
             K_base = Kc_b2[0] + kv_elem_off * 2
             V_base = Vc_b2[0] + kv_elem_off * 2
-            if qk_batched is not None and pv_batched is not None and B > 1:
+            if attn is not None and getattr(attn, 'uses_fa4', False):
+                valid_lengths = weights.get('enc_seqused_tensor_b2') if fixed_shape else None
+                if fixed_shape and valid_lengths is None:
+                    raise ValueError("fixed FA4 encoder requires the device valid-length tensor")
+                attn.run_batched_encoder(
+                    attn_out, K_base, V_base, logits,
+                    batch=B, seq=Se, heads=NH, head_dim=HD,
+                    key_batch_stride=kv_batch_stride_elems,
+                    value_batch_stride=vc_batch_stride_elems,
+                    valid_lengths=valid_lengths, stream=stream)
+            elif fixed_shape:
+                for b in range(B):
+                    fvk.attention_qkv_fp16_seqused(
+                        bufs['ctx'], attn_out + b * attn_q_stride_bytes,
+                        Kc_b2[b] + kv_elem_off * 2,
+                        Vc_b2[b] + kv_elem_off * 2,
+                        logits + b * qk_stride_bytes,
+                        attn_out + b * attn_q_stride_bytes,
+                        Se, Se, NH, HD, enc_valid[b], attn_scale, stream)
+            elif qk_batched is not None and pv_batched is not None and B > 1:
                 qk_batched(
                     bufs['ctx'],
                     attn_out,
@@ -319,9 +345,14 @@ def siglip_forward_batched(gemm, fvk, bufs, weights, dims, stream=0, *,
         # NOTE: attn.run() hardcodes nv = site_spec.batch_axis (num_views),
         # but we need B * nv.  Call fvk directly with the correct batch.
         stride = 3 * D
-        fvk.fmha_strided_full(qkv, qkv + D * 2, qkv + 2 * D * 2,
-                              attn_out, B * nv, spv, spv, NH, NH, HD,
-                              stride, stride, stream)
+        if attn is not None and getattr(attn, 'uses_fa4', False):
+            attn.run_batched_siglip(
+                qkv, attn_out, batch_views=B * nv, seq=spv,
+                heads=NH, head_dim=HD, hidden_dim=D, stream=stream)
+        else:
+            fvk.fmha_strided_full(qkv, qkv + D * 2, qkv + 2 * D * 2,
+                                  attn_out, B * nv, spv, spv, NH, NH, HD,
+                                  stride, stride, stream)
 
         # Cast attn output → FP8
         fvk.quantize_fp8_static_fp16(attn_out, x_fp8, weights['unit_scale'],
