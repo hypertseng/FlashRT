@@ -36,6 +36,8 @@ Functions:
 
 import math
 
+from .rtc_batch_mask import copy_prefix_masked_
+
 from .pipeline_thor import Pi05ThorPipeline, _action_update_fp16, _gpu_copy
 
 
@@ -143,6 +145,19 @@ def decoder_forward_b2(ctx, fvk, bufs, weights, dims, stream=0, *,
     ctx_fp8 = bufs['ctx_fp8']
     rtc_prefix_len = int(dims.get('rtc_prefix_len', 0) or 0)
     rtc_prev_b2 = bufs.get('rtc_prev_action_chunk_b2')
+    rtc_mask = bufs.get('rtc_prefix_mask_tensor')
+
+    def lock_prefix():
+        if rtc_mask is not None:
+            # The frontend stages mask values before replay; all slots share
+            # one elementwise kernel and keep their own prefix lengths.
+            copy_prefix_masked_(bufs['rtc_noise_tensor'], bufs['rtc_previous_tensor'], rtc_mask)
+        else:
+            # Legacy callers retain the homogeneous-prefix contract.
+            for b in range(B):
+                slot_bytes = S * 32 * 2
+                _gpu_copy(noise + b * slot_bytes, rtc_prev_b2 + b * slot_bytes,
+                          rtc_prefix_len * 32 * 2, stream)
     if rtc_prefix_len > 0 and not rtc_prev_b2:
         raise ValueError(
             "rtc_prev_action_chunk_b2 is required when rtc_prefix_len > 0")
@@ -176,15 +191,7 @@ def decoder_forward_b2(ctx, fvk, bufs, weights, dims, stream=0, *,
 
     for s in range(steps):
         if rtc_prefix_len > 0:
-            nbytes = rtc_prefix_len * 32 * 2
-            slot_bytes = S * 32 * 2
-            for b in range(B):
-                _gpu_copy(
-                    noise + b * slot_bytes,
-                    rtc_prev_b2 + b * slot_bytes,
-                    nbytes,
-                    stream,
-                )
+            lock_prefix()
         step_scale_base = s * layers * 4
         # ── Action input: noise → x (M = B*S) ──
         fvk.gmm_fp16(ctx, noise, ain_w, x, BS, D, 32, 0.0, stream)
@@ -306,15 +313,7 @@ def decoder_forward_b2(ctx, fvk, bufs, weights, dims, stream=0, *,
             _action_update_fp16(ctx, fvk, xn, aow, aob, noise, BS, 32, D,
                                 stream, dt, action_f32, aob_dt)
             if rtc_prefix_len > 0:
-                nbytes = rtc_prefix_len * 32 * 2
-                slot_bytes = S * 32 * 2
-                for b in range(B):
-                    _gpu_copy(
-                        noise + b * slot_bytes,
-                        rtc_prev_b2 + b * slot_bytes,
-                        nbytes,
-                        stream,
-                    )
+                lock_prefix()
         else:
             # Per-step CFG (paper-correct, arXiv:2511.14759 App. E;
             # mirrors RTX
@@ -357,15 +356,7 @@ def decoder_forward_b2(ctx, fvk, bufs, weights, dims, stream=0, *,
             fvk.gpu_copy(noise_uncond_ptr, noise_cond_ptr,
                          per_slot_bytes, stream)
             if rtc_prefix_len > 0:
-                nbytes = rtc_prefix_len * 32 * 2
-                slot_bytes = S * 32 * 2
-                for b in range(B):
-                    _gpu_copy(
-                        noise + b * slot_bytes,
-                        rtc_prev_b2 + b * slot_bytes,
-                        nbytes,
-                        stream,
-                    )
+                lock_prefix()
 
 
 class Pi05ThorBatchedPipeline(Pi05ThorPipeline):

@@ -1,6 +1,7 @@
 """FlashRT -- Pi05TorchFrontendThor: complete inference using ONLY flash_rt_kernels.so.
 
-All computation goes through flash_rt_kernels (pybind11 + CUTLASS + cuBLASLt).
+Core model computation uses flash_rt_kernels (pybind11 + CUTLASS + cuBLASLt).
+Per-slot Prefix RTC locks use a graph-capturable PyTorch elementwise operation.
 
 Usage:
     pipe = Pi05TorchFrontendThor("/path/to/checkpoint", num_views=2)
@@ -154,6 +155,7 @@ class Pi05TorchFrontendThor:
     _WEIGHT_CACHE = {}
     supports_fixed_prompt_batch = True
     supports_fixed_fa4 = True
+    supports_mixed_prefix_batch = True
 
     _BATCH_GRAPH_BANK_ATTRS = (
         "_Kc_b2", "_Vc_b2",
@@ -173,6 +175,8 @@ class Pi05TorchFrontendThor:
         "_ae_action_f32_b2", "_ae_xn_fp8_b2", "_ae_hid_fp8_b2",
         "_ae_ctx_fp8_b2",
         "_g_noise_b2", "_rtc_prev_action_chunk_b2", "_v_b2", "_v_b2_f32",
+        "_rtc_prefix_lengths_b2", "_rtc_prefix_mask_b2", "_rtc_row_indices_b2",
+        "_rtc_active_prefix_len_b2",
         "_sa_all_b2", "_sf_all_b2", "_fs_all_b2",
         "_siglip_batched_graph", "_siglip_batched_B",
         "_enc_ae_graph_b2", "_cfg_b2_outer_graph",
@@ -791,6 +795,9 @@ class Pi05TorchFrontendThor:
         self._ae_ctx_fp8_b2 = None
         self._g_noise_b2 = None
         self._rtc_prev_action_chunk_b2 = None
+        self._rtc_prefix_lengths_b2 = None
+        self._rtc_prefix_mask_b2 = None
+        self._rtc_row_indices_b2 = None
         self._v_b2 = None
         self._img_stack_host_b2 = None
         self._img_stack_host_torch_b2 = None
@@ -932,6 +939,9 @@ class Pi05TorchFrontendThor:
         self._ae_ctx_fp8_b2 = torch.zeros(B * Sa * 8 * 256, dtype=torch.uint8, device='cuda')
         self._g_noise_b2 = torch.zeros(B * Sa, 32, dtype=fp16, device='cuda')
         self._rtc_prev_action_chunk_b2 = torch.zeros_like(self._g_noise_b2)
+        self._rtc_prefix_lengths_b2 = torch.zeros(B, dtype=torch.int32, device='cuda')
+        self._rtc_prefix_mask_b2 = torch.zeros((B, self.Sa, 1), dtype=torch.bool, device='cuda')
+        self._rtc_row_indices_b2 = torch.arange(self.Sa, device='cuda').view(1, self.Sa, 1)
         # Per-step velocity scratch for the CFG-batched graph: each step
         # writes (v_cond, v_uncond) here before the in-graph cfg_combine
         # mixes them into ``_g_noise_b2`` slot 0. Always allocated; the
@@ -2704,6 +2714,10 @@ class Pi05TorchFrontendThor:
         ae_bufs_b2 = {
             'noise':   self._g_noise_b2.data_ptr(),
             'rtc_prev_action_chunk_b2': self._rtc_prev_action_chunk_b2.data_ptr(),
+            # Stable tensors read by captured elementwise prefix locks.
+            'rtc_prefix_mask_tensor': self._rtc_prefix_mask_b2,
+            'rtc_previous_tensor': self._rtc_prev_action_chunk_b2.view(B, Sa, 32),
+            'rtc_noise_tensor': self._g_noise_b2.view(B, Sa, 32),
             'x':       self._ae_x_b2.data_ptr(),
             'xn':      self._ae_xn_b2.data_ptr(),
             'gate':    self._ae_gate_b2.data_ptr(),
@@ -3310,7 +3324,7 @@ class Pi05TorchFrontendThor:
         return results
 
     def _run_serial_batch(self, obs_list, prompts, states=None,
-                          rtc_prev_chunks=None, rtc_prefix_lens=None):
+                          rtc_prev_chunks=None, rtc_prefix_lens=None, seed=None, return_rtc_raw=False):
         """Internal: Run serial inference for each item in the list.
 
         Used as fallback when B=1 or when batching is not beneficial.
@@ -3349,7 +3363,9 @@ class Pi05TorchFrontendThor:
                 obs_input,
                 rtc_prev_action_chunk=prev_chunk,
                 rtc_prefix_len=prefix_len,
+                seed=seed,
                 state=state,
+                **({"return_rtc_raw": True} if return_rtc_raw else {}),
             )
             results.append(result)
         return results
@@ -3379,36 +3395,27 @@ class Pi05TorchFrontendThor:
         fixed_batch = self._state_prompt_mode == "fixed"
         if not B:
             raise ValueError("batch_data must not be empty")
-        if fixed_batch and (self._rl_config is not None or self.rtc_prefix_len
+        if fixed_batch and (self._rl_config is not None
                             or not self._encoder_use_fp8 or not self._decoder_use_fp8):
-            raise ValueError("fixed batching currently requires FP8 encoder/decoder, non-CFG, RTC-off")
-        if fixed_batch and any(
-            int(item.get('rtc_prefix_len', 0) or 0) > 0
-            or item.get('rtc_prev_action_chunk') is not None
-            for item in batch_data
-        ):
-            raise ValueError("fixed batching with per-request RTC is not yet supported")
+            raise ValueError("fixed batching requires FP8 encoder/decoder and non-CFG")
         if fixed_batch and self._state_prompt_fixed_max_len % 2:
             raise ValueError("fixed batching currently requires an even prompt capacity")
         nv = self.num_views
         S_sig = self.sig_S
         De = self.De
 
-        # The batched decoder graph uses one fixed copy mask for all slots.
-        # The adapter groups requests by prefix length before reaching here;
-        # keep a direct-call guard so mixed masks can never silently run as a
-        # non-RTC batch.
+        # Lengths are per-slot GPU inputs, not graph-capture constants.
         rtc_prefix_lens = [int(item.get('rtc_prefix_len', 0) or 0)
                            for item in batch_data]
-        if len(set(rtc_prefix_lens)) > 1:
-            raise ValueError(
-                "infer_multi_prompt_batch requires one rtc_prefix_len per batch; "
-                "group requests by prefix length in the serving layer")
-        batch_rtc_prefix_len = rtc_prefix_lens[0] if rtc_prefix_lens else 0
         rtc_prev_chunks = [item.get('rtc_prev_action_chunk') for item in batch_data]
-        if batch_rtc_prefix_len > 0 and any(chunk is None for chunk in rtc_prev_chunks):
-            raise ValueError(
-                "Prefix RTC batch requires rtc_prev_action_chunk for every slot")
+        rtc_enabled = bool(self.rtc_prefix_len) or any(
+            length > 0 or previous is not None or item.get('rtc_mode', item.get('mode')) == 'prefix'
+            for length, previous, item in zip(rtc_prefix_lens, rtc_prev_chunks, batch_data))
+        for length, previous in zip(rtc_prefix_lens, rtc_prev_chunks):
+            if not 0 <= length <= int(self.Sa):
+                raise ValueError(f"rtc_prefix_len {length} outside [0, {self.Sa}]")
+            if length > 0 and previous is None:
+                raise ValueError("Positive RTC prefix requires raw history for that slot")
 
         # Step 1: Parse observations and compute lang embeddings
         samples = []
@@ -3509,13 +3516,6 @@ class Pi05TorchFrontendThor:
         # Se_max so that _enc_x_b2[b*Se_max : b*Se_max+Se_b] aligns with the
         # encoder output layout the decoder expects.
         # For B=1, fall back to serial inference path
-        if B == 1 and fixed_batch:
-            sample = samples[0]
-            if self.batch_graph_bank_enabled:
-                self._save_active_batch_graph_bank_entry()
-            self.set_prompt(sample['prompt'], state=sample['state'])
-            return [self.infer(sample['obs'], seed=seed)]
-
         if B == 1:
             if self.batch_graph_bank_enabled:
                 self._save_active_batch_graph_bank_entry()
@@ -3525,11 +3525,18 @@ class Pi05TorchFrontendThor:
             rtc_prev_chunks = [item.get('rtc_prev_action_chunk') for item in batch_data]
             rtc_prefix_lens = [int(item.get('rtc_prefix_len', 0) or 0) for item in batch_data]
             return self._run_serial_batch(
-                obs_list, prompts, states, rtc_prev_chunks, rtc_prefix_lens)
+                obs_list, prompts, states, rtc_prev_chunks, rtc_prefix_lens,
+                seed=seed, return_rtc_raw=rtc_enabled)
 
         restored_from_graph_bank = False
         if self.batch_graph_bank_enabled:
             self._save_active_batch_graph_bank_entry()
+        desired_rtc_graph = int(rtc_enabled)
+        if desired_rtc_graph != int(self._rtc_active_prefix_len_b2):
+            self._rtc_active_prefix_len_b2 = desired_rtc_graph
+            self._enc_ae_graph_b2 = None
+            self._batch_graph_bank_active_key = None
+        if self.batch_graph_bank_enabled:
             restored_from_graph_bank = self._restore_batch_graph_bank_entry(
                 B, Se_max)
 
@@ -3756,25 +3763,23 @@ class Pi05TorchFrontendThor:
         else:
             self._fill_seed_noise_batched(samples, seed)
 
-        if batch_rtc_prefix_len > int(self.Sa):
-            raise ValueError(
-                f"rtc_prefix_len {batch_rtc_prefix_len} exceeds action chunk {self.Sa}")
-        if batch_rtc_prefix_len > 0:
-            for b, previous in enumerate(rtc_prev_chunks):
+        if rtc_enabled:
+            for b, (length, previous) in enumerate(zip(rtc_prefix_lens, rtc_prev_chunks)):
+                slot = self._rtc_prev_action_chunk_b2[b * self.Sa:(b + 1) * self.Sa]
+                if length == 0:
+                    slot.zero_()
+                    continue
                 raw = np.asarray(previous, dtype=np.float16)
                 if raw.shape != (int(self.Sa), 32) or not np.isfinite(raw).all():
-                    raise ValueError(
-                        "rtc_prev_action_chunk must be finite raw shape "
-                        f"({self.Sa}, 32) for every batched slot")
-                self._rtc_prev_action_chunk_b2[b * self.Sa:(b + 1) * self.Sa].copy_(
-                    torch.from_numpy(np.ascontiguousarray(raw)).to(
-                        device="cuda", dtype=fp16, non_blocking=True))
-        else:
-            self._rtc_prev_action_chunk_b2.zero_()
-
-        if batch_rtc_prefix_len != int(self._rtc_active_prefix_len_b2):
-            self._rtc_active_prefix_len_b2 = int(batch_rtc_prefix_len)
-            self._enc_ae_graph_b2 = None
+                    raise ValueError("rtc_prev_action_chunk must be finite raw shape "
+                                     f"({self.Sa}, 32) for every conditioned slot")
+                slot.copy_(torch.from_numpy(np.ascontiguousarray(raw)).to(
+                    device='cuda', dtype=fp16, non_blocking=True))
+            self._rtc_prefix_lengths_b2.copy_(torch.tensor(
+                rtc_prefix_lens, dtype=torch.int32, device='cuda'))
+            torch.lt(self._rtc_row_indices_b2,
+                     self._rtc_prefix_lengths_b2.view(B, 1, 1),
+                     out=self._rtc_prefix_mask_b2)
 
         # Replay encoder+decoder as a single CUDA Graph (b2 path).
         # By default the graph skips full KV zero because encoder_forward_b2
@@ -3799,7 +3804,7 @@ class Pi05TorchFrontendThor:
             unnorm = unnormalize_actions(raw, self.norm_stats)
             result = {"actions": unnorm[:, :self.action_dim]}
             # Include the bootstrap prefix=0 result so the caller can seed RTC.
-            if int(self.rtc_prefix_len) > 0:
+            if rtc_enabled:
                 result["rtc_raw_actions"] = raw.copy()
             results.append(result)
 
@@ -3929,7 +3934,8 @@ class Pi05TorchFrontendThor:
         return effective
 
     def infer(self, observation, debug=False, seed=None,
-              rtc_prev_action_chunk=None, rtc_prefix_len=None, state=None):
+              rtc_prev_action_chunk=None, rtc_prefix_len=None, state=None,
+              return_rtc_raw=False):
         """Run inference: images -> CUDA graph replay -> actions.
 
         Args:
@@ -4162,7 +4168,7 @@ class Pi05TorchFrontendThor:
             logger.info("Latency: %.1f ms", latency_ms)
 
         result = {"actions": robot_actions}
-        if int(self.rtc_prefix_len) > 0:
+        if int(self.rtc_prefix_len) > 0 or return_rtc_raw or int(rtc_prefix_len or 0) > 0:
             # Return raw actions on the bootstrap prefix=0 pass too; the caller
             # needs this first chunk to seed the next RTC request.
             result["rtc_raw_actions"] = raw_actions.copy()
