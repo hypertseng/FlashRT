@@ -760,6 +760,8 @@ class Pi05TorchFrontendThor:
         self._ae_ctx_fp8 = torch.zeros(Sa * 8 * 256, dtype=torch.uint8, device='cuda')
         self._g_noise = torch.zeros(Sa, 32, dtype=fp16, device='cuda')
         self._rtc_prev_action_chunk = torch.zeros_like(self._g_noise)
+        self._rtc_prefix_mask_b1 = torch.zeros(
+            (Sa, 1), dtype=torch.bool, device='cuda')
 
         # Calibration scale buffers
         self._enc_calib_scales = torch.zeros(Le * 4, dtype=torch.float32, device='cuda')
@@ -2108,6 +2110,9 @@ class Pi05TorchFrontendThor:
             'hid_fp8': self._ae_hid_fp8.data_ptr(),
             'ctx_fp8': self._ae_ctx_fp8.data_ptr(),
             'rtc_prev_action_chunk': self._rtc_prev_action_chunk.data_ptr(),
+            'rtc_noise_tensor': self._g_noise,
+            'rtc_previous_tensor': self._rtc_prev_action_chunk,
+            'rtc_prefix_mask_tensor': self._rtc_prefix_mask_b1,
         }
         ae_weights = {
             'ain_w':     self._ain_w.data_ptr(),
@@ -2470,6 +2475,9 @@ class Pi05TorchFrontendThor:
             'hid_fp8': self._ae_hid_fp8.data_ptr(),
             'ctx_fp8': self._ae_ctx_fp8.data_ptr(),
             'rtc_prev_action_chunk': self._rtc_prev_action_chunk.data_ptr(),
+            'rtc_noise_tensor': self._g_noise,
+            'rtc_previous_tensor': self._rtc_prev_action_chunk,
+            'rtc_prefix_mask_tensor': self._rtc_prefix_mask_b1,
         }
         ae_weights = {
             'ain_w':      self._ain_w.data_ptr(),
@@ -2579,6 +2587,9 @@ class Pi05TorchFrontendThor:
         ae_bufs = {
             'noise':   self._g_noise.data_ptr(),
             'rtc_prev_action_chunk': self._rtc_prev_action_chunk.data_ptr(),
+            'rtc_noise_tensor': self._g_noise,
+            'rtc_previous_tensor': self._rtc_prev_action_chunk,
+            'rtc_prefix_mask_tensor': self._rtc_prefix_mask_b1,
             'x':       self._ae_x.data_ptr(),
             'xn':      self._ae_xn.data_ptr(),
             'gate':    self._ae_gate.data_ptr(),
@@ -3894,14 +3905,10 @@ class Pi05TorchFrontendThor:
     # -----------------------------------------------------------------------
 
     def _prepare_rtc_prefix(self, previous_chunk, prefix_len=None):
-        """Stage one raw action chunk and select the matching CUDA graph.
+        """Stage raw actions and a dynamic prefix mask for the shared graph.
 
-        FlashRT's prefix implementation copies the first ``prefix_len`` rows
-        of the *raw 32-D diffusion chunk* before every denoising step.  The
-        graph therefore has a fixed prefix length.  A request without a
-        previous chunk always uses the ordinary graph (prefix length zero),
-        avoiding the common but incorrect practice of locking the first
-        request to an all-zero prefix.
+        The mask is copied before replay. Prefix changes, including bootstrap
+        prefix zero, never capture or warm up a graph in the request path.
         """
         requested = self.rtc_prefix_len if prefix_len is None else int(prefix_len)
         requested = max(0, requested)
@@ -3925,12 +3932,10 @@ class Pi05TorchFrontendThor:
                     device="cuda", dtype=fp16, non_blocking=True))
             effective = requested
 
-        if effective != int(self._rtc_active_prefix_len):
-            self._rtc_active_prefix_len = int(effective)
-            # The decoder graph bakes rtc_prefix_len into its call sequence.
-            # Recapture only on a 0<->prefix transition; steady-state
-            # requests reuse the captured graph.
-            self._capture_enc_ae_graph()
+        self._rtc_prefix_mask_b1.zero_()
+        if effective:
+            self._rtc_prefix_mask_b1[:effective].fill_(True)
+        self._rtc_active_prefix_len = int(effective)
         return effective
 
     def infer(self, observation, debug=False, seed=None,

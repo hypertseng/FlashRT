@@ -57,6 +57,14 @@ def _action_update_fp16(ctx, fvk, xn, aow, aob, noise, rows, cols, dim,
 # ══════════════════════════════════════════════════════════════════
 
 def _copy_rtc_prefix(bufs, dims, stream: int, prefix_len: int) -> None:
+    mask = bufs.get("rtc_prefix_mask_tensor")
+    if mask is not None:
+        # Fixed tensor addresses let one graph serve every prefix length.
+        # The caller keeps the PyTorch stream aligned with capture/replay.
+        from flash_rt.models.pi05.rtc_batch_mask import copy_prefix_masked_
+        copy_prefix_masked_(
+            bufs["rtc_noise_tensor"], bufs["rtc_previous_tensor"], mask)
+        return
     if prefix_len <= 0:
         return
     if prefix_len > int(dims["S"]):
