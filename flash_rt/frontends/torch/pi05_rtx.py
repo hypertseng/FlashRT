@@ -481,7 +481,8 @@ class Pi05TorchFrontendRtx:
                  use_fp8: bool = True,
                  hardware: Optional[str] = None,
                  fp8_layout: Optional[str] = None,
-                 state_prompt_mode: str = "exact"):
+                 state_prompt_mode: str = "exact",
+                 state_prompt_fixed_max_len: Optional[int] = None):
         checkpoint_dir = pathlib.Path(checkpoint_dir)
         # The action expert stays 32-wide internally, while the public robot
         # action width and state normalisation are checkpoint-specific.  Do
@@ -533,6 +534,12 @@ class Pi05TorchFrontendRtx:
             raise ValueError(
                 f"state_prompt_mode must be 'fixed' or 'exact', got {_spm!r}")
         self._state_prompt_mode = _spm
+        self._state_prompt_fixed_max_len = int(os.environ.get(
+            "FLASHRT_PI05_STATE_PROMPT_FIXED_MAX_LEN",
+            state_prompt_fixed_max_len if state_prompt_fixed_max_len is not None
+            else PI05_STATE_PROMPT_MAX_LEN))
+        if not 1 <= self._state_prompt_fixed_max_len <= 256:
+            raise ValueError("state_prompt_fixed_max_len must be in [1, 256]")
         self.num_views = int(num_views)
         if chunk_size is None:
             chunk_size = int(os.environ.get(
@@ -540,7 +547,8 @@ class Pi05TorchFrontendRtx:
         self.chunk_size = int(chunk_size)
         if self.chunk_size <= 0:
             raise ValueError(f"chunk_size must be positive, got {self.chunk_size}")
-        self.max_prompt_len = int(max_prompt_len)
+        self.max_prompt_len = max(int(max_prompt_len), self._state_prompt_fixed_max_len
+                                  if self._state_prompt_mode == "fixed" else 0)
         self._num_steps = int(num_steps)
         self._vision_pool_factor = int(vision_pool_factor)
         if self._num_steps <= 0:
@@ -712,6 +720,9 @@ class Pi05TorchFrontendRtx:
         self._batch_pipeline_cache: dict[tuple[int, int], Pi05BatchedPipeline] = {}
         self._batch_stream_cache: dict[tuple[int, int], torch.cuda.Stream] = {}
         self._batch_staging_cache: dict[int, tuple] = {}
+        # Worker startup uses the same resident-bank contract as Thor.
+        # Outside bank mode retain the existing bounded RTX cache behavior.
+        self.batch_graph_bank_enabled = False
         self._batch_graph_cache_size = max(
             1, int(os.environ.get("FLASHRT_RTX_BATCH_GRAPH_CACHE_SIZE", "1")))
         bucket_text = os.environ.get(
@@ -1387,21 +1398,25 @@ class Pi05TorchFrontendRtx:
             return
 
         state = self._normalize_state_for_prompt(state)
-        max_len = (PI05_STATE_PROMPT_MAX_LEN if state is not None
+        max_len = (self._state_prompt_fixed_max_len + 1
+                   if self._state_prompt_mode == "fixed" else
+                   PI05_STATE_PROMPT_MAX_LEN if state is not None
                    else MAX_PROMPT_LEN_DEFAULT)
         embeds_np, prompt_len = self._embed_prompt_cached(
             prompt_text, max_len=max_len, state=state)
 
-        if self._state_prompt_mode == "fixed" and state is not None:
+        if self._state_prompt_mode == "fixed":
+            if prompt_len > self._state_prompt_fixed_max_len:
+                raise ValueError(f"prompt length {prompt_len} exceeds fixed capacity "
+                                 f"{self._state_prompt_fixed_max_len}")
             self._set_prompt_fixed(prompt_len)
         else:
             self._set_prompt_per_length(state, prompt_len)
 
         # The attention backend is shared across pipelines, so sync its
         # fixed-shape mode to the now-active pipeline BEFORE running it. Without
-        # this, a frontend that ran a fixed state prompt and then a no-state
-        # prompt (which falls back to a per-length pipeline) would keep the
-        # backend in fixed mode and reuse stale seqused/devpos buffers.
+        # this, switching between fixed and exact runtime shapes could reuse
+        # stale seqused/devpos buffers.
         self.attn_backend.set_fixed_shape(
             bool(getattr(self.pipeline, "_fixed_shape", False)))
 
@@ -1417,23 +1432,19 @@ class Pi05TorchFrontendRtx:
         """Fixed-shape mode: build ONE max-length pipeline + one graph; later
         prompt lengths only update embeds + seqused/devpos (no re-capture).
 
-        The fixed pipeline is cached in ``self._fixed_pipeline`` so that
-        switching to a no-state prompt (which activates a per-length pipeline)
-        and back REUSES the already-calibrated, already-captured graph instead
-        of rebuilding it — a rebuild would re-run FP8 calibration/autotune on a
-        backend the per-length pipeline has since touched (observed CUDA illegal
-        access) and would also perturb numerics via autotune variance.
+        The same fixed-capacity graph serves prompts with and without robot
+        state. Valid lengths/masks are device inputs, as on the Thor path.
         """
-        self._ensure_prompt_capacity(PI05_STATE_PROMPT_MAX_LEN)
+        self._ensure_prompt_capacity(self._state_prompt_fixed_max_len)
         if self._fixed_pipeline is None:
             logger.info("Building fixed-shape Pi05Pipeline (max_prompt_len=%d)...",
-                        PI05_STATE_PROMPT_MAX_LEN)
+                        self._state_prompt_fixed_max_len)
             pipeline_weights = self._build_pipeline_weights()
             self._fixed_pipeline = Pi05Pipeline(
                 gemm=self.gemm, fvk=self.fvk, attn_backend=self.attn_backend,
                 weights=pipeline_weights,
                 num_views=self.num_views,
-                max_prompt_len=PI05_STATE_PROMPT_MAX_LEN,
+                max_prompt_len=self._state_prompt_fixed_max_len,
                 chunk_size=self.chunk_size,
                 num_steps=self._num_steps,
                 vision_pool_factor=self._vision_pool_factor,
@@ -2085,9 +2096,50 @@ class Pi05TorchFrontendRtx:
     # Batched B=N inference path — B=1 API remains unchanged
     # -----------------------------------------------------------------
 
+    def enable_batch_graph_bank(self, enable: bool = True, *,
+                                clear: bool = False) -> None:
+        """Keep seen exact-B graphs resident, matching the Thor Worker API.
+
+        No automatic eviction or fallback is applied in bank mode, as on
+        Thor. Callers choose which shapes to prewarm and must provision memory.
+        """
+        if clear:
+            self.clear_batch_graph_bank()
+        if enable:
+            # Align the initial backend to its batch prompt bucket before
+            # startup captures B1. Otherwise the first B>=2 bucket growth
+            # correctly invalidates every previously captured single graph.
+            capacity = (self._state_prompt_fixed_max_len
+                        if self._state_prompt_mode == "fixed"
+                        else self._prompt_bucket_for(self.max_prompt_len))
+            self._ensure_prompt_capacity(capacity)
+        self.batch_graph_bank_enabled = bool(enable)
+
+    def clear_batch_graph_bank(self) -> None:
+        """Drop bank references; active runtime references remain valid."""
+        self._batch_pipeline_cache.clear()
+        self._batch_stream_cache.clear()
+        self._batch_staging_cache.clear()
+        self._batch_backend_cache.clear()
+
+    def batch_graph_bank_keys(self):
+        """Report only captured graphs, including the separate B1 runtime."""
+        keys = {key for key, pipeline in self._batch_pipeline_cache.items()
+                if getattr(pipeline, "_graph", None) is not None}
+        singles = list(self._prompt_pipeline_cache.items())
+        if self._fixed_pipeline is not None:
+            singles.append((self._state_prompt_fixed_max_len, self._fixed_pipeline))
+        if self.pipeline is not None and not isinstance(
+                self.pipeline, Pi05BatchedPipeline):
+            singles.append((self.current_prompt_len, self.pipeline))
+        for prompt_len, pipeline in singles:
+            if getattr(pipeline, "_graph", None) is not None:
+                keys.add((1, int(prompt_len)))
+        return tuple(sorted(keys))
+
     def _evict_batch_runtimes_for(self, batch_size: int) -> None:
         """Bound resident exact-B runtimes before allocating a new shape."""
-        if batch_size in self._batch_backend_cache:
+        if self.batch_graph_bank_enabled or batch_size in self._batch_backend_cache:
             return
         while len(self._batch_backend_cache) >= self._batch_graph_cache_size:
             victim = next(iter(self._batch_backend_cache))
@@ -2120,7 +2172,7 @@ class Pi05TorchFrontendRtx:
         supported range.
         """
         if not enable:
-            if self._batch_graph_cache_size == 1:
+            if not self.batch_graph_bank_enabled and self._batch_graph_cache_size == 1:
                 self._evict_batch_runtimes_for(-1)
             self._batched_active = False
             self._batch_size = 1
@@ -2200,13 +2252,22 @@ class Pi05TorchFrontendRtx:
         prompt_lens = []
         states = [self._normalize_state_for_prompt(state) for state in states]
         for p, state in zip(prompts, states):
-            max_len = (PI05_STATE_PROMPT_MAX_LEN if state is not None
+            max_len = (self._state_prompt_fixed_max_len + 1
+                       if self._state_prompt_mode == "fixed" else
+                       PI05_STATE_PROMPT_MAX_LEN if state is not None
                        else MAX_PROMPT_LEN_DEFAULT)
             e_np, plen = self._embed_prompt_cached(
                 p, max_len=max_len, state=state)
             embeds_np_list.append(e_np)
             prompt_lens.append(plen)
-        if self.attn_backend.per_slot_mask_enabled:
+        if self._state_prompt_mode == "fixed":
+            if max(prompt_lens) > self._state_prompt_fixed_max_len:
+                raise ValueError(f"prompt length {max(prompt_lens)} exceeds fixed capacity "
+                                 f"{self._state_prompt_fixed_max_len}")
+            if not self.attn_backend.per_slot_mask_enabled:
+                raise ValueError("fixed batching requires per-slot attention masks")
+            target_len = self._state_prompt_fixed_max_len
+        elif self.attn_backend.per_slot_mask_enabled:
             target_len = self._prompt_bucket_for(max(prompt_lens))
         else:
             if len(set(prompt_lens)) != 1:
@@ -2222,7 +2283,8 @@ class Pi05TorchFrontendRtx:
         key = (B, target_len)
         cached = self._batch_pipeline_cache.get(key)
         if cached is None:
-            while len(self._batch_pipeline_cache) >= self._batch_graph_cache_size:
+            while (not self.batch_graph_bank_enabled
+                   and len(self._batch_pipeline_cache) >= self._batch_graph_cache_size):
                 victim_key = next(iter(self._batch_pipeline_cache))
                 victim_pipeline = self._batch_pipeline_cache.pop(victim_key)
                 if self.pipeline is victim_pipeline:
@@ -2244,6 +2306,7 @@ class Pi05TorchFrontendRtx:
                 num_views=self.num_views,
                 max_prompt_len=target_len,
                 chunk_size=self.chunk_size,
+                fixed_shape=self._state_prompt_mode == "fixed",
                 **self._pipeline_precision_kwargs())
             self._batch_pipeline_cache[key] = cached
         self.pipeline = cached
@@ -2273,11 +2336,18 @@ class Pi05TorchFrontendRtx:
 
     def batch_compatibility_key(self, prompt: str, state=None) -> tuple:
         """Return non-padding compatibility dimensions for one request."""
-        max_len = (PI05_STATE_PROMPT_MAX_LEN if state is not None
+        max_len = (self._state_prompt_fixed_max_len + 1
+                   if self._state_prompt_mode == "fixed" else
+                   PI05_STATE_PROMPT_MAX_LEN if state is not None
                    else MAX_PROMPT_LEN_DEFAULT)
         _, prompt_len = self._embed_prompt_cached(
             prompt, max_len=max_len, state=state)
-        self._prompt_bucket_for(prompt_len)
+        if self._state_prompt_mode == "fixed":
+            if prompt_len > self._state_prompt_fixed_max_len:
+                raise ValueError(f"prompt length {prompt_len} exceeds fixed capacity "
+                                 f"{self._state_prompt_fixed_max_len}")
+        else:
+            self._prompt_bucket_for(prompt_len)
         state_schema = None
         if state is not None:
             state_arr = np.asarray(state)
