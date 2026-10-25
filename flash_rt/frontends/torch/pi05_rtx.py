@@ -20,6 +20,7 @@ Usage::
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
 import logging
 import math
@@ -628,6 +629,7 @@ class Pi05TorchFrontendRtx:
                  hardware: Optional[str] = None,
                  fp8_layout: Optional[str] = None,
                  state_prompt_mode: str = "exact",
+                 state_prompt_fixed_max_len: Optional[int] = None,
                  use_cuda_graph: bool = True,
                  denoise_trace: bool = False,
                  prefix_features: bool = False,
@@ -685,9 +687,17 @@ class Pi05TorchFrontendRtx:
             raise ValueError(
                 f"state_prompt_mode must be 'fixed' or 'exact', got {_spm!r}")
         self._state_prompt_mode = _spm
+        self._state_prompt_fixed_max_len = int(os.environ.get(
+            "FLASHRT_PI05_STATE_PROMPT_FIXED_MAX_LEN",
+            state_prompt_fixed_max_len if state_prompt_fixed_max_len is not None
+            else PI05_STATE_PROMPT_MAX_LEN))
+        if not 1 <= self._state_prompt_fixed_max_len <= 256:
+            raise ValueError("state_prompt_fixed_max_len must be in [1, 256]")
+        self.batch_graph_bank_enabled = False
         self.num_views = int(num_views)
         self.chunk_size = int(chunk_size)
-        self.max_prompt_len = int(max_prompt_len)
+        self.max_prompt_len = max(int(max_prompt_len),
+            self._state_prompt_fixed_max_len if _spm == "fixed" else 0)
         self._num_steps = int(num_steps)
         self._vision_pool_factor = int(vision_pool_factor)
         if self._num_steps <= 0:
@@ -763,6 +773,7 @@ class Pi05TorchFrontendRtx:
 
         # ── Load + convert safetensors ──
         safetensors_path = checkpoint_dir / "model.safetensors"
+        self._checkpoint_path = str(safetensors_path)
         if not safetensors_path.exists():
             raise FileNotFoundError(
                 f"safetensors not found at {safetensors_path} — "
@@ -828,6 +839,14 @@ class Pi05TorchFrontendRtx:
         self.fvk = fvk
         self.gemm = fvk.GemmRunner()
 
+        override = os.environ.get("FLASHRT_FP8_CALIBRATION_CACHE")
+        calibration_key = hashlib.sha256(json.dumps(
+            self._fp8_calibration_identity(), sort_keys=True).encode()).hexdigest()[:20]
+        self._fp8_calibration_cache_path = pathlib.Path(override).expanduser() if override else (
+            pathlib.Path("~/.cache/flashrt/calibration").expanduser()
+            / f"pi05-rtx-fp8-{calibration_key}.json")
+        self._fp8_calibration_cache_hit = False
+
         # ── Reusable pre-allocated input buffers (match Thor style) ──
         self._img_buf = torch.empty(
             self.num_views, IMG_HW, IMG_HW, 3, dtype=bf16, device="cuda")
@@ -846,6 +865,96 @@ class Pi05TorchFrontendRtx:
         logger.info(
             "Pi05TorchFrontendRtx initialised (num_views=%d, chunk=%d, fp8_layout=%s)",
             self.num_views, self.chunk_size, self.fp8_layout)
+
+    def _checkpoint_fingerprint(self) -> dict:
+        """Cheap content-sensitive checkpoint identity for cache validation."""
+        path = pathlib.Path(self._checkpoint_path)
+        stat = path.stat()
+        digest = hashlib.sha256()
+        sample_bytes = 1024 * 1024
+        with path.open("rb") as handle:
+            digest.update(handle.read(sample_bytes))
+            if stat.st_size > sample_bytes:
+                handle.seek(max(0, stat.st_size - sample_bytes))
+                digest.update(handle.read(sample_bytes))
+        return {
+            "size": stat.st_size,
+            "edge_sha256": digest.hexdigest(),
+        }
+
+    def _fp8_calibration_identity(self) -> dict:
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        return {
+            "schema": 1,
+            "checkpoint": self._checkpoint_fingerprint(),
+            "device_name": props.name,
+            "compute_capability": [props.major, props.minor],
+            "torch_cuda": str(torch.version.cuda),
+            "fp8_layout": self.fp8_layout,
+            "num_views": self.num_views,
+            "chunk_size": self.chunk_size,
+            "num_steps": self._num_steps,
+            "vision_pool_factor": self._vision_pool_factor,
+            "vision_num_layers": self._vision_num_layers,
+        }
+
+    def _can_cache_fp8_calibration(self) -> bool:
+        return bool(
+            self.use_fp8
+            and self._prefix_precision == "fp8"
+            and self._decoder_kernel == "cublaslt"
+            and not self._force_bf16
+            and not self._force_int8_decoder
+            and not self._use_int8_encoder
+            and not self._use_int8_vision_static
+            and hasattr(self.pipeline, "fp8_act_scales")
+        )
+
+    def _load_fp8_calibration_cache(self) -> bool:
+        if not self._can_cache_fp8_calibration():
+            return False
+        path = self._fp8_calibration_cache_path
+        if not path.exists():
+            return False
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if payload.get("identity") != self._fp8_calibration_identity():
+                logger.warning("Ignoring incompatible FP8 calibration cache %s", path)
+                return False
+            scales = payload.get("scales", {})
+            if not isinstance(scales, dict) or not 1 <= len(scales) <= 2048:
+                raise ValueError("invalid FP8 calibration scale table size")
+            # Pi0.5 creates these four-byte device buffers lazily during its
+            # first dynamic forward.  A cache hit must recreate them before
+            # that forward; otherwise an empty dict would make persistence a
+            # no-op.  Restrict names before allocating from a local file.
+            for name in scales:
+                if (not isinstance(name, str) or len(name) > 128
+                        or any(ch not in "abcdefghijklmnopqrstuvwxyz0123456789_"
+                               for ch in name)):
+                    raise ValueError(f"invalid FP8 scale name {name!r}")
+                self.pipeline._fp8_scale_buf(name)
+            expected = set(self.pipeline.fp8_act_scales)
+            if set(scales) != expected:
+                logger.warning(
+                    "Ignoring FP8 calibration cache with a different scale set: %s",
+                    path)
+                return False
+            for name in sorted(expected):
+                value = float(scales[name])
+                if not math.isfinite(value) or value <= 0.0:
+                    raise ValueError(f"invalid scale {name}={value}")
+                self.pipeline.fp8_act_scales[name].upload(
+                    np.array([value], dtype=np.float32))
+            self.pipeline.fp8_calibrated = True
+            self._fp8_calibration_cache_hit = True
+            logger.info("Loaded %d FP8 calibration scales from %s",
+                        len(expected), path)
+            return True
+        except Exception as exc:
+            logger.warning("Ignoring unusable FP8 calibration cache %s: %s",
+                           path, exc)
+            return False
 
     def _ensure_prompt_capacity(self, required_prompt_len: int) -> None:
         """Grow RTX attention buffers before building longer prompt pipelines."""
@@ -1024,6 +1133,9 @@ class Pi05TorchFrontendRtx:
     def _live_pipelines(self) -> list:
         seen: dict[int, object] = {}
         parked = [c.get("pipeline") for c in getattr(self, "_batch_ctx", {}).values()]
+        single = getattr(self, "_single_ctx", None)
+        if single:
+            parked.extend([single.get("pipeline"), single.get("_fixed_pipeline")])
         for pipe in [self.pipeline, getattr(self, "_fixed_pipeline", None),
                      *getattr(self, "_prompt_pipeline_cache", {}).values(), *parked]:
             if pipe is not None:
@@ -1138,7 +1250,8 @@ class Pi05TorchFrontendRtx:
             if call[0] == "single":
                 self.set_prompt(call[1], call[2])
             else:
-                self.set_prompt_batch(list(call[1]))
+                self.set_prompt_batch(list(call[1]),
+                                      states=getattr(self, "_batch_prompt_states", None))
         torch.cuda.synchronize()
         self._weight_version = self.weight_version + 1
         elapsed = time.perf_counter() - t0
@@ -1503,6 +1616,8 @@ class Pi05TorchFrontendRtx:
         builds the unconditioned prompt embeddings and uploads both into
         the CFG-aware pipeline.
         """
+        if self._rl_config is None and getattr(self, "_batched_active", False):
+            self.set_batched_mode(enable=False)
         self._last_prompt_call = ("single", prompt_text, state)
         if self._rl_config is not None:
             if state is not None:
@@ -1515,13 +1630,18 @@ class Pi05TorchFrontendRtx:
                 bool(getattr(self.pipeline, "_fixed_shape", False)))
             return
 
-        max_len = (PI05_STATE_PROMPT_MAX_LEN if state is not None
+        max_len = (self._state_prompt_fixed_max_len + 1
+                   if self._state_prompt_mode == "fixed" else
+                   PI05_STATE_PROMPT_MAX_LEN if state is not None
                    else MAX_PROMPT_LEN_DEFAULT)
         embeds, prompt_len, embeds_np = self._embed_prompt_cached(
             prompt_text, max_len, state=state)
         self._last_prompt_len = int(prompt_len)
 
-        if self._state_prompt_mode == "fixed" and state is not None:
+        if self._state_prompt_mode == "fixed":
+            if prompt_len > self._state_prompt_fixed_max_len:
+                raise ValueError(f"prompt length {prompt_len} exceeds fixed capacity "
+                                 f"{self._state_prompt_fixed_max_len}")
             self._set_prompt_fixed(prompt_len)
         else:
             self._set_prompt_per_length(state, prompt_len)
@@ -1546,23 +1666,19 @@ class Pi05TorchFrontendRtx:
         """Fixed-shape mode: build ONE max-length pipeline + one graph; later
         prompt lengths only update embeds + seqused/devpos (no re-capture).
 
-        The fixed pipeline is cached in ``self._fixed_pipeline`` so that
-        switching to a no-state prompt (which activates a per-length pipeline)
-        and back REUSES the already-calibrated, already-captured graph instead
-        of rebuilding it — a rebuild would re-run FP8 calibration/autotune on a
-        backend the per-length pipeline has since touched (observed CUDA illegal
-        access) and would also perturb numerics via autotune variance.
+        Prompts with and without state share this fixed-capacity pipeline.
+        Valid lengths are device inputs, so changing state does not recapture.
         """
-        self._ensure_prompt_capacity(PI05_STATE_PROMPT_MAX_LEN)
+        self._ensure_prompt_capacity(self._state_prompt_fixed_max_len)
         if self._fixed_pipeline is None:
             logger.info("Building fixed-shape Pi05Pipeline (max_prompt_len=%d)...",
-                        PI05_STATE_PROMPT_MAX_LEN)
+                        self._state_prompt_fixed_max_len)
             pipeline_weights = self._build_pipeline_weights()
             self._fixed_pipeline = Pi05Pipeline(
                 gemm=self.gemm, fvk=self.fvk, attn_backend=self.attn_backend,
                 weights=pipeline_weights,
                 num_views=self.num_views,
-                max_prompt_len=PI05_STATE_PROMPT_MAX_LEN,
+                max_prompt_len=self._state_prompt_fixed_max_len,
                 chunk_size=self.chunk_size,
                 num_steps=self._num_steps,
                 vision_pool_factor=self._vision_pool_factor,
@@ -1837,19 +1953,21 @@ class Pi05TorchFrontendRtx:
             self._copy_tensor_to_pipeline_buf_stream(
                 noise, self.pipeline.input_noise_buf, stream_int)
 
-            # Batched pipelines carry their own calibrate_fp8 that drives
-            # a parent-B=1 forward internally — calling run_pipeline here
-            # would fire the batched path with only the parent's B=1
-            # slots populated. Skip the preemptive run for batched
-            # subclasses and let calibrate_fp8 do the work.
-            if not isinstance(self.pipeline, Pi05BatchedPipeline):
-                self.pipeline.run_pipeline(stream=stream_int)
+            calibration_cache_hit = self._load_fp8_calibration_cache()
+            if not calibration_cache_hit:
+                # Batched pipelines carry their own calibrate_fp8 that drives
+                # a parent-B=1 forward internally — calling run_pipeline here
+                # would fire the batched path with only the parent's B=1
+                # slots populated. Skip the preemptive run for batched
+                # subclasses and let calibrate_fp8 do the work.
+                if not isinstance(self.pipeline, Pi05BatchedPipeline):
+                    self.pipeline.run_pipeline(stream=stream_int)
 
-            self._cudart.cudaStreamSynchronize(
-                ctypes.c_void_p(stream_int))
+                self._cudart.cudaStreamSynchronize(
+                    ctypes.c_void_p(stream_int))
 
-            # FP8 calibration (no-op for INT8 pipelines).
-            self.pipeline.calibrate_fp8()
+                # FP8 calibration (no-op for INT8 pipelines).
+                self.pipeline.calibrate_fp8()
             # Static INT8 vision: the run_pipeline() call above already ran one
             # vision forward with quantize_int8_device, writing per-site scales
             # into vis_int8_static_scales. Flip the flag to switch to the fast
@@ -1892,7 +2010,7 @@ class Pi05TorchFrontendRtx:
         self.calibrated = True
         self.graph_recorded = self.use_cuda_graph
         self._precision_spec = self._snapshot_precision_spec(
-            method="single_frame", n=1, percentile=None)
+            method="cache" if calibration_cache_hit else "single_frame", n=1, percentile=None)
         self._warn_if_scale_ceiling_exceeded()
         logger.info(
             "Calibration%s complete",
@@ -2224,7 +2342,7 @@ class Pi05TorchFrontendRtx:
     # -----------------------------------------------------------------
 
     @serialized
-    def set_batched_mode(self, *, enable: bool = True,
+    def _set_batched_mode(self, *, enable: bool = True,
                          batch_size: int = PI05_BATCH_SIZE) -> None:
         """Enable / disable B=N batching (N >= 1, default 2; opt-in).
 
@@ -2266,7 +2384,7 @@ class Pi05TorchFrontendRtx:
             # Replacing the backend orphans any single-sample pipelines that were
             # bound to the old one; drop the caches so they are rebuilt on the
             # new backend (mirrors _ensure_prompt_capacity()).
-            self._prompt_pipeline_cache.clear()
+            self._prompt_pipeline_cache = {}
             self._fixed_pipeline = None
         self._batched_active = True
         # Force pipeline rebuild so set_prompt_batch picks the batched class.
@@ -2295,7 +2413,8 @@ class Pi05TorchFrontendRtx:
         "attn_backend", "pipeline", "current_prompt_len", "graph_recorded",
         "calibrated", "_batched_active", "_batch_size", "_img_buf_b2",
         "_noise_buf_b2", "_noise_out_b2", "_batch_prompt_texts", "_batch_prompt_lens",
-        "_last_prompt_call", "_graph_torch_stream", "_sde_eps_stage")
+        "_last_prompt_call", "_graph_torch_stream", "_sde_eps_stage",
+        "_batch_prompt_states", "_fixed_pipeline", "_prompt_pipeline_cache")
 
     @property
     def batch_sizes(self) -> tuple:
@@ -2332,6 +2451,9 @@ class Pi05TorchFrontendRtx:
         if cur == bs:
             return
         ctxs = self.__dict__.setdefault("_batch_ctx", {})
+        if cur is None and getattr(self, "_single_ctx", None) is None:
+            self._single_ctx = {a: getattr(self, a, None) for a in self._BATCH_CTX_ATTRS}
+            self._single_ctx["_weight_version"] = self.weight_version
         if cur is not None:
             saved = {a: getattr(self, a, None) for a in self._BATCH_CTX_ATTRS}
             saved["_weight_version"] = self.weight_version
@@ -2344,7 +2466,8 @@ class Pi05TorchFrontendRtx:
             call = self._last_prompt_call
             if version != self.weight_version and call is not None and call[0] == "batch":
                 self._batch_prompt_texts = None
-                self.set_prompt_batch(list(call[1]))
+                self.set_prompt_batch(list(call[1]),
+                                      states=getattr(self, "_batch_prompt_states", None))
             return
         # New width: a fresh backend, staging tensors and (on the next
         # set_prompt_batch) pipeline. Parked widths keep theirs.
@@ -2353,10 +2476,79 @@ class Pi05TorchFrontendRtx:
         self._last_prompt_call = None
         self._batch_prompt_texts = None
         self._batched_active = False
-        self.set_batched_mode(enable=True, batch_size=bs)
+        self._set_batched_mode(enable=True, batch_size=bs)
+
+    supports_fixed_prompt_batch = True
+    supports_worker_statefree_prewarm = True
 
     @serialized
-    def set_prompt_batch(self, prompts: list) -> None:
+    def enable_batch_graph_bank(self, enable=True, *, clear=False):
+        self.batch_graph_bank_enabled = bool(enable)
+        if clear:
+            self.clear_batch_graph_bank()
+
+    @serialized
+    def clear_batch_graph_bank(self):
+        # Keep the currently executing context; discard only parked widths.
+        self.__dict__.setdefault("_batch_ctx", {}).clear()
+
+    def batch_graph_bank_keys(self):
+        contexts = list(getattr(self, "_batch_ctx", {}).items())
+        if getattr(self, "_batched_active", False):
+            contexts.append((self._batch_size, {"pipeline": self.pipeline}))
+        else:
+            contexts.append((1, {"pipeline": self.pipeline}))
+        single = getattr(self, "_single_ctx", None)
+        if single:
+            contexts.append((1, single))
+        return tuple(sorted({(int(bs), int(pipe.max_prompt_len))
+            for bs, ctx in contexts
+            for pipe in [ctx.get("pipeline")]
+            if pipe is not None and getattr(pipe, "_graph", None) is not None}))
+
+    @serialized
+    def set_batched_mode(self, *, enable=True, batch_size=PI05_BATCH_SIZE):
+        if enable:
+            self.select_batch_size(batch_size)
+            return
+        if getattr(self, "_batched_active", False):
+            saved = {a: getattr(self, a, None) for a in self._BATCH_CTX_ATTRS}
+            saved["_weight_version"] = self.weight_version
+            self.__dict__.setdefault("_batch_ctx", {})[int(self._batch_size)] = saved
+            single = self.__dict__.pop("_single_ctx", None)
+            if single is not None:
+                version = single.pop("_weight_version", self.weight_version)
+                for a, v in single.items():
+                    setattr(self, a, v)
+                call = self._last_prompt_call
+                if version != self.weight_version and call is not None and call[0] == "single":
+                    self.set_prompt(call[1], state=call[2])
+            else:
+                self._set_batched_mode(enable=False)
+
+    @serialized
+    def infer_multi_prompt_batch(self, requests, *, seed=None):
+        """Serve canonical Worker requests through the native batched pipeline."""
+        if not requests:
+            return []
+        if any(item.get("rtc_prev_action_chunk") is not None
+               or int(item.get("rtc_prefix_len", 0) or 0) for item in requests):
+            raise ValueError("RTX request-level RTC is not supported")
+        self.select_batch_size(len(requests))
+        states = [item.get("state") if item.get("state") is not None
+                  else item["observation"].get("state") for item in requests]
+        self.set_prompt_batch([item["prompt"] for item in requests], states=states)
+        observations = [item["observation"] for item in requests]
+        if not self.calibrated:
+            self.calibrate(observations[:1])
+        generator = None
+        if seed is not None:
+            generator = torch.Generator(device="cuda")
+            generator.manual_seed(int(seed) & 0xFFFFFFFF)
+        return self.infer_batch(observations, generator=generator)
+
+    @serialized
+    def set_prompt_batch(self, prompts: list, states=None) -> None:
         """Set per-sample prompts for the batched pipeline.
 
         Args:
@@ -2373,11 +2565,24 @@ class Pi05TorchFrontendRtx:
             raise ValueError(
                 f"set_prompt_batch expects {self._batch_size} prompts, "
                 f"got {len(prompts)}")
+        if states is None:
+            states = [None] * self._batch_size
+        if len(states) != self._batch_size:
+            raise ValueError("states must contain one entry per batch slot")
         self._last_prompt_call = ("batch", tuple(prompts))
-        entries = [self._embed_prompt_cached(p, MAX_PROMPT_LEN_DEFAULT)
-                   for p in prompts]
+        max_len = (self._state_prompt_fixed_max_len + 1
+                   if self._state_prompt_mode == "fixed" else PI05_STATE_PROMPT_MAX_LEN)
+        entries = [self._embed_prompt_cached(p,
+                   max_len if self._state_prompt_mode == "fixed" else
+                   PI05_STATE_PROMPT_MAX_LEN if state is not None else MAX_PROMPT_LEN_DEFAULT,
+                   state=state) for p, state in zip(prompts, states)]
         prompt_lens = [e[1] for e in entries]
-        target_len = max(prompt_lens)
+        target_len = (self._state_prompt_fixed_max_len
+                      if self._state_prompt_mode == "fixed" else max(prompt_lens))
+        if max(prompt_lens) > target_len:
+            raise ValueError(f"prompt length {max(prompt_lens)} exceeds fixed capacity {target_len}")
+        if target_len > self.max_prompt_len:
+            raise ValueError("batch prompt exceeds configured attention capacity")
         self._batch_prompt_lens = tuple(prompt_lens)
 
         # Pad each embed to target_len (BF16 zeros are valid pad tokens).
@@ -2408,6 +2613,8 @@ class Pi05TorchFrontendRtx:
                 num_views=self.num_views,
                 max_prompt_len=target_len,
                 chunk_size=self.chunk_size,
+                num_steps=self._num_steps,
+                fixed_shape=self._state_prompt_mode == "fixed",
                 denoise_trace=self._denoise_trace,
                 prefix_export=self._prefix_features,
                 sde=self._sde,
@@ -2420,11 +2627,16 @@ class Pi05TorchFrontendRtx:
         if prev is None or len(prev) != len(prompts):
             slots = list(range(self._batch_size))
         else:
-            slots = [b for b in range(self._batch_size) if prev[b] != prompts[b]]
+            previous_states = getattr(self, "_batch_prompt_states", None)
+            slots = [b for b in range(self._batch_size)
+                     if prev[b] != prompts[b] or states[b] is not None
+                     or (previous_states is not None and previous_states[b] is not None)]
         if rebuild or 0 in slots:
             # B=1 pipeline path is what calibrate_fp8 uses for FP8 scale collection.
-            self.pipeline.set_language_embeds(padded_np_list[0])
-        self.pipeline.set_language_embeds_batch(padded_np_list, slots=slots)
+            self.pipeline.set_language_embeds(entries[0][2])
+        self.pipeline.set_language_embeds_batch(
+            padded_np_list, slots=slots, valid_prompt_lens=prompt_lens)
+        self._batch_prompt_states = tuple(states)
         self._batch_prompt_texts = tuple(prompts)
         self._frame_count = 0
         logger.info(

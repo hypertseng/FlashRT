@@ -60,6 +60,10 @@ class RtxFlashAttnBatchedBackendPi05(RtxFlashAttnBackend):
         bf16 = self.vis_Q.dtype
         d = "cuda"
         B = self._batch_size
+        self.enc_seqused_b2 = torch.zeros(B, dtype=torch.int32, device=d)
+        self.dec_seqused_b2 = torch.zeros(B, dtype=torch.int32, device=d)
+        self.dec_devpos_b2 = torch.zeros(B, dtype=torch.int32, device=d)
+        self._batched_valid_lens = False
         nv = self._num_views
         es_max = self._encoder_seq_max
         ds = self._chunk_size
@@ -224,6 +228,17 @@ class RtxFlashAttnBatchedBackendPi05(RtxFlashAttnBackend):
             o_accum=self._vis_o_accum_b2)
         return self._vis_O72_b2.data_ptr()
 
+    def set_batched_valid_prefix_lens(self, lengths):
+        torch = self._torch
+        values = torch.as_tensor(lengths, dtype=torch.int32, device="cuda")
+        if values.numel() != self._batch_size or bool(torch.any(values <= 0)) or bool(torch.any(values > self._encoder_seq_max)):
+            raise ValueError("invalid per-slot prefix lengths")
+        self.enc_seqused_b2.copy_(values)
+        self.dec_seqused_b2.copy_(values + self._chunk_size)
+        self.dec_devpos_b2.copy_(values)
+        self._batched_valid_lens = True
+        torch.cuda.synchronize()
+
     def encoder_attn_batched(self, layer_idx: int, seq: int,
                               stream: int = 0) -> int:
         """Gemma-2B encoder self-attention with B=N sample batching."""
@@ -238,10 +253,15 @@ class RtxFlashAttnBatchedBackendPi05(RtxFlashAttnBackend):
         q_c = q.contiguous()
         k_c = k.contiguous()
         v_c = v.contiguous()
-        self._call_fvk_fa2(q_c, k_c, v_c,
-                           o, self._enc_lse_b2, stream=stream,
-                           lse_accum=self._enc_lse_accum_b2,
-                           o_accum=self._enc_o_accum_b2)
+        if self._batched_valid_lens:
+            self._call_fvk_fa2_seqused_splitkv(q_c, k_c, v_c,
+                o, self._enc_lse_b2, self.enc_seqused_b2, stream=stream,
+                lse_accum=self._enc_lse_accum_b2, o_accum=self._enc_o_accum_b2)
+        else:
+            self._call_fvk_fa2(q_c, k_c, v_c,
+                               o, self._enc_lse_b2, stream=stream,
+                               lse_accum=self._enc_lse_accum_b2,
+                               o_accum=self._enc_o_accum_b2)
         if not hasattr(self, "_enc_qkv_o_refs_b2"):
             self._enc_qkv_o_refs_b2 = {}
         self._enc_qkv_o_refs_b2[layer_idx] = (q_c, k_c, v_c, o)
@@ -261,10 +281,15 @@ class RtxFlashAttnBatchedBackendPi05(RtxFlashAttnBackend):
         q_c = q.contiguous()
         k_c = k.contiguous()
         v_c = v.contiguous()
-        self._call_fvk_fa2(q_c, k_c, v_c,
-                           o, self._dec_lse_b2, stream=stream,
-                           lse_accum=self._dec_lse_accum_b2,
-                           o_accum=self._dec_o_accum_b2)
+        if self._batched_valid_lens:
+            self._call_fvk_fa2_seqused_splitkv(q_c, k_c, v_c,
+                o, self._dec_lse_b2, self.dec_seqused_b2, stream=stream,
+                lse_accum=self._dec_lse_accum_b2, o_accum=self._dec_o_accum_b2)
+        else:
+            self._call_fvk_fa2(q_c, k_c, v_c,
+                               o, self._dec_lse_b2, stream=stream,
+                               lse_accum=self._dec_lse_accum_b2,
+                               o_accum=self._dec_o_accum_b2)
         if not hasattr(self, "_dec_qkv_o_refs_b2"):
             self._dec_qkv_o_refs_b2 = []
         self._dec_qkv_o_refs_b2.append((q_c, k_c, v_c, o))

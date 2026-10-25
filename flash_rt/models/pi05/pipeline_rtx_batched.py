@@ -304,7 +304,7 @@ class Pi05BatchedPipeline(Pi05Pipeline):
     #   Public API: per-sample language-embed upload
     # ══════════════════════════════════════════════════════════════════
 
-    def set_language_embeds_batch(self, embeds_np_list, slots=None) -> None:
+    def set_language_embeds_batch(self, embeds_np_list, slots=None, valid_prompt_lens=None) -> None:
         """Store per-sample language embeddings.
 
         Args:
@@ -335,6 +335,10 @@ class Pi05BatchedPipeline(Pi05Pipeline):
                 f"prompt_len {prompt_len} exceeds max_prompt_len "
                 f"{self.max_prompt_len}")
         import numpy as np
+        if valid_prompt_lens is None:
+            valid_prompt_lens = [prompt_len] * self.B
+        if len(valid_prompt_lens) != self.B or any(int(v) <= 0 or int(v) > prompt_len for v in valid_prompt_lens):
+            raise ValueError("invalid per-slot prompt lengths")
         if slots is not None:
             slots = sorted(set(int(b) for b in slots))
             if slots and not (0 <= slots[0] and slots[-1] < self.B):
@@ -359,6 +363,13 @@ class Pi05BatchedPipeline(Pi05Pipeline):
         self._current_prompt_len_b2 = prompt_len
         # Reuse the parent's decoder-RoPE setup for this prompt length.
         self._set_decoder_rope_for_prompt(prompt_len)
+        if "decoder_rope_weights_b2" not in self.bufs:
+            self.bufs["decoder_rope_weights_b2"] = CudaBuffer.device_empty(
+                self.B * self.chunk_size * DEC_HD, BF16)
+        rope_rows = [self._rope_table_np[self.vision_seq + int(v):
+                     self.vision_seq + int(v) + self.chunk_size] for v in valid_prompt_lens]
+        self.bufs["decoder_rope_weights_b2"].upload(np.ascontiguousarray(np.stack(rope_rows)))
+        self.attn.set_batched_valid_prefix_lens([self.vision_seq + int(v) for v in valid_prompt_lens])
         self._copy_lang_embeds_to_encoder_x_b2()
 
     def _copy_lang_embeds_to_encoder_x_b2(self, stream: int = 0) -> None:
@@ -1016,16 +1027,28 @@ class Pi05BatchedPipeline(Pi05Pipeline):
         for b in range(self.B):
             qkv_src = Bb["decoder_QKV_b2"].ptr.value + b * per_sample_qkv_bytes
             q_dst = ap["dec_Q"] + b * per_sample_q_bytes
-            k_ptr_b, v_ptr_b = self._enc_kv_layer_ptrs_b2(i, offset_tokens=enc_seq)
+            use_mask = self.attn._batched_valid_lens
+            k_ptr_b, v_ptr_b = self._enc_kv_layer_ptrs_b2(
+                i, offset_tokens=0 if use_mask else enc_seq)
             k_ptr_b += b * sample_stride_kv
             v_ptr_b += b * sample_stride_kv
-            fvk.qkv_split_rope(
-                qkv_src,
-                Bb["decoder_rope_weights"].ptr.value,
-                q_dst,
-                k_ptr_b, v_ptr_b,
-                ds, DEC_NH * DEC_HD, DEC_NKV * DEC_HD, DEC_NKV * DEC_HD,
-                DEC_HD, stream=stream)
+            if use_mask:
+                rope_stride_bytes = ds * DEC_HD * 2
+                devpos_ptr = self.attn.dec_devpos_b2.data_ptr() + b * 4
+                fvk.qkv_split_rope_devpos(
+                    qkv_src,
+                    Bb["decoder_rope_weights_b2"].ptr.value
+                    + b * rope_stride_bytes,
+                    q_dst,
+                    k_ptr_b, v_ptr_b, devpos_ptr,
+                    ds, DEC_NH * DEC_HD, DEC_NKV * DEC_HD, DEC_NKV * DEC_HD,
+                    DEC_HD, stream=stream)
+            else:
+                fvk.qkv_split_rope(
+                    qkv_src, Bb["decoder_rope_weights"].ptr.value,
+                    q_dst, k_ptr_b, v_ptr_b,
+                    ds, DEC_NH * DEC_HD, DEC_NKV * DEC_HD,
+                    DEC_NKV * DEC_HD, DEC_HD, stream=stream)
 
         # C3: Batched cross-attention (per-sample contexts)
         dec_o_ptr = self.attn.run_batched(
