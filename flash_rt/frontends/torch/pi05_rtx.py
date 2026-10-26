@@ -635,7 +635,13 @@ class Pi05TorchFrontendRtx:
                  prefix_features: bool = False,
                  decoder_kernel: Optional[str] = None,
                  prefix_precision: Optional[str] = None,
-                 sde: bool = False):
+                 sde: bool = False,
+                 rtc_prefix_len: int = 0):
+        self.rtc_prefix_len = int(rtc_prefix_len)
+        if isinstance(rtc_prefix_len, bool) or self.rtc_prefix_len != rtc_prefix_len or not 0 <= self.rtc_prefix_len <= chunk_size:
+            raise ValueError("rtc_prefix_len must be an integer within the action horizon")
+        if self.rtc_prefix_len and sde:
+            raise ValueError("Prefix RTC with SDE is not validated")
         checkpoint_dir = pathlib.Path(checkpoint_dir)
         # Stochastic sampler: pipelines take a per-step noise scale and
         # per-step noise (infer(..., sde_sigma=, step_noise=)); with no
@@ -1896,6 +1902,7 @@ class Pi05TorchFrontendRtx:
         """
         if self.pipeline is None:
             raise RuntimeError("set_prompt must be called before calibrate")
+        self._prepare_rtc_pipeline()
         if self.calibrated:
             logger.warning(
                 "calibrate() called a second time; returning without re-running.")
@@ -2177,7 +2184,8 @@ class Pi05TorchFrontendRtx:
 
     @serialized
     def infer(self, observation: dict, debug: bool = False, *,
-              noise=None, generator=None, step_noise=None, sde_sigma=None, return_noise: bool = False) -> dict:
+              noise=None, generator=None, step_noise=None, sde_sigma=None, return_noise: bool = False,
+              seed=None, rtc_prev_action_chunk=None, rtc_prefix_len=None, return_rtc_raw=False) -> dict:
         """Run inference on a single observation.
 
         All GPU work happens on ``self._graph_torch_stream`` — the same
@@ -2206,6 +2214,11 @@ class Pi05TorchFrontendRtx:
         if self.pipeline is None:
             raise RuntimeError("set_prompt must be called before infer")
 
+        if seed is not None:
+            if generator is not None:
+                raise ValueError("Pass seed or generator, not both")
+            generator = torch.Generator(device="cuda")
+            generator.manual_seed(int(seed) & 0xFFFFFFFF)
         if isinstance(self.pipeline, Pi05CFGBatchedPipeline):
             return self._infer_cfg_batched(
                 observation, debug=debug, noise=noise, generator=generator,
@@ -2221,6 +2234,9 @@ class Pi05TorchFrontendRtx:
 
         with torch.cuda.stream(self._graph_torch_stream):
             stream_int = self._graph_torch_stream.cuda_stream
+
+            length = (self.rtc_prefix_len if rtc_prev_action_chunk is not None else 0) if rtc_prefix_len is None else rtc_prefix_len
+            self._stage_rtc([rtc_prev_action_chunk], [length])
 
             # With an explicit initial noise and a schedule, the generator
             # feeds the step noise only.
@@ -2264,6 +2280,8 @@ class Pi05TorchFrontendRtx:
             logger.info("Latency: %.1f ms", latency_ms)
 
         result = {"actions": robot_actions}
+        if self.rtc_prefix_len or return_rtc_raw:
+            result["rtc_raw_actions"] = raw_actions.copy()
         if return_noise:
             result["noise"] = self._noise_buf.float().cpu().numpy()
         if self._denoise_trace:
@@ -2478,6 +2496,30 @@ class Pi05TorchFrontendRtx:
         self._batched_active = False
         self._set_batched_mode(enable=True, batch_size=bs)
 
+    supports_mixed_prefix_batch = True
+    supports_fixed_fa4 = False
+
+    def _prepare_rtc_pipeline(self):
+        if not self.rtc_prefix_len:
+            return
+        if self._rl_config is not None:
+            raise ValueError("Prefix RTC is not supported with CFG mode")
+        from flash_rt.models.pi05.rtc_prefix_lock import DynamicPrefixLock
+        pipe = self.pipeline
+        if not hasattr(pipe, "_rtc_dynamic_lock"):
+            pipe._rtc_dynamic_lock = DynamicPrefixLock(1, self.chunk_size)
+        if isinstance(pipe, Pi05BatchedPipeline) and not hasattr(pipe, "_rtc_dynamic_lock_batched"):
+            pipe._rtc_dynamic_lock_batched = DynamicPrefixLock(pipe.B, self.chunk_size)
+
+    def _stage_rtc(self, previous, lengths, *, batched=False):
+        if not self.rtc_prefix_len:
+            if any(int(n) > 0 for n in lengths) or any(p is not None for p in previous):
+                raise ValueError("Worker was not initialized with Prefix RTC")
+            return
+        self._prepare_rtc_pipeline()
+        name = "_rtc_dynamic_lock_batched" if batched else "_rtc_dynamic_lock"
+        getattr(self.pipeline, name).stage(previous, lengths)
+
     supports_fixed_prompt_batch = True
     supports_worker_statefree_prewarm = True
 
@@ -2531,9 +2573,9 @@ class Pi05TorchFrontendRtx:
         """Serve canonical Worker requests through the native batched pipeline."""
         if not requests:
             return []
-        if any(item.get("rtc_prev_action_chunk") is not None
+        if not self.rtc_prefix_len and any(item.get("rtc_prev_action_chunk") is not None
                or int(item.get("rtc_prefix_len", 0) or 0) for item in requests):
-            raise ValueError("RTX request-level RTC is not supported")
+            raise ValueError("Worker was not initialized with Prefix RTC")
         self.select_batch_size(len(requests))
         states = [item.get("state") if item.get("state") is not None
                   else item["observation"].get("state") for item in requests]
@@ -2545,7 +2587,11 @@ class Pi05TorchFrontendRtx:
         if seed is not None:
             generator = torch.Generator(device="cuda")
             generator.manual_seed(int(seed) & 0xFFFFFFFF)
-        return self.infer_batch(observations, generator=generator)
+        previous = [item.get("rtc_prev_action_chunk") for item in requests]
+        lengths = [item.get("rtc_prefix_len", self.rtc_prefix_len if old is not None else 0)
+                   for item, old in zip(requests, previous)]
+        return self.infer_batch(observations, generator=generator,
+                                rtc_prev_action_chunks=previous, rtc_prefix_lengths=lengths)
 
     @serialized
     def set_prompt_batch(self, prompts: list, states=None) -> None:
@@ -2652,6 +2698,7 @@ class Pi05TorchFrontendRtx:
         sample-invariant) on the first observation; the batched B=N
         forward then reuses those scales.
         """
+        self._prepare_rtc_pipeline()
         if not isinstance(self.pipeline, Pi05BatchedPipeline):
             raise RuntimeError(
                 "calibrate_batch requires set_prompt_batch to have built a "
@@ -2683,7 +2730,8 @@ class Pi05TorchFrontendRtx:
 
     @serialized
     def infer_batch(self, observations: list, *,
-                    noise=None, generator=None, step_noise=None, sde_sigma=None, return_noise: bool = False) -> list:
+                    noise=None, generator=None, step_noise=None, sde_sigma=None, return_noise: bool = False,
+                    rtc_prev_action_chunks=None, rtc_prefix_lengths=None) -> list:
         """Run B=N inference on N independent observations.
 
         Args:
@@ -2709,6 +2757,9 @@ class Pi05TorchFrontendRtx:
         t0 = time.perf_counter()
 
         with torch.cuda.stream(self._graph_torch_stream):
+            previous = [None] * self._batch_size if rtc_prev_action_chunks is None else rtc_prev_action_chunks
+            lengths = [0] * self._batch_size if rtc_prefix_lengths is None else rtc_prefix_lengths
+            self._stage_rtc(previous, lengths, batched=True)
             # Stage per-sample inputs into B=N tensors (_b2 is a legacy suffix).
             for b, obs in enumerate(observations):
                 self._img_buf_b2[b].copy_(self._stack_images(obs))
@@ -2746,6 +2797,8 @@ class Pi05TorchFrontendRtx:
             raw = self._noise_out_b2[b].float().cpu().numpy()
             unnorm = unnormalize_actions(raw, self.norm_stats)
             entry = {"actions": unnorm[:, :LIBERO_ACTION_DIM]}
+            if self.rtc_prefix_len:
+                entry["rtc_raw_actions"] = raw.copy()
             if return_noise:
                 entry["noise"] = self._noise_buf_b2[b].float().cpu().numpy()
             if prefix is not None:

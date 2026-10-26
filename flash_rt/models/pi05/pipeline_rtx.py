@@ -1777,6 +1777,10 @@ class Pi05Pipeline:
     # ══════════════════════════════════════════════════════════════════
 
     def _copy_rtc_prefix(self, prefix_len: int, stream: int = 0) -> None:
+        lock = getattr(self, "_rtc_dynamic_lock", None)
+        if lock is not None:
+            lock.apply(self.bufs["diffusion_noise"], stream, self._cudart)
+            return
         if prefix_len <= 0:
             return
         if prefix_len > self.chunk_size:

@@ -874,7 +874,10 @@ class Pi05BatchedPipeline(Pi05Pipeline):
         m = self.B * ds
         fused = self.use_fp8_decoder and self.fp8_calibrated
 
+        lock = getattr(self, "_rtc_dynamic_lock_batched", None)
         for step in range(self.num_steps):
+            if lock is not None:
+                lock.apply(Bb["diffusion_noise_b2"], stream, self._cudart)
             skinny_step = fused and self._skinny
             if skinny_step:
                 rc = fvk.pi05_dec_skinny_action_in_norm(
@@ -924,6 +927,8 @@ class Pi05BatchedPipeline(Pi05Pipeline):
                         trace_x, trace_delta, m, self._skinny_pdl, stream)
                 if rc != 0:
                     raise RuntimeError(f"skinny decoder action_out failed: cudaError {rc}")
+                if lock is not None:
+                    lock.apply(Bb["diffusion_noise_b2"], stream, self._cudart)
                 continue
 
             # C8: Final AdaRMSNorm + output projection
@@ -958,6 +963,8 @@ class Pi05BatchedPipeline(Pi05Pipeline):
                     Bb["diffusion_noise_b2"].ptr.value,
                     Bb["decoder_action_buf_b2"].ptr.value,
                     m * ACTION_DIM, stream=stream)
+            if lock is not None:
+                lock.apply(Bb["diffusion_noise_b2"], stream, self._cudart)
 
     def _decoder_layer_batched(self, i: int, step: int, enc_seq: int,
                                 ds: int, m: int, skip_c1: bool,

@@ -719,3 +719,30 @@ When adding a new model or kernel, read these in order:
    `fvk` kernels grouped by purpose, current production fusion
    patterns, what does and does not fuse, and the catalog of failed
    optimizations (OPT-3 / OPT-5 / v1.5-B2 / v1.5-B4) to avoid.
+
+
+## RTX Pi0.5 request-level Prefix RTC
+
+The Torch RTX frontend accepts `rtc_prefix_len` at construction. A positive
+value enables resident per-slot prefix buffers. `infer(...,
+rtc_prev_action_chunk=raw, rtc_prefix_len=n, seed=seed)` locks the first `n`
+normalized action rows during every denoising update. Bootstrap requests use
+`rtc_prefix_len=0`. Enabled frontends return `rtc_raw_actions` with shape
+`(chunk_size, 32)` alongside unnormalized robot actions; history must use this
+raw output, not the seven-dimensional robot actions. A single call may supply
+`seed` or `generator`, but not both.
+
+`infer_multi_prompt_batch` accepts one canonical request dictionary per slot,
+with `observation`, `prompt`, and optional `rtc_prev_action_chunk` and
+`rtc_prefix_len`. Prefix lengths may differ across slots; changing them updates
+buffer values without replacing the captured graph. A zero-length slot remains
+unlocked, including after a previous request locked that slot. Requests that
+require a prefix fail explicitly if the frontend was constructed without RTC.
+CFG and SDE combinations are outside the validated Prefix RTC path.
+
+The initial integration checks FP8, fixed prompt capacity 48, 10 denoising
+steps, action horizon 10, and B1/B2. This is a graph/protocol contract; it does
+not establish task success or numerical equality between B1 and B2. Run the
+opt-in device contract with `FLASHRT_RUN_RTX_PREFIX_GPU=1` and
+`PI05_CHECKPOINT=/path/to/checkpoint` using
+`python -m pytest tests/test_pi05_rtx_prefix_rtc.py -q`.
