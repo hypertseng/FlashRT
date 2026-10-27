@@ -2577,7 +2577,9 @@ class Pi05TorchFrontendRtx:
                or int(item.get("rtc_prefix_len", 0) or 0) for item in requests):
             raise ValueError("Worker was not initialized with Prefix RTC")
         self.select_batch_size(len(requests))
-        states = [item.get("state") if item.get("state") is not None
+        # An explicit None disables state conditioning (e.g. Prefix RTC).
+        # Only callers omitting the key inherit observation state.
+        states = [item["state"] if "state" in item
                   else item["observation"].get("state") for item in requests]
         self.set_prompt_batch([item["prompt"] for item in requests], states=states)
         observations = [item["observation"] for item in requests]

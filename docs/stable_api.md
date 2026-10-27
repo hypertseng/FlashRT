@@ -740,6 +740,11 @@ unlocked, including after a previous request locked that slot. Requests that
 require a prefix fail explicitly if the frontend was constructed without RTC.
 CFG and SDE combinations are outside the validated Prefix RTC path.
 
+Canonical request dictionaries distinguish an omitted `state` key from an
+explicit `state=None`: omission inherits `observation["state"]`, while `None`
+disables state conditioning. Lingshu Prefix RTC explicitly disables it; VLASh
+supplies the measured or projected state and needs sufficient prompt capacity.
+
 The initial integration checks FP8, fixed prompt capacity 48, 10 denoising
 steps, action horizon 10, and B1/B2. This is a graph/protocol contract; it does
 not establish task success or numerical equality between B1 and B2. Run the

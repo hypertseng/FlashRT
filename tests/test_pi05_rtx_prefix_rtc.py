@@ -23,11 +23,31 @@ def test_invalid_prefix_is_rejected_before_checkpoint_loading(length):
 def test_disabled_prefix_fails_before_batch_selection():
     fe = frontend_type().__new__(frontend_type())
     fe._lifecycle_lock = threading.RLock()
+    fe._reload_failed = False
     fe.rtc_prefix_len = 0
     with pytest.raises(ValueError, match="not initialized"):
         fe.infer_multi_prompt_batch([
             {"prompt": "test", "observation": {}, "rtc_prefix_len": 2}
         ])
+
+
+@pytest.mark.parametrize("explicit_none", [True, False])
+def test_explicit_none_controls_observation_state_fallback(explicit_none):
+    fe = frontend_type().__new__(frontend_type())
+    fe._lifecycle_lock = threading.RLock()
+    fe._reload_failed = False
+    fe.rtc_prefix_len = 0
+    fe.calibrated = True
+    seen = []
+    fe.select_batch_size = lambda size: None
+    fe.set_prompt_batch = lambda prompts, states: seen.extend(states)
+    fe.infer_batch = lambda observations, **kwargs: []
+    state = np.zeros(8, np.float32)
+    item = {"prompt": "test", "observation": {"state": state}}
+    if explicit_none:
+        item["state"] = None
+    fe.infer_multi_prompt_batch([item])
+    assert seen[0] is (None if explicit_none else state)
 
 
 @pytest.mark.skipif(os.getenv("FLASHRT_RUN_RTX_PREFIX_GPU") != "1",
@@ -44,7 +64,8 @@ def test_fixed48_prefix_locks_slots_without_replacing_graphs():
             "wrist_image": rng.integers(0, 256, (224, 224, 3), dtype=np.uint8),
             "state": np.zeros(8, np.float32)} for _ in range(2)]
     prompts = ["pick up the red block", "pick up the blue block"]
-    fe.set_prompt(prompts[0], state=obs[0]["state"])
+    # Lingshu Prefix RTC is image+text; measured state is VLASh-only.
+    fe.set_prompt(prompts[0], state=None)
     fe.calibrate(obs[0])
     initial = fe.infer(obs[0], seed=7, rtc_prefix_len=0)
     graph = fe.pipeline._graph
@@ -58,7 +79,7 @@ def test_fixed48_prefix_locks_slots_without_replacing_graphs():
     with pytest.raises(ValueError, match="raw previous"):
         fe.infer(obs[0], rtc_prefix_len=2)
 
-    items = [{"prompt": p, "observation": o, "rtc_prefix_len": 0}
+    items = [{"prompt": p, "observation": o, "state": None, "rtc_prefix_len": 0}
              for p, o in zip(prompts, obs)]
     initial_batch = fe.infer_multi_prompt_batch(items, seed=7)
     batch_graph = fe.pipeline._graph
@@ -78,7 +99,7 @@ def test_fixed48_prefix_locks_slots_without_replacing_graphs():
             else:
                 np.testing.assert_array_equal(row["rtc_raw_actions"], reference["rtc_raw_actions"])
     fe.set_batched_mode(enable=False)
-    fe.set_prompt(prompts[0], state=obs[0]["state"])
+    fe.set_prompt(prompts[0], state=None)
     restored = fe.infer(obs[0], seed=7, rtc_prefix_len=0)
     assert fe.pipeline._graph is graph
     np.testing.assert_array_equal(restored["rtc_raw_actions"], raw)
