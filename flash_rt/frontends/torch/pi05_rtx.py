@@ -666,7 +666,7 @@ class Pi05TorchFrontendRtx:
         if scratch_max:
             from flash_rt.core.cuda_buffer import CudaBuffer
             from flash_rt.models.pi05.batch_scratch_arena import BatchScratchArena
-            self._batch_scratch_arena = BatchScratchArena(scratch_max, CudaBuffer.device_empty)
+            self._batch_scratch_arena = BatchScratchArena(scratch_max, CudaBuffer.device_empty, CudaBuffer.device_zeros)
         self._reload_failed = False
         self._decoder_kernel = (decoder_kernel
                                 or os.environ.get("FLASHRT_PI05_DECODER_KERNEL", "cublaslt"))

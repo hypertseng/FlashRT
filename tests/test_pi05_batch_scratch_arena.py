@@ -22,3 +22,17 @@ def test_rejects_unsafe_growth_and_incompatible_layout():
     with pytest.raises(ValueError): arena.acquire("x", 4 * 11, "bf16", batch_size=4)
     with pytest.raises(ValueError): arena.acquire("x", 4 * 10, "fp8", batch_size=4)
     with pytest.raises(ValueError): arena.acquire("y", 21, "bf16", batch_size=2)
+
+
+def test_padded_zero_scratch_reuses_maximum_allocation():
+    allocations = []
+    def zeroed(count, dtype):
+        allocations.append((count, dtype))
+        return Buffer(count, dtype)
+    arena = BatchScratchArena(max_batch_size=10, allocator=Buffer, zero_allocator=zeroed)
+    first = arena.acquire("fp8", 3 * 128, "fp8", batch_size=2, extra_rows=1, zeroed=True)
+    assert first.count == 11 * 128
+    assert arena.acquire("fp8", 9 * 128, "fp8", batch_size=8, extra_rows=1, zeroed=True) is first
+    assert allocations == [(11 * 128, "fp8")]
+    with pytest.raises(ValueError):
+        arena.acquire("fp8", 8 * 128, "fp8", batch_size=8)

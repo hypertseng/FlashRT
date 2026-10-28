@@ -96,10 +96,10 @@ class Pi05BatchedPipeline(Pi05Pipeline):
     #   B-fold buffer allocation (additive — parent buffers untouched)
     # ══════════════════════════════════════════════════════════════════
 
-    def _scratch_buffer(self, name, count, dtype):
+    def _scratch_buffer(self, name, count, dtype, *, extra_rows=0, zeroed=False):
         if self._shared_scratch_arena is None:
-            return CudaBuffer.device_empty(count, dtype)
-        return self._shared_scratch_arena.acquire(name, count, dtype, batch_size=self.B)
+            return (CudaBuffer.device_zeros if zeroed else CudaBuffer.device_empty)(count, dtype)
+        return self._shared_scratch_arena.acquire(name, count, dtype, batch_size=self.B, extra_rows=extra_rows, zeroed=zeroed)
 
     def _allocate_b2_buffers(self) -> None:
         """Allocate B=N-folded versions of every per-sample working buffer.
@@ -167,19 +167,19 @@ class Pi05BatchedPipeline(Pi05Pipeline):
         # so quantize_fp8_static and downstream FP8 GEMM cannot trip a
         # by-one overflow at the buffer boundary on the batched path.
         if self.use_fp8:
-            self.bufs["vis_act_fp8_b2"] = CudaBuffer.device_zeros(
-                (B + 1) * vs * VIS_D, FP8)
-            self.bufs["vis_act_fp8_large_b2"] = CudaBuffer.device_zeros(
-                (B + 1) * vs * VIS_H, FP8)
-            self.bufs["enc_act_fp8_b2"] = CudaBuffer.device_zeros(
-                (B + 1) * es * ENC_D, FP8)
-            self.bufs["enc_act_fp8_large_b2"] = CudaBuffer.device_zeros(
-                (B + 1) * es * 2 * ENC_H, FP8)
+            self.bufs["vis_act_fp8_b2"] = self._scratch_buffer("vis_act_fp8_b2",
+                (B + 1) * vs * VIS_D, FP8, extra_rows=1, zeroed=True)
+            self.bufs["vis_act_fp8_large_b2"] = self._scratch_buffer("vis_act_fp8_large_b2",
+                (B + 1) * vs * VIS_H, FP8, extra_rows=1, zeroed=True)
+            self.bufs["enc_act_fp8_b2"] = self._scratch_buffer("enc_act_fp8_b2",
+                (B + 1) * es * ENC_D, FP8, extra_rows=1, zeroed=True)
+            self.bufs["enc_act_fp8_large_b2"] = self._scratch_buffer("enc_act_fp8_large_b2",
+                (B + 1) * es * 2 * ENC_H, FP8, extra_rows=1, zeroed=True)
         if self.use_fp8_decoder:
-            self.bufs["dec_act_fp8_b2"] = CudaBuffer.device_zeros(
-                (B + 1) * ds * DEC_D, FP8)
-            self.bufs["dec_act_fp8_large_b2"] = CudaBuffer.device_zeros(
-                (B + 1) * ds * 2 * DEC_H, FP8)
+            self.bufs["dec_act_fp8_b2"] = self._scratch_buffer("dec_act_fp8_b2",
+                (B + 1) * ds * DEC_D, FP8, extra_rows=1, zeroed=True)
+            self.bufs["dec_act_fp8_large_b2"] = self._scratch_buffer("dec_act_fp8_large_b2",
+                (B + 1) * ds * 2 * DEC_H, FP8, extra_rows=1, zeroed=True)
 
         # Override parent's lazy ``_bias_zero_buf``. Parent allocates it
         # on first call to ``_bias_add_bf16`` sized for **B=1** vision
@@ -208,7 +208,7 @@ class Pi05BatchedPipeline(Pi05Pipeline):
             B * ds * ACTION_DIM,                 # decoder action_buf
             B * ds * DEC_D,                      # decoder generic
         )
-        self._bias_zero_buf = CudaBuffer.device_zeros(max_count, BF16)
+        self._bias_zero_buf = self._scratch_buffer("bias_zero_b2", max_count, BF16, zeroed=True)
 
         # B-tiled decoder style buffers.
         #
