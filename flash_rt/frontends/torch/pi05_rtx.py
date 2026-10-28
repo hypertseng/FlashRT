@@ -667,6 +667,12 @@ class Pi05TorchFrontendRtx:
             from flash_rt.core.cuda_buffer import CudaBuffer
             from flash_rt.models.pi05.batch_scratch_arena import BatchScratchArena
             self._batch_scratch_arena = BatchScratchArena(scratch_max, CudaBuffer.device_empty, CudaBuffer.device_zeros)
+        self._attention_scratch_arena = None
+        if os.environ.get("FLASHRT_BATCH_ATTN_SCRATCH", "0") == "1":
+            if not scratch_max:
+                raise ValueError("FLASHRT_BATCH_ATTN_SCRATCH requires FLASHRT_BATCH_SCRATCH_MAX")
+            from flash_rt.hardware.rtx.torch_batch_scratch_arena import TorchBatchScratchArena
+            self._attention_scratch_arena = TorchBatchScratchArena(scratch_max)
         self._reload_failed = False
         self._decoder_kernel = (decoder_kernel
                                 or os.environ.get("FLASHRT_PI05_DECODER_KERNEL", "cublaslt"))
@@ -2400,7 +2406,8 @@ class Pi05TorchFrontendRtx:
                 encoder_seq_max=enc_seq_max,
                 chunk_size=self.chunk_size,
                 num_encoder_layers=ENC_L,
-                batch_size=self._batch_size)
+                batch_size=self._batch_size,
+                scratch_arena=getattr(self, "_attention_scratch_arena", None))
             self.pipeline = None
             self.current_prompt_len = 0
             self.graph_recorded = False

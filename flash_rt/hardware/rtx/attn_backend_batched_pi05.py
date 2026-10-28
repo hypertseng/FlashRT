@@ -49,7 +49,7 @@ class RtxFlashAttnBatchedBackendPi05(RtxFlashAttnBackend):
     same kernel call with a larger leading dim covers N samples.
     """
 
-    def __init__(self, *args, batch_size: int = PI05_BATCH_SIZE, **kwargs):
+    def __init__(self, *args, batch_size: int = PI05_BATCH_SIZE, scratch_arena=None, **kwargs):
         super().__init__(*args, **kwargs)
         if int(batch_size) < 1:
             raise ValueError(f"batch_size must be >= 1, got {batch_size}")
@@ -133,14 +133,18 @@ class RtxFlashAttnBatchedBackendPi05(RtxFlashAttnBackend):
         _sig_splits = 2
         self._vis_lse_accum_b2 = torch.empty(_sig_splits, B * nv, 16, 256,
                                               dtype=torch.float32, device=d)
-        self._vis_o_accum_b2 = torch.empty(_sig_splits, B * nv, 16, 256, 96,
-                                            dtype=torch.float32, device=d)
+        vis_shape = (_sig_splits, B * nv, 16, 256, 96)
+        self._vis_o_accum_b2 = (torch.empty(vis_shape, dtype=torch.float32, device=d)
+            if scratch_arena is None else scratch_arena.acquire(
+                "vision_splitkv_output", vis_shape, batch_size=B, dtype=torch.float32))
         # Encoder
         _enc_splits = min(128, (es_max + 63) // 64)
         self._enc_lse_accum_b2 = torch.empty(_enc_splits, B, 8, es_max,
                                               dtype=torch.float32, device=d)
-        self._enc_o_accum_b2 = torch.empty(_enc_splits, B, 8, es_max, 256,
-                                            dtype=torch.float32, device=d)
+        enc_shape = (_enc_splits, B, 8, es_max, 256)
+        self._enc_o_accum_b2 = (torch.empty(enc_shape, dtype=torch.float32, device=d)
+            if scratch_arena is None else scratch_arena.acquire(
+                "encoder_splitkv_output", enc_shape, batch_size=B, dtype=torch.float32))
         # Decoder
         _dec_splits = min(128, (total_kv + 63) // 64)
         self._dec_lse_accum_b2 = torch.empty(_dec_splits, B, 8, ds,
