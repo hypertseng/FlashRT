@@ -661,6 +661,12 @@ class Pi05TorchFrontendRtx:
         # the library GEMMs, "skinny" requires the kernels. The environment
         # variable FLASHRT_PI05_DECODER_KERNEL overrides the default.
         self._lifecycle_lock = threading.RLock()
+        self._batch_scratch_arena = None
+        scratch_max = int(os.environ.get("FLASHRT_BATCH_SCRATCH_MAX", "0"))
+        if scratch_max:
+            from flash_rt.core.cuda_buffer import CudaBuffer
+            from flash_rt.models.pi05.batch_scratch_arena import BatchScratchArena
+            self._batch_scratch_arena = BatchScratchArena(scratch_max, CudaBuffer.device_empty)
         self._reload_failed = False
         self._decoder_kernel = (decoder_kernel
                                 or os.environ.get("FLASHRT_PI05_DECODER_KERNEL", "cublaslt"))
@@ -2656,6 +2662,7 @@ class Pi05TorchFrontendRtx:
             self.calibrated = False
             pipeline_weights = self._build_pipeline_weights()
             self.pipeline = Pi05BatchedPipeline(
+                scratch_arena=self._batch_scratch_arena,
                 gemm=self.gemm, fvk=self.fvk, attn_backend=self.attn_backend,
                 weights=pipeline_weights,
                 num_views=self.num_views,

@@ -65,7 +65,8 @@ class Pi05BatchedPipeline(Pi05Pipeline):
     path has its B-folded Q/K/V/output buffers available.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, scratch_arena=None, **kwargs):
+        self._shared_scratch_arena = scratch_arena
         super().__init__(*args, **kwargs)
         if not isinstance(self.attn, RtxFlashAttnBatchedBackendPi05):
             raise TypeError(
@@ -95,6 +96,11 @@ class Pi05BatchedPipeline(Pi05Pipeline):
     #   B-fold buffer allocation (additive — parent buffers untouched)
     # ══════════════════════════════════════════════════════════════════
 
+    def _scratch_buffer(self, name, count, dtype):
+        if self._shared_scratch_arena is None:
+            return CudaBuffer.device_empty(count, dtype)
+        return self._shared_scratch_arena.acquire(name, count, dtype, batch_size=self.B)
+
     def _allocate_b2_buffers(self) -> None:
         """Allocate B=N-folded versions of every per-sample working buffer.
 
@@ -123,11 +129,11 @@ class Pi05BatchedPipeline(Pi05Pipeline):
                 B * es * ENC_D, BF16)
 
         # ── Vision ──
-        self.bufs["vision_x_b2"] = CudaBuffer.device_empty(B * vs * VIS_D, BF16)
-        self.bufs["vision_x_norm_b2"] = CudaBuffer.device_empty(B * vs * VIS_D, BF16)
-        self.bufs["vision_QKV_b2"] = CudaBuffer.device_empty(B * vs * 3 * VIS_D, BF16)
-        self.bufs["vision_hidden_b2"] = CudaBuffer.device_empty(B * vs * VIS_H, BF16)
-        self.bufs["vision_patches_b2"] = CudaBuffer.device_empty(
+        self.bufs["vision_x_b2"] = self._scratch_buffer("vision_x_b2", B * vs * VIS_D, BF16)
+        self.bufs["vision_x_norm_b2"] = self._scratch_buffer("vision_x_norm_b2", B * vs * VIS_D, BF16)
+        self.bufs["vision_QKV_b2"] = self._scratch_buffer("vision_QKV_b2", B * vs * 3 * VIS_D, BF16)
+        self.bufs["vision_hidden_b2"] = self._scratch_buffer("vision_hidden_b2", B * vs * VIS_H, BF16)
+        self.bufs["vision_patches_b2"] = self._scratch_buffer("vision_patches_b2",
             B * vs * VIS_PATCH_FLAT, BF16)
         # Pos embed expanded across (B*nv) views — replicate parent's
         # vision_pos_embed_expanded (single-sample, vs * VIS_D) twice in M.
@@ -136,25 +142,25 @@ class Pi05BatchedPipeline(Pi05Pipeline):
         self._fill_pos_embed_b2()
 
         # ── Encoder ──
-        self.bufs["encoder_x_b2"] = CudaBuffer.device_empty(B * es * ENC_D, BF16)
-        self.bufs["encoder_x_norm_b2"] = CudaBuffer.device_empty(B * es * ENC_D, BF16)
-        self.bufs["encoder_QKV_b2"] = CudaBuffer.device_empty(
+        self.bufs["encoder_x_b2"] = self._scratch_buffer("encoder_x_b2", B * es * ENC_D, BF16)
+        self.bufs["encoder_x_norm_b2"] = self._scratch_buffer("encoder_x_norm_b2", B * es * ENC_D, BF16)
+        self.bufs["encoder_QKV_b2"] = self._scratch_buffer("encoder_QKV_b2",
             B * es * (ENC_NH + 2 * ENC_NKV) * ENC_HD, BF16)
-        self.bufs["encoder_hidden_b2"] = CudaBuffer.device_empty(B * es * ENC_H, BF16)
-        self.bufs["encoder_gate_merged_b2"] = CudaBuffer.device_empty(
+        self.bufs["encoder_hidden_b2"] = self._scratch_buffer("encoder_hidden_b2", B * es * ENC_H, BF16)
+        self.bufs["encoder_gate_merged_b2"] = self._scratch_buffer("encoder_gate_merged_b2",
             B * es * 2 * ENC_H, BF16)
 
         # ── Decoder ──
-        self.bufs["decoder_x_b2"] = CudaBuffer.device_empty(B * ds * DEC_D, BF16)
+        self.bufs["decoder_x_b2"] = self._scratch_buffer("decoder_x_b2", B * ds * DEC_D, BF16)
         self.bufs["decoder_action_buf_b2"] = CudaBuffer.device_empty(
             B * ds * ACTION_DIM, BF16)
-        self.bufs["decoder_QKV_b2"] = CudaBuffer.device_empty(
+        self.bufs["decoder_QKV_b2"] = self._scratch_buffer("decoder_QKV_b2",
             B * ds * (DEC_NH + 2 * DEC_NKV) * DEC_HD, BF16)
-        self.bufs["decoder_hidden_b2"] = CudaBuffer.device_empty(B * ds * DEC_H, BF16)
-        self.bufs["decoder_gate_merged_b2"] = CudaBuffer.device_empty(
+        self.bufs["decoder_hidden_b2"] = self._scratch_buffer("decoder_hidden_b2", B * ds * DEC_H, BF16)
+        self.bufs["decoder_gate_merged_b2"] = self._scratch_buffer("decoder_gate_merged_b2",
             B * ds * 2 * DEC_H, BF16)
-        self.bufs["x_normed_buf_b2"] = CudaBuffer.device_empty(B * ds * DEC_D, BF16)
-        self.bufs["gate_buf_b2"] = CudaBuffer.device_empty(B * ds * DEC_D, BF16)
+        self.bufs["x_normed_buf_b2"] = self._scratch_buffer("x_normed_buf_b2", B * ds * DEC_D, BF16)
+        self.bufs["gate_buf_b2"] = self._scratch_buffer("gate_buf_b2", B * ds * DEC_D, BF16)
 
         # ── FP8 activation scratch (B-folded) ──
         # Each scratch buffer is allocated with one extra row of slack

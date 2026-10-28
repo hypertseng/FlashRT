@@ -86,6 +86,7 @@ def test_fixed_overflow_rejected_before_graph_replacement():
 
 def test_request_level_rtc_is_refused_instead_of_ignored():
     f = frontend()
+    f.rtc_prefix_len = 0
     with pytest.raises(ValueError, match="RTC"):
         f.infer_multi_prompt_batch([{"rtc_prefix_len": 1}])
 
