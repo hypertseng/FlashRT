@@ -28,3 +28,10 @@ def offload_candidates(weights, fp8, layers, *, vision_layers=None, decoder_laye
     moved = {key: weights[key].to("cpu") for key in groups}
     weights.update(moved)
     return set(groups)
+
+
+def release_reload_cache(enabled):
+    if enabled:
+        import torch
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()

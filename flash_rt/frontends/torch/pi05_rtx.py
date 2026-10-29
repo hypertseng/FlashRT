@@ -1285,6 +1285,9 @@ class Pi05TorchFrontendRtx:
                                       states=getattr(self, "_batch_prompt_states", None))
         torch.cuda.synchronize()
         self._weight_version = self.weight_version + 1
+        if os.environ.get("FLASHRT_RELOAD_RELEASE_CACHE", "0") == "1":
+            from .fp8_bf16_offload import release_reload_cache
+            release_reload_cache(True)
         elapsed = time.perf_counter() - t0
         phases["prompt"] = elapsed - sum(phases.values())
         self._last_reload_phases = phases

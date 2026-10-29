@@ -38,3 +38,13 @@ def test_incomplete_one_group_does_not_mutate_weights():
     with pytest.raises(ValueError):
         offload_candidates(weights, fp8, 2, vision_layers=2, decoder_layers=2)
     assert all(weights[k] is originals[k] for k in weights)
+
+def test_reload_cache_cleanup_is_opt_in(monkeypatch):
+    from flash_rt.frontends.torch.fp8_bf16_offload import release_reload_cache
+    calls = []
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: calls.append("sync"))
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("empty"))
+    release_reload_cache(False)
+    assert calls == []
+    release_reload_cache(True)
+    assert calls == ["sync", "empty"]
