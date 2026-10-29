@@ -36,3 +36,14 @@ def test_padded_zero_scratch_reuses_maximum_allocation():
     assert allocations == [(11 * 128, "fp8")]
     with pytest.raises(ValueError):
         arena.acquire("fp8", 8 * 128, "fp8", batch_size=8)
+
+def test_fixed_parent_scratch_reuses_exact_capacity():
+    arena = BatchScratchArena(max_batch_size=12, allocator=Buffer)
+    first = arena.acquire_fixed("parent_encoder", 120, "bf16")
+    second = arena.acquire_fixed("parent_encoder", 120, "bf16")
+    assert first is second
+    assert first.count == 120
+    with pytest.raises(ValueError):
+        arena.acquire_fixed("parent_encoder", 121, "bf16")
+    with pytest.raises(ValueError):
+        arena.acquire_fixed("parent_encoder", 120, "fp8")

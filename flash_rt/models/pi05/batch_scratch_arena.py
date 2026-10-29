@@ -27,3 +27,18 @@ class BatchScratchArena:
         buf = allocator(per_sample * (self.max_batch_size + extra_rows), dtype)
         self._buffers[key] = (buf, per_sample, dtype, extra_rows, zeroed)
         return buf
+
+    def acquire_fixed(self, name, count, dtype, *, zeroed=False):
+        key = "fixed:" + str(name)
+        layout = (int(count), dtype, bool(zeroed))
+        if key in self._buffers:
+            buf, prior = self._buffers[key]
+            if prior != layout:
+                raise ValueError("fixed scratch layout changed after graph capture")
+            return buf
+        allocator = self._zero_allocator if zeroed else self._allocator
+        if allocator is None or count <= 0:
+            raise ValueError("invalid fixed scratch allocator or size")
+        buf = allocator(count, dtype)
+        self._buffers[key] = (buf, layout)
+        return buf

@@ -354,6 +354,13 @@ class Pi05Pipeline:
     #   Buffer allocation
     # ══════════════════════════════════════════════════════════════════
 
+    def _parent_workspace(self, name, count, dtype, *, zeroed=False):
+        arena = getattr(self, "_shared_scratch_arena", None)
+        if arena is not None and os.environ.get("FLASHRT_PARENT_SCRATCH_SHARE", "0") == "1":
+            return arena.acquire_fixed("parent:" + name, count, dtype, zeroed=zeroed)
+        alloc = CudaBuffer.device_zeros if zeroed else CudaBuffer.device_empty
+        return alloc(count, dtype)
+
     def _allocate_buffers(self) -> dict:
         """Allocate all pipeline working buffers as CudaBuffer."""
         nv = self.num_views
@@ -386,11 +393,11 @@ class Pi05Pipeline:
         B["encoder_x"] = CudaBuffer.device_empty(es * ENC_D, BF16)
         B["encoder_x_norm"] = CudaBuffer.device_empty(es * ENC_D, BF16)
         B["encoder_QKV"] = CudaBuffer.device_empty(es * (ENC_NH + 2 * ENC_NKV) * ENC_HD, BF16)
-        B["encoder_hidden"] = CudaBuffer.device_empty(es * ENC_H, BF16)
+        B["encoder_hidden"] = self._parent_workspace("encoder_hidden", es * ENC_H, BF16)
         # Merged gate+up output (legacy BF16 path) or gate-only buffer for SiLU-gated.
-        B["encoder_gate_merged"] = CudaBuffer.device_empty(es * 2 * ENC_H, BF16)
+        B["encoder_gate_merged"] = self._parent_workspace("encoder_gate_merged", es * 2 * ENC_H, BF16)
         # Gate buffer for SiLU-gated EVT fusion (encoder): (es, ENC_H) BF16
-        B["encoder_gate_buf"] = CudaBuffer.device_empty(es * ENC_H, BF16)
+        B["encoder_gate_buf"] = self._parent_workspace("encoder_gate_buf", es * ENC_H, BF16)
 
         # ── Decoder (Gemma-300M) ──
         B["decoder_rope_weights"] = CudaBuffer.device_empty(ds * 256, BF16)
@@ -451,7 +458,7 @@ class Pi05Pipeline:
 
         # Encoder FP8 scratch — D=2048, H_merged=32768 (2*16384)
         B["enc_act_fp8"] = CudaBuffer.device_zeros(es * ENC_D, FP8)
-        B["enc_act_fp8_large"] = CudaBuffer.device_zeros(es * 2 * ENC_H, FP8)
+        B["enc_act_fp8_large"] = self._parent_workspace("enc_act_fp8_large", es * 2 * ENC_H, FP8, zeroed=True)
         B["enc_act_scale"] = CudaBuffer.device_zeros(1, FP32)
 
         # Decoder FP8 scratch — D=1024, H_merged=8192
