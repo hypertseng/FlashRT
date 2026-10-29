@@ -843,6 +843,16 @@ class Pi05TorchFrontendRtx:
         # ── Pre-compute decoder styles (time MLP + style modulation) ──
         self._precomputed_styles = _precompute_decoder_styles(
             self._ckpt_bf16, self.chunk_size, num_steps=self._num_steps)
+        self._offloaded_fp8_bf16 = set()
+        if os.environ.get("FLASHRT_FP8_OFFLOAD_ENCODER_GATE", "0") == "1":
+            if (not self.use_fp8 or self._force_bf16 or self._force_int8_decoder
+                    or self._use_int8_encoder or self._prefix_precision != "fp8"):
+                raise ValueError("FP8 BF16 offload requires the FP8 encoder")
+            from .fp8_bf16_offload import offload_candidates
+            self._offloaded_fp8_bf16 = offload_candidates(
+                self._ckpt_bf16, self._fp8_weights, ENC_L)
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
         # ── Attention backend (torch, owns Q/K/V/O) ──
         enc_seq_max = self.num_views * 256 + self.max_prompt_len
@@ -1189,6 +1199,8 @@ class Pi05TorchFrontendRtx:
         """
         if self._int8_weights or self._force_int8_decoder:
             raise NotImplementedError("weight reload is not available for INT8 modes")
+        if getattr(self, "_offloaded_fp8_bf16", None):
+            raise NotImplementedError("weight reload requires BF16 weights on GPU; disable FP8 offload")
         t0 = time.perf_counter()
         if isinstance(source, (str, pathlib.Path)):
             from safetensors.torch import load_file
@@ -1476,6 +1488,8 @@ class Pi05TorchFrontendRtx:
 
         def p_list(key: str) -> list[int]:
             t = W[key]
+            if key in getattr(self, "_offloaded_fp8_bf16", ()):
+                return [0] * t.shape[0]
             stride = t.stride(0) * t.element_size()
             base = t.data_ptr()
             return [base + i * stride for i in range(t.shape[0])]
