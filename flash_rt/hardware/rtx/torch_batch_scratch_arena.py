@@ -23,3 +23,14 @@ class TorchBatchScratchArena:
         if old_count != per_sample or old_dtype != dtype:
             raise ValueError("scratch layout changed after graph capture")
         return base[:count].view(shape)
+
+    def compact(self, name, source, *, batch_size, max_sequence):
+        # Allocate the maximum supported sequence once; graph-visible
+        # views have packed per-batch strides for the actual sequence.
+        if source.ndim < 2 or source.shape[0] != batch_size or source.shape[1] > max_sequence:
+            raise ValueError("invalid compact workspace shape")
+        shape = (batch_size, int(max_sequence), *source.shape[2:])
+        workspace = self.acquire(name, shape, batch_size=batch_size, dtype=source.dtype)
+        view = workspace.view(-1)[:source.numel()].view(source.shape)
+        view.copy_(source)
+        return view

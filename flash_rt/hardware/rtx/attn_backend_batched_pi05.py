@@ -22,6 +22,7 @@ still require B=2.
 from __future__ import annotations
 
 import logging
+import os
 
 from .attn_backend import RtxFlashAttnBackend
 
@@ -51,6 +52,9 @@ class RtxFlashAttnBatchedBackendPi05(RtxFlashAttnBackend):
 
     def __init__(self, *args, batch_size: int = PI05_BATCH_SIZE, scratch_arena=None, **kwargs):
         super().__init__(*args, **kwargs)
+        self._compact_kv_arena = (scratch_arena if os.environ.get("FLASHRT_BATCH_COMPACT_KV", "0") == "1" else None)
+        if os.environ.get("FLASHRT_BATCH_COMPACT_KV", "0") == "1" and scratch_arena is None:
+            raise ValueError("FLASHRT_BATCH_COMPACT_KV requires FLASHRT_BATCH_ATTN_SCRATCH")
         if int(batch_size) < 1:
             raise ValueError(f"batch_size must be >= 1, got {batch_size}")
         self._batch_size = int(batch_size)
@@ -255,8 +259,16 @@ class RtxFlashAttnBatchedBackendPi05(RtxFlashAttnBackend):
         v = self.enc_V_b2[layer_idx, :, :seq]
         o = self._enc_O_b2[:, :seq].contiguous()
         q_c = q.contiguous()
-        k_c = k.contiguous()
-        v_c = v.contiguous()
+        if self._compact_kv_arena is None:
+            k_c = k.contiguous()
+            v_c = v.contiguous()
+        else:
+            k_c = self._compact_kv_arena.compact(
+                "encoder_compact_k", k, batch_size=self._batch_size,
+                max_sequence=self._encoder_seq_max)
+            v_c = self._compact_kv_arena.compact(
+                "encoder_compact_v", v, batch_size=self._batch_size,
+                max_sequence=self._encoder_seq_max)
         if self._batched_valid_lens:
             self._call_fvk_fa2_seqused_splitkv(q_c, k_c, v_c,
                 o, self._enc_lse_b2, self.enc_seqused_b2, stream=stream,
