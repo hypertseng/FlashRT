@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import os
 
 from flash_rt.core.cuda_buffer import CudaBuffer
 from flash_rt.hardware.rtx.attn_backend_batched_pi05 import (
@@ -67,6 +68,9 @@ class Pi05BatchedPipeline(Pi05Pipeline):
 
     def __init__(self, *args, scratch_arena=None, **kwargs):
         self._shared_scratch_arena = scratch_arena
+        self._share_batch_styles = os.environ.get("FLASHRT_BATCH_STYLE_SHARE", "0") == "1"
+        if self._share_batch_styles and scratch_arena is None:
+            raise ValueError("FLASHRT_BATCH_STYLE_SHARE requires FLASHRT_BATCH_SCRATCH_MAX")
         super().__init__(*args, **kwargs)
         if not isinstance(self.attn, RtxFlashAttnBatchedBackendPi05):
             raise TypeError(
@@ -243,7 +247,11 @@ class Pi05BatchedPipeline(Pi05Pipeline):
         ``*_b2`` buffers (allocated on the first call, uploaded in place
         afterwards so a weight reload never moves them)."""
         import numpy as np
-        B = self.B
+        # Shared layouts use the same max-width stride for every graph.
+        # Reload writes every live pipeline under the frontend reload guard,
+        # without changing captured device addresses.
+        B = (self._shared_scratch_arena.max_batch_size
+             if self._share_batch_styles else self.B)
         pre = self.weights["precomputed"]
         # style_attn / style_ffn: (num_steps, DEC_L, ds, 3*DEC_D)
         sa = np.ascontiguousarray(np.tile(pre["style_attn"], (1, 1, B, 1)))
@@ -252,11 +260,17 @@ class Pi05BatchedPipeline(Pi05Pipeline):
         sfin = np.ascontiguousarray(np.tile(pre["style_final"], (1, B, 1)))
         for key, arr in (("decoder_style_attn_b2", sa), ("decoder_style_ffn_b2", sf),
                          ("decoder_style_final_b2", sfin)):
-            buf = self.bufs.get(key)
-            if buf is not None and buf.nbytes == arr.nbytes:
+            if self._share_batch_styles:
+                buf = self._shared_scratch_arena.acquire(
+                    key, arr.size, arr.dtype, batch_size=B)
+                self.bufs[key] = buf
                 buf.upload(arr)
             else:
-                self.bufs[key] = CudaBuffer.from_numpy(arr)
+                buf = self.bufs.get(key)
+                if buf is not None and buf.nbytes == arr.nbytes:
+                    buf.upload(arr)
+                else:
+                    self.bufs[key] = CudaBuffer.from_numpy(arr)
 
     def _upload_precomputed_styles(self) -> None:
         super()._upload_precomputed_styles()
@@ -282,7 +296,9 @@ class Pi05BatchedPipeline(Pi05Pipeline):
         b2_key = buf_name + "_b2"
         base = self.bufs[b2_key].ptr.value
         # Per-row size is 3 * DEC_D * 2 bytes; per-slice has B*ds rows.
-        per_slice = self.B * self.chunk_size * 3 * DEC_D * 2
+        stride_batch = (self._shared_scratch_arena.max_batch_size
+                        if self._share_batch_styles else self.B)
+        per_slice = stride_batch * self.chunk_size * 3 * DEC_D * 2
         if buf_name == "decoder_style_final":
             return base + step * per_slice
         # style_attn / style_ffn: (num_steps, DEC_L, B*ds, 3*DEC_D)
