@@ -850,7 +850,8 @@ class Pi05TorchFrontendRtx:
                 raise ValueError("FP8 BF16 offload requires the FP8 encoder")
             from .fp8_bf16_offload import offload_candidates
             self._offloaded_fp8_bf16 = offload_candidates(
-                self._ckpt_bf16, self._fp8_weights, ENC_L)
+                self._ckpt_bf16, self._fp8_weights, ENC_L,
+                vision_layers=VIS_L, decoder_layers=DEC_L)
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
@@ -1082,6 +1083,8 @@ class Pi05TorchFrontendRtx:
             self._fp8_store_index = store_index
 
         def quant(name: str, w: torch.Tensor):
+            if not w.is_cuda:
+                w = w.to("cuda")
             if self.fp8_layout == "nk":
                 w = w.t().contiguous()
             else:
@@ -1199,8 +1202,6 @@ class Pi05TorchFrontendRtx:
         """
         if self._int8_weights or self._force_int8_decoder:
             raise NotImplementedError("weight reload is not available for INT8 modes")
-        if getattr(self, "_offloaded_fp8_bf16", None):
-            raise NotImplementedError("weight reload requires BF16 weights on GPU; disable FP8 offload")
         t0 = time.perf_counter()
         if isinstance(source, (str, pathlib.Path)):
             from safetensors.torch import load_file
@@ -1248,7 +1249,7 @@ class Pi05TorchFrontendRtx:
                 raise ValueError(
                     f"reload_weights: {key} has shape {tuple(value.shape)}, "
                     f"loaded model has {tuple(dst.shape)}")
-            value = value.to("cuda", bf16)
+            value = value.to(dst.device, bf16)
             if key in ("decoder_action_out_proj_w", "decoder_action_out_proj_b"):
                 value = value * scale_out
             dst.copy_(value)
@@ -1484,6 +1485,8 @@ class Pi05TorchFrontendRtx:
         W = self._ckpt_bf16
 
         def p(key: str) -> int:
+            if key in getattr(self, "_offloaded_fp8_bf16", ()):
+                return 0
             return W[key].data_ptr()
 
         def p_list(key: str) -> list[int]:

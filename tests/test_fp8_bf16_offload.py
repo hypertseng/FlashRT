@@ -16,3 +16,25 @@ def test_offloads_pair_and_preserves_other_weights():
     assert result=={"encoder_ffn_gate_w","encoder_ffn_up_w"}
     assert weights["encoder_ffn_gate_w"].device.type=="cpu"
     assert weights["keep"] is keep
+
+def test_complete_fp8_map_offloads_all_quantized_groups():
+    from flash_rt.frontends.torch.fp8_bf16_offload import fp8_candidates
+    groups = fp8_candidates(2, 2, 2)
+    weights = {k: torch.ones(2, 3) for k in groups}
+    fp8 = {name:(123,456) for names in groups.values() for name in names}
+    result = offload_candidates(weights, fp8, 2, vision_layers=2, decoder_layers=2)
+    assert result == set(groups)
+    assert "encoder_ffn_down_w" in result
+    assert "vision_attn_qkv_w" in result
+    assert "decoder_ffn_down_w" in result
+
+def test_incomplete_one_group_does_not_mutate_weights():
+    from flash_rt.frontends.torch.fp8_bf16_offload import fp8_candidates
+    groups = fp8_candidates(2, 2, 2)
+    weights = {k: torch.ones(2, 3) for k in groups}
+    originals = dict(weights)
+    fp8 = {name:(123,456) for names in groups.values() for name in names}
+    fp8.pop("vision_attn_qkv_w_1")
+    with pytest.raises(ValueError):
+        offload_candidates(weights, fp8, 2, vision_layers=2, decoder_layers=2)
+    assert all(weights[k] is originals[k] for k in weights)
