@@ -55,6 +55,7 @@ def _load_pi05_rtx_symbols():
 def _setup_pi05_pipe(pipe_cls):
     pipe = pipe_cls.__new__(pipe_cls)
     pipe._gemms_autotuned = False
+    pipe._nvfp4 = {}
     pipe.use_fp8 = True
     pipe.fp8_calibrated = True
     pipe.use_int8_vision = False

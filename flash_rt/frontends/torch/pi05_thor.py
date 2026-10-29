@@ -843,6 +843,12 @@ class Pi05TorchFrontendThor:
 
         logger.info("Weights loaded for Pi05TorchFrontendThor")
 
+    def _thor_batch_scratch(self, name, shape, batch_size, dtype, *, device="cuda"):
+        arena = getattr(self, "_thor_scratch_arena", None)
+        if arena is None:
+            return torch.empty(shape, dtype=dtype, device=device)
+        return arena.acquire(name, shape, batch_size=batch_size, dtype=dtype)
+
     def _alloc_b2_buffers(self, B: int = 2, Se_dynamic: int = None) -> None:
         """Allocate all B=N inference buffers.
 
@@ -858,6 +864,18 @@ class Pi05TorchFrontendThor:
         """
         if B < 2:
             raise ValueError(f"_alloc_b2_buffers requires B >= 2; got {B}")
+        if os.environ.get("FLASHRT_THOR_BATCH_SCRATCH", "0") == "1":
+            max_batch = int(os.environ.get("FLASHRT_BATCH_SCRATCH_MAX", "0"))
+            if max_batch < B:
+                raise ValueError("Thor scratch requires FLASHRT_BATCH_SCRATCH_MAX >= batch")
+            if self._state_prompt_mode != "fixed":
+                raise ValueError("Thor shared scratch requires fixed prompt shape")
+            if getattr(self, "_thor_scratch_arena", None) is None:
+                from flash_rt.core.torch_batch_scratch_arena import TorchBatchScratchArena
+                self._thor_scratch_arena = TorchBatchScratchArena(max_batch)
+            elif self._thor_scratch_arena.max_batch_size != max_batch:
+                raise ValueError("Thor shared scratch capacity cannot change while graphs live")
+
         Le = self.Le; De = self.De; He = self.He
         NHe = self.NHe; HDe = self.HDe
         Sa = self.Sa; Da = self.Da; Ha = self.Ha; La = self.La
@@ -877,15 +895,15 @@ class Pi05TorchFrontendThor:
         H_sig = self.sig_H  # 4304
         self._sig_x_b2    = torch.zeros(B * S_sig, D_sig, dtype=fp16, device='cuda')
         self._sig_x_fp8_b2 = torch.zeros(B * S_sig * D_sig, dtype=torch.uint8, device='cuda')
-        self._sig_qkv_b2  = torch.empty(B * S_sig, 3 * D_sig, dtype=fp16, device='cuda')
-        self._sig_attn_b2 = torch.empty(B * S_sig, D_sig, dtype=fp16, device='cuda')
-        self._sig_hidden_b2 = torch.empty(B * S_sig, H_sig, dtype=fp16, device='cuda')
+        self._sig_qkv_b2  = self._thor_batch_scratch('_sig_qkv_b2', (B * S_sig, 3 * D_sig), B, fp16)
+        self._sig_attn_b2 = self._thor_batch_scratch('_sig_attn_b2', (B * S_sig, D_sig), B, fp16)
+        self._sig_hidden_b2 = self._thor_batch_scratch('_sig_hidden_b2', (B * S_sig, H_sig), B, fp16)
         self._sig_hid_fp8_b2 = torch.zeros(B * S_sig * H_sig, dtype=torch.uint8, device='cuda')
         self._sig_fg_b2 = (
             torch.empty(B * S_sig, D_sig, dtype=fp16, device='cuda')
             if not self._siglip_use_fp8 else None
         )
-        self._postln_scratch_b2 = torch.empty(B * S_sig, D_sig, dtype=fp16, device='cuda')
+        self._postln_scratch_b2 = self._thor_batch_scratch('_postln_scratch_b2', (B * S_sig, D_sig), B, fp16)
         self._postln_proj_b2 = (
             torch.empty(B * S_sig, self.De, dtype=fp16, device='cuda')
             if self.batched_postln_proj_fusion else None
@@ -928,26 +946,24 @@ class Pi05TorchFrontendThor:
         self._siglip_batched_B = B
 
         # ── Encoder buffers (B*Se, ...) ──
-        self._enc_x_b2     = torch.empty(B * Se_max, De, dtype=fp16, device='cuda')
+        self._enc_x_b2     = self._thor_batch_scratch('_enc_x_b2', (B * Se_max, De), B, fp16)
         self._enc_x_fp8_b2 = torch.zeros(B * Se_max * De, dtype=torch.uint8, device='cuda')
-        self._enc_qkv_buf_b2 = torch.empty(B * Se_max, 2560, dtype=fp16, device='cuda')
-        self._enc_logits_b2  = torch.empty(B * Se_max * NHe, total_keys_max,
-                                            dtype=fp16, device='cuda')  # scratch reused per sample
-        self._enc_attn_b2    = torch.empty(B * Se_max, NHe * HDe, dtype=fp16, device='cuda')
+        self._enc_qkv_buf_b2 = self._thor_batch_scratch('_enc_qkv_buf_b2', (B * Se_max, 2560), B, fp16)
+        self._enc_logits_b2  = self._thor_batch_scratch('_enc_logits_b2', (B * Se_max * NHe, total_keys_max), B, fp16)  # scratch reused per sample
+        self._enc_attn_b2    = self._thor_batch_scratch('_enc_attn_b2', (B * Se_max, NHe * HDe), B, fp16)
         self._enc_o_fp8_b2   = torch.zeros(B * Se_max * NHe * HDe, dtype=torch.uint8, device='cuda')
-        self._enc_gate_b2    = torch.empty(B * Se_max, 2 * He, dtype=fp16, device='cuda')
+        self._enc_gate_b2    = self._thor_batch_scratch('_enc_gate_b2', (B * Se_max, 2 * He), B, fp16)
         self._enc_hid_fp8_b2 = torch.zeros(B * Se_max * He, dtype=torch.uint8, device='cuda')
-        self._enc_fg_b2      = torch.empty(B * Se_max, De, dtype=fp16, device='cuda')
+        self._enc_fg_b2      = self._thor_batch_scratch('_enc_fg_b2', (B * Se_max, De), B, fp16)
 
         # ── Decoder buffers (B*Sa, ...) ──
-        self._ae_x_b2   = torch.empty(B * Sa, Da, dtype=fp16, device='cuda')
-        self._ae_xn_b2  = torch.empty(B * Sa, Da, dtype=fp16, device='cuda')
-        self._ae_gate_b2 = torch.empty(B * Sa, Da, dtype=fp16, device='cuda')
-        self._ae_qkv_b2 = torch.empty(B * Sa, 2560, dtype=fp16, device='cuda')
-        self._ae_logits_b2 = torch.empty(B * Sa * 8, total_keys_max,
-                                          dtype=fp16, device='cuda')  # scratch for each sample
-        self._ae_attn_b2 = torch.empty(B * Sa * 8, 256, dtype=fp16, device='cuda')
-        self._ae_fg_b2   = torch.empty(B * Sa, 2 * Ha, dtype=fp16, device='cuda')
+        self._ae_x_b2   = self._thor_batch_scratch('_ae_x_b2', (B * Sa, Da), B, fp16)
+        self._ae_xn_b2  = self._thor_batch_scratch('_ae_xn_b2', (B * Sa, Da), B, fp16)
+        self._ae_gate_b2 = self._thor_batch_scratch('_ae_gate_b2', (B * Sa, Da), B, fp16)
+        self._ae_qkv_b2 = self._thor_batch_scratch('_ae_qkv_b2', (B * Sa, 2560), B, fp16)
+        self._ae_logits_b2 = self._thor_batch_scratch('_ae_logits_b2', (B * Sa * 8, total_keys_max), B, fp16)  # scratch for each sample
+        self._ae_attn_b2 = self._thor_batch_scratch('_ae_attn_b2', (B * Sa * 8, 256), B, fp16)
+        self._ae_fg_b2   = self._thor_batch_scratch('_ae_fg_b2', (B * Sa, 2 * Ha), B, fp16)
         self._ae_action_f32_b2 = torch.empty(B * Sa, 32, dtype=torch.float32, device='cuda')
         self._ae_xn_fp8_b2  = torch.zeros(B * Sa * Da, dtype=torch.uint8, device='cuda')
         self._ae_hid_fp8_b2 = torch.zeros(B * Sa * Ha, dtype=torch.uint8, device='cuda')
