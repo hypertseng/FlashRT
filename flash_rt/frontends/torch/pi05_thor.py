@@ -140,6 +140,14 @@ from flash_rt.core.thor_frontend_utils import embed_prompt_torch as embed_prompt
 # ThorPipeline
 # ===========================================================================
 
+def _release_raw_checkpoint_cache(cache):
+    """Drop checkpoint source tensors after every cached key is converted."""
+    missing = set(cache["raw"]) - set(cache["fp16"])
+    if missing:
+        raise RuntimeError(f"raw checkpoint cache contains unconverted keys: {sorted(missing)}")
+    cache["raw"].clear()
+
+
 class Pi05TorchFrontendThor:
     """Complete Pi0.5 inference pipeline using only flash_rt_kernels.so.
 
@@ -743,6 +751,11 @@ class Pi05TorchFrontendThor:
         dp_full = 'paligemma_with_expert.gemma_expert'
         self._final_mod_w = g(f'{dp_full}.model.norm.dense.weight')
         self._final_mod_b = g(f'{dp_full}.model.norm.dense.bias')
+
+        # Source tensors are not needed once the converted weights exist.
+        # Converted and frontend-owned tensors retain their own references.
+        if os.environ.get("FLASHRT_THOR_RELEASE_RAW_CACHE", "0") == "1":
+            _release_raw_checkpoint_cache(cache)
 
         # Decoder buffers (pre-allocate at max sizes)
         self._dec_rope = torch.empty(Sa, 256, dtype=fp16, device='cuda')
