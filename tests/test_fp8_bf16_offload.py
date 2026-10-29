@@ -48,3 +48,22 @@ def test_reload_cache_cleanup_is_opt_in(monkeypatch):
     assert calls == []
     release_reload_cache(True)
     assert calls == ["sync", "empty"]
+
+def test_discard_retains_metadata_without_storage():
+    from flash_rt.frontends.torch.fp8_bf16_offload import discard_candidates
+    weights = {"encoder_ffn_gate_w": torch.ones(2,3), "encoder_ffn_up_w": torch.ones(2,3), "keep": torch.ones(1)}
+    fp8 = {f"encoder_ffn_gate_up_w_{i}": (123,456) for i in range(2)}
+    dropped = discard_candidates(weights, fp8, 2)
+    assert dropped == {"encoder_ffn_gate_w", "encoder_ffn_up_w"}
+    assert weights["encoder_ffn_gate_w"].device.type == "meta"
+    assert weights["encoder_ffn_gate_w"].shape == (2,3)
+    assert weights["keep"].device.type == "cpu"
+
+
+def test_discard_refuses_incomplete_fp8_without_mutation():
+    from flash_rt.frontends.torch.fp8_bf16_offload import discard_candidates
+    weights = {"encoder_ffn_gate_w": torch.ones(2,3), "encoder_ffn_up_w": torch.ones(2,3)}
+    originals = dict(weights)
+    with pytest.raises(ValueError):
+        discard_candidates(weights, {}, 2)
+    assert all(weights[k] is originals[k] for k in weights)

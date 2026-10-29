@@ -14,7 +14,7 @@ def fp8_candidates(vision_layers, encoder_layers, decoder_layers):
         groups[f"{component}_ffn_up_w"] = fused
     return groups
 
-def offload_candidates(weights, fp8, layers, *, vision_layers=None, decoder_layers=None):
+def offload_candidates(weights, fp8, layers, *, vision_layers=None, decoder_layers=None, destination="cpu"):
     if vision_layers is None and decoder_layers is None:
         groups = {key: [f"encoder_ffn_gate_up_w_{i}" for i in range(layers)]
                   for key in ("encoder_ffn_gate_w", "encoder_ffn_up_w")}
@@ -25,7 +25,7 @@ def offload_candidates(weights, fp8, layers, *, vision_layers=None, decoder_laye
     if any(key not in weights for key in groups) or any(
             name not in fp8 for names in groups.values() for name in names):
         raise ValueError("cannot offload without all corresponding FP8 weights")
-    moved = {key: weights[key].to("cpu") for key in groups}
+    moved = {key: weights[key].to(destination) for key in groups}
     weights.update(moved)
     return set(groups)
 
@@ -35,3 +35,8 @@ def release_reload_cache(enabled):
         import torch
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
+
+
+def discard_candidates(weights, fp8, layers, *, vision_layers=None, decoder_layers=None):
+    return offload_candidates(weights, fp8, layers, vision_layers=vision_layers,
+                              decoder_layers=decoder_layers, destination="meta")

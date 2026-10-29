@@ -844,12 +844,16 @@ class Pi05TorchFrontendRtx:
         self._precomputed_styles = _precompute_decoder_styles(
             self._ckpt_bf16, self.chunk_size, num_steps=self._num_steps)
         self._offloaded_fp8_bf16 = set()
+        self._discarded_fp8_bf16 = os.environ.get("FLASHRT_FP8_DISCARD_BF16", "0") == "1"
+        if self._discarded_fp8_bf16 and os.environ.get("FLASHRT_FP8_OFFLOAD_ENCODER_GATE", "0") != "1":
+            raise ValueError("BF16 discard requires FP8 offload mode")
         if os.environ.get("FLASHRT_FP8_OFFLOAD_ENCODER_GATE", "0") == "1":
             if (not self.use_fp8 or self._force_bf16 or self._force_int8_decoder
                     or self._use_int8_encoder or self._prefix_precision != "fp8"):
                 raise ValueError("FP8 BF16 offload requires the FP8 encoder")
-            from .fp8_bf16_offload import offload_candidates
-            self._offloaded_fp8_bf16 = offload_candidates(
+            from .fp8_bf16_offload import offload_candidates, discard_candidates
+            select = discard_candidates if self._discarded_fp8_bf16 else offload_candidates
+            self._offloaded_fp8_bf16 = select(
                 self._ckpt_bf16, self._fp8_weights, ENC_L,
                 vision_layers=VIS_L, decoder_layers=DEC_L)
             torch.cuda.synchronize()
@@ -1200,6 +1204,8 @@ class Pi05TorchFrontendRtx:
 
         INT8 modes are not supported. Returns the wall time in seconds.
         """
+        if getattr(self, "_discarded_fp8_bf16", False):
+            raise NotImplementedError("weight reload is unavailable after BF16 discard")
         if self._int8_weights or self._force_int8_decoder:
             raise NotImplementedError("weight reload is not available for INT8 modes")
         t0 = time.perf_counter()
