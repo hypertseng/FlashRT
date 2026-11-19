@@ -300,11 +300,60 @@ class Pi05BatchedPipeline(Pi05Pipeline):
                         if self._share_batch_styles else self.B)
         per_slice = stride_batch * self.chunk_size * 3 * DEC_D * 2
         if buf_name == "decoder_style_final":
-            return base + step * per_slice
-        # style_attn / style_ffn: (num_steps, DEC_L, B*ds, 3*DEC_D)
-        per_layer = per_slice
-        per_step = DEC_L * per_layer
-        return base + step * per_step + layer * per_layer
+            offset = step * per_slice
+            step_stride = per_slice
+        else:
+            step_stride = DEC_L * per_slice
+            offset = step * step_stride + layer * per_slice
+
+        lane_steps = getattr(self, "_explicit_lane_steps", None)
+        if lane_steps is None:
+            return base + offset
+
+        # Device copies and consumers are ordered on the same CUDA stream.
+        # Existing AdaRMSNorm kernels already consume a separate style row
+        # for each action token. This builds those rows from each lane's time.
+        scratch = self._lane_style_scratch
+        lane_bytes = self.chunk_size * 3 * DEC_D * 2
+        for lane, lane_step in enumerate(lane_steps):
+            src = base + offset + (lane_step - step) * step_stride + lane * lane_bytes
+            dst = scratch.ptr.value + lane * lane_bytes
+            status = self._cudart.cudaMemcpyAsync(
+                ctypes.c_void_p(dst), ctypes.c_void_p(src), lane_bytes, 3,
+                ctypes.c_void_p(self._lane_style_stream),
+            )
+            if status:
+                raise RuntimeError(f"Pi0.5 lane style copy failed: CUDA status {status}")
+        return scratch.ptr.value
+
+    def advance_decoder_lanes(self, steps: tuple[int, ...], stream: int) -> None:
+        """Advance independent, already staged BF16 ODE lanes by one step.
+
+        Callers own context, the current latent, and the RTC prefix for every
+        lane. The pipeline and its scratch are exclusive to the given stream
+        across calls. Wait for earlier work before changing streams or reusing
+        scratch from another operation. This eager entry point never changes
+        whole-graph capture or starts/stops an inference request.
+        """
+        if self.use_fp8_decoder or self.sde or self.denoise_trace:
+            raise ValueError("Explicit lane steps currently require BF16 ODE without tracing")
+        if len(steps) != self.B or any(
+            type(step) is not int or not 0 <= step < self.num_steps for step in steps
+        ):
+            raise ValueError("One valid denoising step is required for every lane")
+        if all(step == steps[0] for step in steps):
+            self._run_batched_decoder_steps((steps[0],), stream)
+            return
+        if getattr(self, "_lane_style_scratch", None) is None:
+            self._lane_style_scratch = CudaBuffer.device_empty(
+                self.B * self.chunk_size * 3 * DEC_D, BF16
+            )
+        self._explicit_lane_steps = steps
+        self._lane_style_stream = stream
+        try:
+            self._run_batched_decoder_steps((steps[0],), stream)
+        finally:
+            self._explicit_lane_steps = None
 
     def _fill_pos_embed_b2(self) -> None:
         """Replicate the parent's per-sample pos_embed across B in the M dim."""
@@ -887,6 +936,9 @@ class Pi05BatchedPipeline(Pi05Pipeline):
     # ══════════════════════════════════════════════════════════════════
 
     def transformer_decoder_batched(self, stream: int = 0) -> None:
+        self._run_batched_decoder_steps(range(self.num_steps), stream)
+
+    def _run_batched_decoder_steps(self, steps, stream: int) -> None:
         fvk = self.fvk
         gemm = self.gemm
         W = self.weights
@@ -897,7 +949,7 @@ class Pi05BatchedPipeline(Pi05Pipeline):
         fused = self.use_fp8_decoder and self.fp8_calibrated
 
         lock = getattr(self, "_rtc_dynamic_lock_batched", None)
-        for step in range(self.num_steps):
+        for step in steps:
             if lock is not None:
                 lock.apply(Bb["diffusion_noise_b2"], stream, self._cudart)
             skinny_step = fused and self._skinny
