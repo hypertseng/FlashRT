@@ -23,6 +23,8 @@ reuses the parent's calibration without an extra pass.
 from __future__ import annotations
 
 import ctypes
+
+import torch
 import logging
 import os
 
@@ -246,6 +248,7 @@ class Pi05BatchedPipeline(Pi05Pipeline):
         """Tile the per-step styles B times along the row dimension into the
         ``*_b2`` buffers (allocated on the first call, uploaded in place
         afterwards so a weight reload never moves them)."""
+        self._device_lane_styles = None
         import numpy as np
         # Shared layouts use the same max-width stride for every graph.
         # Reload writes every live pipeline under the frontend reload guard,
@@ -293,6 +296,13 @@ class Pi05BatchedPipeline(Pi05Pipeline):
                 "decoder_style_attn", "decoder_style_ffn",
                 "decoder_style_final"):
             return super()._style_slice_ptr(buf_name, step, layer)
+        device_steps = getattr(self, "_device_lane_steps", None)
+        if device_steps is not None:
+            styles = self._device_lane_styles[buf_name]
+            source = styles if layer is None else styles[layer]
+            torch.index_select(source, 0, device_steps, out=self._device_lane_style_rows)
+            return self._device_lane_style_rows.data_ptr()
+
         b2_key = buf_name + "_b2"
         base = self.bufs[b2_key].ptr.value
         # Per-row size is 3 * DEC_D * 2 bytes; per-slice has B*ds rows.
@@ -354,6 +364,49 @@ class Pi05BatchedPipeline(Pi05Pipeline):
             self._run_batched_decoder_steps((steps[0],), stream)
         finally:
             self._explicit_lane_steps = None
+
+    def prepare_device_lane_steps(self) -> None:
+        """Allocate the stable style tables used by dynamic BF16 step replay."""
+        if self.use_fp8_decoder or self.sde or self.denoise_trace:
+            raise ValueError("Device lane steps currently require BF16 ODE without tracing")
+        if getattr(self, "_device_lane_styles", None) is not None:
+            return
+        pre = self.weights["precomputed"]
+        self._device_lane_styles = {}
+        for name in ("style_attn", "style_ffn", "style_final"):
+            styles = torch.from_numpy(pre[name].copy()).view(torch.bfloat16)
+            if name != "style_final":
+                styles = styles.transpose(0, 1).contiguous()
+            self._device_lane_styles[f"decoder_{name}"] = styles.to(device="cuda")
+        self._device_lane_style_rows = torch.empty(
+            (self.B, self.chunk_size, 3 * DEC_D), dtype=torch.bfloat16, device="cuda"
+        )
+
+    def advance_decoder_device_lanes(self, steps: torch.Tensor, stream: int) -> None:
+        """Enqueue one step, with device values read at launch or graph replay.
+
+        `steps` is caller-owned, stable for the graph lifetime, and holds one
+        checked int64 step number per lane in [0, num_steps). The caller stages
+        changes on the same stream before replay. Reprepare and recapture
+        after changing the pipeline weights or buffers.
+        """
+        if getattr(self, "_device_lane_styles", None) is None:
+            raise RuntimeError("Prepare lane tables before recording a graph")
+        if (
+            not steps.is_cuda or steps.dtype != torch.int64 or steps.shape != (self.B,)
+            or not steps.is_contiguous()
+            or steps.device != self._device_lane_style_rows.device
+        ):
+            raise ValueError("Expected a contiguous CUDA int64 tensor with one step per lane")
+        if torch.cuda.current_stream(steps.device).cuda_stream != stream:
+            raise ValueError("PyTorch and decoder work must share the same CUDA stream")
+        self._device_lane_steps = steps
+        try:
+            # In this supported precision/mode, styles are the only consumers
+            # of the ODE step index. Mixed indices come from the device tensor.
+            self._run_batched_decoder_steps((0,), stream)
+        finally:
+            self._device_lane_steps = None
 
     def _fill_pos_embed_b2(self) -> None:
         """Replicate the parent's per-sample pos_embed across B in the M dim."""
